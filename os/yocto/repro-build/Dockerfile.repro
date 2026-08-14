@@ -58,3 +58,15 @@ ENV CARGO_HOME=/tmp/cargo
 
 # Generate locale for bitbake
 RUN locale-gen en_US.UTF-8
+
+# Poky's usrmerge layout gives target binaries the ELF interpreter
+# /usr/lib/ld-linux-x86-64.so.2; on Ubuntu the loader is at
+# /lib/x86_64-linux-gnu/ (with only a /lib64 compatibility symlink), so that
+# path does not resolve here. Cargo build scripts that cross-compile a probe
+# with the target toolchain and then run it on the build host therefore see
+# ENOENT before main(). aws-lc-sys -- reached via dcap-qvl -> reqwest ->
+# rustls -- does exactly this in its memcmp check, and reports the resulting
+# exit 127 as "COMPILER BUG DETECTED", failing dstack-guest do_compile.
+# This link only affects probes executed on the build host; the guest
+# binaries keep their own interpreter and are byte-for-byte unaffected.
+RUN ln -sf /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
