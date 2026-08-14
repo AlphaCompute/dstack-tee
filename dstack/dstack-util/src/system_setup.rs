@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use dstack_attest::emit_runtime_event;
 use dstack_kms_rpc as rpc;
 use dstack_types::{
@@ -2012,29 +2013,104 @@ impl<'a> Stage0<'a> {
     }
 }
 
-impl Stage1<'_> {
-    fn decrypt_env_vars(
-        &self,
-        key: &[u8],
-        ciphertext: &[u8],
-        allowed: &BTreeSet<String>,
-    ) -> Result<BTreeMap<String, String>> {
-        let vars = if !key.is_empty() && !ciphertext.is_empty() {
-            info!("Processing encrypted env");
-            let env_crypt_key: [u8; 32] = key
-                .try_into()
-                .ok()
-                .context("Invalid env crypt key length")?;
+/// Magic prefix marking a v1 multi-entry encrypted env manifest.
+///
+/// A legacy `.encrypted-env` is a single ECIES blob that starts with a random
+/// 32-byte ephemeral public key, so the two formats are told apart by this
+/// prefix rather than by sniffing the payload: any content-based guess would
+/// collide with some legacy blobs.
+const ENCRYPTED_ENV_MAGIC: &[u8] = b"DSTACKS1";
+/// The only manifest version this build understands.
+const ENCRYPTED_ENV_VERSION: u32 = 1;
+/// Upper bound on the entries in one manifest. `.encrypted-env` is already
+/// truncated to 256 KB when it is copied in, but bound the decrypt work
+/// explicitly rather than relying on that.
+const MAX_ENCRYPTED_ENV_ENTRIES: usize = 256;
+
+/// A v1 manifest: independently encrypted secrets, so any one of them can be
+/// rotated without re-encrypting (and therefore without knowing) the others.
+#[derive(Deserialize)]
+struct EncryptedEnvManifest {
+    v: u32,
+    /// Standard-alphabet, padded base64 of one ECIES blob each, all encrypted
+    /// to the same app env-encrypt public key. Defaulted so that an unknown
+    /// version is reported as such even if its body looks nothing like this.
+    #[serde(default)]
+    entries: Vec<String>,
+}
+
+/// Decrypt the app's `.encrypted-env`.
+///
+/// Two formats are accepted: a legacy single ECIES blob, and a v1 manifest of
+/// independently encrypted entries (see [`ENCRYPTED_ENV_MAGIC`]). Both decrypt
+/// to the same plaintext shape, so `parse_env` — and with it `allowed_envs`
+/// filtering and the `.decrypted-env` output — is identical either way.
+fn decrypt_env_vars(
+    key: &[u8],
+    ciphertext: &[u8],
+    allowed: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>> {
+    if key.is_empty() || ciphertext.is_empty() {
+        info!("No encrypted env, using default");
+        return Ok(Default::default());
+    }
+    info!("Processing encrypted env");
+    let env_crypt_key: [u8; 32] = key
+        .try_into()
+        .ok()
+        .context("Invalid env crypt key length")?;
+    match ciphertext.strip_prefix(ENCRYPTED_ENV_MAGIC) {
+        Some(manifest) => decrypt_env_manifest(env_crypt_key, manifest, allowed),
+        None => {
             let decrypted_json =
                 dh_decrypt(env_crypt_key, ciphertext).context("Failed to decrypt env file")?;
-            crate::parse_env_file::parse_env(&decrypted_json, allowed)?
-        } else {
-            info!("No encrypted env, using default");
-            Default::default()
-        };
-        Ok(vars)
+            crate::parse_env_file::parse_env(&decrypted_json, allowed)
+        }
     }
+}
 
+/// Decrypt a v1 manifest, merging entries in array order: a later entry
+/// setting a key an earlier one already set wins.
+///
+/// Fails closed. A single entry that will not decrypt or parse fails the boot,
+/// because starting the app with one secret silently missing is a worse
+/// failure than not starting at all. Entry indices are logged; entry contents
+/// never are.
+fn decrypt_env_manifest(
+    env_crypt_key: [u8; 32],
+    manifest: &[u8],
+    allowed: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>> {
+    let manifest: EncryptedEnvManifest =
+        serde_json::from_slice(manifest).context("Failed to parse encrypted env manifest")?;
+    if manifest.v != ENCRYPTED_ENV_VERSION {
+        bail!("Unsupported encrypted env manifest version: {}", manifest.v);
+    }
+    if manifest.entries.len() > MAX_ENCRYPTED_ENV_ENTRIES {
+        bail!(
+            "Too many encrypted env entries: {} (max {MAX_ENCRYPTED_ENV_ENTRIES})",
+            manifest.entries.len()
+        );
+    }
+    info!(
+        "Decrypting {} encrypted env entries",
+        manifest.entries.len()
+    );
+    let mut vars = BTreeMap::new();
+    for (index, entry) in manifest.entries.iter().enumerate() {
+        let blob = BASE64
+            .decode(entry)
+            .with_context(|| format!("Failed to decode encrypted env entry {index}"))?;
+        let decrypted_json = dh_decrypt(env_crypt_key, &blob)
+            .with_context(|| format!("Failed to decrypt encrypted env entry {index}"))?;
+        let entry_vars = crate::parse_env_file::parse_env(&decrypted_json, allowed)
+            .with_context(|| format!("Failed to parse encrypted env entry {index}"))?;
+        vars.extend(entry_vars);
+    }
+    Ok(vars)
+}
+
+impl Stage1<'_> {
     fn write_env_file(&self, env_vars: &BTreeMap<String, String>) -> Result<()> {
         info!("Writing env");
         fs::write(
@@ -2057,7 +2133,7 @@ impl Stage1<'_> {
             .cloned()
             .collect();
         // Decrypt env file
-        let decrypted_env = self.decrypt_env_vars(
+        let decrypted_env = decrypt_env_vars(
             &self.keys.env_crypt_key,
             &self.shared.encrypted_env,
             &allowed_envs,
@@ -2375,6 +2451,175 @@ fn test_validate_luks2_header() {
     assert!(error
         .to_string()
         .contains("Invalid LUKS keyslot encryption"));
+}
+
+/// The app env-encrypt key pair a test encrypts to.
+#[cfg(test)]
+const TEST_ENV_CRYPT_KEY: [u8; 32] = [7u8; 32];
+
+#[cfg(test)]
+fn test_env_allowed(keys: &[&str]) -> BTreeSet<String> {
+    keys.iter().map(|k| k.to_string()).collect()
+}
+
+/// One sealed entry: the same `{"env":[..]}` plaintext a legacy blob carries,
+/// encrypted on its own and base64'd, as a producer of the v1 format emits it.
+#[cfg(test)]
+fn test_env_entry(pairs: &[(&str, &str)]) -> String {
+    let env: Vec<_> = pairs
+        .iter()
+        .map(|(key, value)| serde_json::json!({"key": key, "value": value}))
+        .collect();
+    let plaintext = serde_json::json!({ "env": env }).to_string();
+    let blob = crate::crypto::dh_encrypt(
+        crate::crypto::dh_public_key(TEST_ENV_CRYPT_KEY),
+        plaintext.as_bytes(),
+    )
+    .unwrap();
+    BASE64.encode(blob)
+}
+
+#[cfg(test)]
+fn test_env_manifest(version: u32, entries: &[String]) -> Vec<u8> {
+    let body = serde_json::json!({ "v": version, "entries": entries }).to_string();
+    [ENCRYPTED_ENV_MAGIC, body.as_bytes()].concat()
+}
+
+#[test]
+fn test_decrypt_env_vars_empty_inputs_yield_no_vars() {
+    let allowed = test_env_allowed(&["FOO"]);
+    let ciphertext = test_env_manifest(1, &[test_env_entry(&[("FOO", "bar")])]);
+    assert!(decrypt_env_vars(&[], &ciphertext, &allowed)
+        .unwrap()
+        .is_empty());
+    assert!(decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &[], &allowed)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn test_decrypt_env_vars_legacy_blob_unchanged() {
+    // A legacy `.encrypted-env` is one blob holding every pair, with no magic
+    // prefix. It must keep decrypting exactly as before.
+    let blob = crate::crypto::dh_encrypt(
+        crate::crypto::dh_public_key(TEST_ENV_CRYPT_KEY),
+        br#"{"env":[{"key":"FOO","value":"bar"},{"key":"SECRET","value":"s3cr3t"}]}"#,
+    )
+    .unwrap();
+    let vars = decrypt_env_vars(
+        &TEST_ENV_CRYPT_KEY,
+        &blob,
+        &test_env_allowed(&["FOO", "SECRET"]),
+    )
+    .unwrap();
+    assert_eq!(vars.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(vars.get("SECRET").map(String::as_str), Some("s3cr3t"));
+
+    // allowed_envs still filters out what the app did not declare.
+    let vars = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &blob, &test_env_allowed(&["FOO"])).unwrap();
+    assert_eq!(vars.keys().collect::<Vec<_>>(), vec!["FOO"]);
+}
+
+#[test]
+fn test_decrypt_env_vars_v1_manifest_merges_entries() {
+    let ciphertext = test_env_manifest(
+        1,
+        &[
+            test_env_entry(&[("FOO", "bar")]),
+            test_env_entry(&[("SECRET", "s3cr3t")]),
+            test_env_entry(&[("OTHER", "value")]),
+        ],
+    );
+    let vars = decrypt_env_vars(
+        &TEST_ENV_CRYPT_KEY,
+        &ciphertext,
+        &test_env_allowed(&["FOO", "SECRET", "OTHER"]),
+    )
+    .unwrap();
+    assert_eq!(vars.len(), 3);
+    assert_eq!(vars.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(vars.get("SECRET").map(String::as_str), Some("s3cr3t"));
+    assert_eq!(vars.get("OTHER").map(String::as_str), Some("value"));
+
+    // Independent entries do not weaken allowed_envs filtering: an entry
+    // holding an undeclared name is dropped, as in the legacy format.
+    let vars = decrypt_env_vars(
+        &TEST_ENV_CRYPT_KEY,
+        &ciphertext,
+        &test_env_allowed(&["FOO"]),
+    )
+    .unwrap();
+    assert_eq!(vars.keys().collect::<Vec<_>>(), vec!["FOO"]);
+}
+
+#[test]
+fn test_decrypt_env_vars_v1_later_entry_wins() {
+    let ciphertext = test_env_manifest(
+        1,
+        &[
+            test_env_entry(&[("FOO", "first")]),
+            test_env_entry(&[("FOO", "second")]),
+        ],
+    );
+    let vars = decrypt_env_vars(
+        &TEST_ENV_CRYPT_KEY,
+        &ciphertext,
+        &test_env_allowed(&["FOO"]),
+    )
+    .unwrap();
+    assert_eq!(vars.get("FOO").map(String::as_str), Some("second"));
+}
+
+#[test]
+fn test_decrypt_env_vars_v1_fails_closed_on_bad_entry() {
+    let allowed = test_env_allowed(&["FOO", "SECRET"]);
+    let good = test_env_entry(&[("FOO", "bar")]);
+
+    // An entry that is not valid base64.
+    let ciphertext = test_env_manifest(1, &[good.clone(), "not base64!!".to_string()]);
+    let err = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &ciphertext, &allowed).unwrap_err();
+    assert!(err.to_string().contains("decode encrypted env entry 1"));
+
+    // An entry whose ciphertext does not authenticate.
+    let mut corrupt = BASE64.decode(&good).unwrap();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    let ciphertext = test_env_manifest(1, &[good.clone(), BASE64.encode(&corrupt)]);
+    let err = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &ciphertext, &allowed).unwrap_err();
+    assert!(err.to_string().contains("decrypt encrypted env entry 1"));
+
+    // An entry that decrypts but is not the expected plaintext shape.
+    let junk = crate::crypto::dh_encrypt(
+        crate::crypto::dh_public_key(TEST_ENV_CRYPT_KEY),
+        b"[{\"key\":\"FOO\",\"value\":\"bar\"}]",
+    )
+    .unwrap();
+    let ciphertext = test_env_manifest(1, &[good, BASE64.encode(junk)]);
+    let err = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &ciphertext, &allowed).unwrap_err();
+    assert!(err.to_string().contains("parse encrypted env entry 1"));
+}
+
+#[test]
+fn test_decrypt_env_vars_v1_rejects_bad_manifest() {
+    let allowed = test_env_allowed(&["FOO"]);
+    let entry = test_env_entry(&[("FOO", "bar")]);
+
+    let ciphertext = test_env_manifest(2, &[entry.clone()]);
+    let err = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &ciphertext, &allowed).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Unsupported encrypted env manifest version: 2"));
+
+    let ciphertext = [ENCRYPTED_ENV_MAGIC, b"not json"].concat();
+    let err = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &ciphertext, &allowed).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Failed to parse encrypted env manifest"));
+
+    let entries = vec![entry; MAX_ENCRYPTED_ENV_ENTRIES + 1];
+    let ciphertext = test_env_manifest(1, &entries);
+    let err = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &ciphertext, &allowed).unwrap_err();
+    assert!(err.to_string().contains("Too many encrypted env entries"));
 }
 
 #[cfg(test)]

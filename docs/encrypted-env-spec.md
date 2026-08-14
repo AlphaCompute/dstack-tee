@@ -104,6 +104,45 @@ Stored as raw binary in `.encrypted-env`. SDK functions may return hex strings.
 {"env": [{"key": "FOO", "value": "bar"}, {"key": "SECRET", "value": "123"}]}
 ```
 
+### Multi-Entry Manifest (v1)
+
+A single blob encrypts every value together, so changing one secret means
+re-encrypting the whole set — which requires holding every plaintext. That rules
+out multiple admins owning different secrets, and per-secret rotation.
+
+`.encrypted-env` therefore also accepts a manifest of independently encrypted
+entries, selected by an 8-byte ASCII magic prefix followed by JSON:
+
+```
+"DSTACKS1"  ‖  {"v": 1, "entries": ["<base64 blob>", "<base64 blob>", ...]}
+```
+
+The prefix, rather than a guess at the payload's shape, is what distinguishes the
+two formats: a legacy blob starts with 32 random bytes and can begin with any
+byte at all.
+
+Each entry is an independent ciphertext in the binary format above, encrypted to
+the **same** app env-encrypt public key, and decrypting to the **same** plaintext
+format above — normally one `{"key", "value"}` pair. Entries are standard-alphabet,
+padded base64.
+
+Rules a producer must respect:
+
+- **Variable names live inside the sealed payload**, never in the manifest. There
+  is nothing to relabel: an attacker who reorders or substitutes ciphertexts
+  cannot move a value onto a different variable name.
+- **Merge order is array order.** A later entry setting a key an earlier one
+  already set overwrites it.
+- **Decryption fails closed.** An entry that does not decrypt, decode, or parse
+  fails the boot; the app never starts with one secret silently missing.
+- At most 256 entries, and the whole manifest must fit the 256 KB `.encrypted-env`
+  cap — count ~60 bytes of ECIES overhead per entry plus base64 inflation.
+- `allowed_envs` filtering is applied per entry exactly as for a legacy blob, and
+  `.decrypted-env` / `.decrypted-env.json` are unchanged.
+
+A `.encrypted-env` without the magic prefix is the legacy single blob and is
+still supported unchanged.
+
 ### Encryption Flow (Client-Side)
 
 Input: `env_vars` (key-value list), `remote_public_key` (X25519 public key, 32 bytes)
