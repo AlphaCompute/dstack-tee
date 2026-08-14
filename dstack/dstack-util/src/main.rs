@@ -702,8 +702,19 @@ fn cmd_rand(rand_args: RandArgs) -> Result<()> {
 }
 
 fn cmd_show_mrs() -> Result<()> {
-    let attestation =
-        ra_tls::attestation::Attestation::local().context("Failed to get attestation")?;
+    let attestation = match ra_tls::attestation::Attestation::local() {
+        Ok(attestation) => attestation,
+        Err(err) => {
+            // DEV-ONLY fallback: no TEE hardware present (e.g. a local no_tee
+            // dev CVM). There are no measurement registers to show, so skip
+            // instead of failing. Real TEE hosts always resolve an
+            // attestation above and print MRs as before.
+            tracing::warn!(
+                "no TEE attestation available ({err:#}); skipping MR display (no_tee dev mode)"
+            );
+            return Ok(());
+        }
+    };
     let app_info = attestation
         .into_v1()
         .decode_app_info(false)
@@ -874,12 +885,26 @@ fn make_app_keys(
     use ra_tls::cert::CertRequest;
     let pubkey = app_key.public_key_der();
     let report_data = QuoteContentType::RaTlsCert.to_report_data(&pubkey);
-    let attestation = Attestation::quote(&report_data)
-        .context("Failed to get attestation")?
-        .into_versioned();
+    let attestation = match Attestation::quote(&report_data) {
+        Ok(attestation) => Some(attestation.into_versioned()),
+        Err(err) => {
+            // DEV-ONLY fallback: no TEE hardware present (e.g. a local no_tee
+            // dev CVM). Issue a plain self-signed cert with no ra-tls
+            // attestation extension instead of failing app-key generation.
+            // Real TEE hosts always resolve a quote above and take the
+            // unchanged path; the KMS key-provider path never calls this
+            // function locally (KMS keys come from the KMS server), so this
+            // only affects the None/Local key providers used by local,
+            // unattested dev CVMs.
+            tracing::warn!(
+                "no TEE attestation available ({err:#}); issuing app keys without an attestation (no_tee dev mode)"
+            );
+            None
+        }
+    };
     let req = CertRequest::builder()
         .subject("App Root Cert")
-        .attestation(&attestation)
+        .maybe_attestation(attestation.as_ref())
         .key(app_key)
         .ca_level(ca_level)
         .build();

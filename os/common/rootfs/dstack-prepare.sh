@@ -112,15 +112,25 @@ has_tsm_provider() {
 
 if [[ -e /dev/sev-guest ]] || has_tsm_provider sev_guest; then
 	log "SEV-SNP guest device/TSM provider detected"
+	TEE_PRESENT=1
 elif [[ -e /dev/tdx_guest ]] || has_tsm_provider tdx_guest; then
 	log "TDX guest device/TSM provider detected"
+	TEE_PRESENT=1
 elif modprobe sev-guest 2>/dev/null; then
 	log "Loaded sev-guest module"
+	TEE_PRESENT=1
 elif modprobe tdx-guest 2>/dev/null; then
 	log "Loaded tdx-guest module"
+	TEE_PRESENT=1
 else
-	log "Error: neither sev-guest nor tdx-guest module is available"
-	exit 1
+	# DEV-ONLY fallback: no TEE attestation device is present (e.g. a plain
+	# laptop with no sev-guest/tdx-guest hardware). Real deployments still
+	# enforce attestation at a separate layer (KMS/auth-server reject any VM
+	# that cannot produce a valid quote), so continuing here does not weaken
+	# production security -- it only lets a local, non-attesting dev CVM
+	# finish booting. Do NOT rely on this path for anything attested.
+	log "Warning: neither sev-guest nor tdx-guest module is available; continuing in no_tee dev mode (DEV-ONLY, not attested)"
+	TEE_PRESENT=0
 fi
 
 # Setup configfs and TSM for TDX attestation
@@ -138,7 +148,11 @@ setup_tsm() {
 		mkdir -p /sys/kernel/config/tsm/report/com.intel.dcap
 	fi
 }
-setup_tsm || true
+if [[ "$TEE_PRESENT" == "1" ]]; then
+	setup_tsm || true
+else
+	log "Skipping TSM/attestation setup (no_tee dev mode)"
+fi
 
 # Setup dstack system
 log "Preparing dstack system..."

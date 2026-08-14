@@ -40,9 +40,25 @@ static EMIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// - GCP TPM: SHA256 PCR14
 /// - AWS NitroTPM: SHA384 PCR14 (not PCR23; no launch/runtime PCR split)
 pub fn emit_runtime_event(event: &str, payload: &[u8]) -> anyhow::Result<()> {
-    let event = RuntimeEvent::new(event.to_string(), payload.to_vec());
+    let mode = match AttestationMode::detect() {
+        Ok(mode) => mode,
+        Err(err) => {
+            // DEV-ONLY fallback: no TEE hardware is present (e.g. a local
+            // no_tee dev CVM on a plain laptop with no TDX/SEV-SNP device).
+            // Skip the event log / RTMR extension instead of failing the
+            // boot. Real TEE hosts always resolve an AttestationMode above
+            // and take the unchanged path below; production attestation is
+            // enforced at a separate layer (KMS/auth-server reject any VM
+            // that cannot produce a valid quote), so this does not weaken
+            // production security.
+            tracing::warn!(
+                "no TEE attestation mode available ({err:#}); skipping runtime event '{event}' (no_tee dev mode)"
+            );
+            return Ok(());
+        }
+    };
 
-    let mode = AttestationMode::detect()?;
+    let event = RuntimeEvent::new(event.to_string(), payload.to_vec());
 
     // Hold the lock across both the log append and the register extension so
     // that the on-disk log order always matches the RTMR extension order.

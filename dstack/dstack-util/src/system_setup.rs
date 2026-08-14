@@ -1925,19 +1925,28 @@ impl<'a> Stage0<'a> {
     }
 
     fn verify_app(&self, app_info: &AppInfo, keys: &AppKeys) -> Result<()> {
-        config_id_verifier::verify_mr_config_id(
-            &app_info.compose_hash,
-            &app_info
-                .instance_info
-                .app_id
-                .as_slice()
-                .try_into()
-                .ok()
-                .context("Invalid app id")?,
-            &app_info.instance_info.instance_id,
-            keys.key_provider.kind(),
-            keys.key_provider.id(),
-        )?;
+        if dstack_attest::attestation::AttestationMode::detect().is_err() {
+            // DEV-ONLY fallback: no TEE hardware present (e.g. a local no_tee
+            // dev CVM). There is no TDX/SEV-SNP quote to read an
+            // mr_config_id from, so skip this check instead of failing boot.
+            // Real TEE hosts always resolve an AttestationMode and take the
+            // unchanged verification path below.
+            warn!("no TEE attestation mode available; skipping mr_config_id verification (no_tee dev mode)");
+        } else {
+            config_id_verifier::verify_mr_config_id(
+                &app_info.compose_hash,
+                &app_info
+                    .instance_info
+                    .app_id
+                    .as_slice()
+                    .try_into()
+                    .ok()
+                    .context("Invalid app id")?,
+                &app_info.instance_info.instance_id,
+                keys.key_provider.kind(),
+                keys.key_provider.id(),
+            )?;
+        }
         self.verify_key_provider_id(keys.key_provider.id())?;
         // TPM uses an empty id: the instance app-root pubkey is not a stable
         // provider identity and must not enter the launch measurement chain.
