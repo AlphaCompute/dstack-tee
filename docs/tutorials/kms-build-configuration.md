@@ -183,14 +183,11 @@ port = 9100
 key = "/etc/kms/certs/rpc.key"
 certs = "/etc/kms/certs/rpc.crt"
 
-# Mutual TLS (mTLS) Configuration
-[rpc.tls.mutual]
-ca_certs = "/etc/kms/certs/tmp-ca.crt"
-# Keep the TLS listener optional because bootstrap/public endpoints must be
-# reachable before a client has an RA-TLS certificate. Temp-CA bootstrap material
-# is bootstrap-sensitive. Key-release RPCs still require verified caller
+# No mutual-TLS section: client certificates are verified by the attestation they
+# carry, not by an issuer CA, so there is nothing to pin. Connections without a
+# certificate are still accepted, because bootstrap and public endpoints must be
+# reachable before a client has one. Key-release RPCs still require verified caller
 # attestation; certificate signing verifies CSR signature and attestation.
-mandatory = false
 
 # Core KMS Configuration
 [core]
@@ -371,16 +368,11 @@ The Dockerfile bakes all configuration into the image for reliable CVM deploymen
 ```bash
 cat > Dockerfile << 'EOF'
 # KMS Docker Image for CVM Deployment
-# Extract dstack-acpi-tables and QEMU BIOS files from the official builder image.
-# These are required for OS image verification (computing expected TDX measurements).
-FROM dstacktee/dstack-kms@sha256:11ac59f524a22462ccd2152219b0bec48a28ceb734e32500152d4abefab7a62a AS official
-
 FROM ubuntu:24.04
 
 # Install runtime dependencies
-# libglib2.0-0t64, libpixman-1-0, and libslirp0 are required by dstack-acpi-tables (QEMU binary)
 RUN apt-get update && \
-    apt-get install -y ca-certificates curl libglib2.0-0t64 libpixman-1-0 libslirp0 && \
+    apt-get install -y ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Node.js 20.x for auth-eth
@@ -390,10 +382,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 
 # Create directories
 RUN mkdir -p /etc/kms/certs /etc/kms/images /var/run/kms /var/log/kms
-
-# Copy dstack-acpi-tables from official image (needed for OS image verification)
-COPY --from=official /usr/local/bin/dstack-acpi-tables /usr/local/bin/dstack-acpi-tables
-COPY --from=official /usr/local/share/qemu /usr/local/share/qemu
 
 # Copy KMS binary
 COPY dstack-kms /usr/local/bin/dstack-kms
@@ -466,14 +454,11 @@ port = 9100
 key = "/etc/kms/certs/rpc.key"
 certs = "/etc/kms/certs/rpc.crt"
 
-# Mutual TLS (mTLS) Configuration
-[rpc.tls.mutual]
-ca_certs = "/etc/kms/certs/tmp-ca.crt"
-# Keep the TLS listener optional because bootstrap/public endpoints must be
-# reachable before a client has an RA-TLS certificate. Temp-CA bootstrap material
-# is bootstrap-sensitive. Key-release RPCs still require verified caller
+# No mutual-TLS section: client certificates are verified by the attestation they
+# carry, not by an issuer CA, so there is nothing to pin. Connections without a
+# certificate are still accepted, because bootstrap and public endpoints must be
+# reachable before a client has one. Key-release RPCs still require verified caller
 # attestation; certificate signing verifies CSR signature and attestation.
-mandatory = false
 
 # Core KMS Configuration
 [core]

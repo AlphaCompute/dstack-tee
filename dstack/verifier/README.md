@@ -6,7 +6,7 @@ A HTTP server that provides dstack quote verification services using the same ve
 
 ### POST /verify
 
-Verifies a dstack attestation or quote with the provided data and VM configuration. The body can be grabbed via [getQuote](https://github.com/Dstack-TEE/dstack/blob/master/sdk/curl/api.md#3-get-quote) or [attest](https://github.com/Dstack-TEE/dstack/blob/master/sdk/curl/api.md#8-attest).
+Verifies a dstack attestation or quote with the provided data and VM configuration. The body can be grabbed via [getQuote](https://github.com/Dstack-TEE/dstack/blob/next/sdk/curl/api.md#3-get-quote) (Intel TDX only, and not the full evidence on GCP) or [attest](https://github.com/Dstack-TEE/dstack/blob/next/sdk/curl/api.md#7-attest) (any platform).
 
 **Request Body:**
 Provide either `attestation` or (`quote` + `event_log` + `vm_config`).
@@ -40,7 +40,7 @@ against the returned evidence.
     "acpi_tables_verified": true,         // true only when TDX ACPI table contents are verified
     "os_image_is_dev": false,             // true=dev image, false=prod, null=unknown/N/A
     "os_image_version": "0.5.10",         // dstack OS version, null if unknown
-    "attestation_mode": "dstack-tdx",   // dstack-tdx | dstack-gcp-tdx | dstack-nitro-enclave | dstack-amd-sev-snp | dstack-aws-nitro-tpm
+    "tee_variant": "dstack-tdx",   // dstack-tdx | dstack-gcp-tdx | dstack-nitro-enclave | dstack-amd-sev-snp | dstack-aws-nitro-tpm
     "report_data": "hex-encoded-64-byte-report-data",
     "tcb_status": "UpToDate",
     "advisory_ids": [],
@@ -61,7 +61,7 @@ against the returned evidence.
       "key_provider_info": "hex-string"
     },
     "boot_info": {
-      "attestationMode": "dstack-aws-nitro-tpm",
+      "teeVariant": "dstack-aws-nitro-tpm",
       "mrAggregated": "hex-string",
       "osImageHash": "hex-string",
       "mrSystem": "hex-string",
@@ -100,7 +100,8 @@ You usually don't need to edit the config file. Just using the default is fine, 
 - `image_cache_dir`: Directory for cached OS images (default: "/tmp/dstack-verifier/cache")
 - `image_download_url`: URL template for downloading OS images (default: dstack official releases URL)
 - `image_download_timeout_secs`: Download timeout in seconds (default: 300)
-- `pccs_url`: PCCS URL for quote verification (default: uses Intel's public PCCS)
+- `attestation.urls.pccs`: PCCS URL (default: production PCCS)
+- `attestation.urls.amd_kds`: AMD KDS URL (default: AMD production KDS)
 
 ### Example Configuration File
 
@@ -110,7 +111,9 @@ port = 8080
 image_cache_dir = "/tmp/dstack-verifier/cache"
 image_download_url = "https://download.dstack.org/os-images/mr_{OS_IMAGE_HASH}.tar.gz"
 image_download_timeout_secs = 300
-# pccs_url = "https://pccs.phala.network"
+[attestation.urls]
+# pccs = "https://pccs.phala.network"
+# amd_kds = "https://kdsintf.amd.com/vcek/v1"
 ```
 
 ## Usage
@@ -158,7 +161,7 @@ The verification checks that:
 
 Clients, gateways, or release validators should combine this certificate-level
 check with the policy fields emitted by `/verify`: accepted OS image,
-`attestationMode`, `mrAggregated`, app compose hash, KMS identity, a
+`teeVariant`, `mrAggregated`, app compose hash, KMS identity, a
 `report_data` challenge, and any deployment-specific endpoint allowlist.
 
 ### Running with Docker Compose
@@ -250,9 +253,35 @@ The verifier performs the following verification steps:
    result as `app_info.os_image_hash_verified` (self-contained for all platforms
    except the TDX legacy full-image path, which reports `false`).
 
-`details.acpi_tables_verified` is `true` only for the full-image TDX path, where the verifier recomputes ACPI table contents and checks the resulting RTMRs against the quote. It is `false` for TDX lite, which uses the quote's named ACPI DATA digests without validating table contents, and for non-TDX platforms where ACPI table verification is not applicable.
+`details.acpi_tables_verified` is `true` for both TDX paths, which recompute the ACPI table contents and check them against the quote. It is `false` only for non-TDX platforms, where ACPI table verification is not applicable.
 
 All verification steps must pass for the verification to be considered valid.
+
+### TDX ACPI table verification
+
+RTMR0 covers three ACPI blobs QEMU hands to OVMF (`acpi-loader`, `acpi-rsdp`,
+`acpi-tables`); `acpi-tables` carries the DSDT, which is AML the guest kernel
+executes. Both TDX paths regenerate those blobs from the VM shape declared in
+`vm_config` (vCPU count, RAM size, PCI topology, QEMU version) and require the
+recomputed digests to equal the ones the quote's event log reports, before
+rebuilding the expected RTMR0 from the recomputed values.
+
+Verification fails closed in both directions:
+
+- **digest mismatch** — the tables are not the ones this VM shape produces.
+- **cannot generate** — the shape is one the ACPI generator does not model
+  (`swtpm = true`, or a QEMU older than 8.0). There is nothing to compare
+  against, so the attestation is rejected rather than accepted as unverified.
+
+The second case is deliberate. `swtpm` and `qemu_version` are host-declared
+fields that no other measurement independently constrains, so accepting an
+unverifiable shape would let a host opt out of the check by declaring one.
+CVMs using the TPM key provider (`swtpm = true`) therefore cannot be verified
+on either TDX path, which is the pre-existing behavior of the full-image path.
+
+QEMU versions newer than the newest ACPI profile the verifier models are
+generated with that profile, so a QEMU upgrade that leaves the ACPI ABI alone
+keeps verifying; one that changes it surfaces as a digest mismatch.
 
 ### Identifying the deployment
 
@@ -260,9 +289,9 @@ Beyond pass/fail, the result carries a few descriptive fields so a relying party
 
 - **`os_image_is_dev`** — `true` for a development OS image, `false` for production. Dev images are built for local testing and are not hardened for production use, so a relying party generally wants to reject them.
 - **`os_image_version`** — the dstack OS version (e.g. `0.5.10`), useful for enforcing a minimum version.
-- **`attestation_mode`** — the attestation mode that produced the verified quote, serialized as `AttestationMode`: `dstack-tdx`, `dstack-gcp-tdx`, `dstack-nitro-enclave`, `dstack-amd-sev-snp`, or `dstack-aws-nitro-tpm`.
+- **`tee_variant`** — the TEE variant that produced the verified quote, serialized as `TeeVariant`: `dstack-tdx`, `dstack-gcp-tdx`, `dstack-nitro-enclave`, `dstack-amd-sev-snp`, or `dstack-aws-nitro-tpm`.
 - **`acpi_tables_verified`** — whether TDX ACPI table contents were verified. This is useful for relying parties that require `requirements.tdx_measure_acpi_tables = true`.
 - **`key_provider`** — the decoded `app_info.key_provider_info` (`{name, id}`); `name` is e.g. `kms` or `local`. A `local` key provider means the CVM is not KMS-backed, which is itself a dev/insecure posture signal. The raw bytes remain in `app_info.key_provider_info`.
-- **`boot_info`** — the policy object a relying party should feed to its auth/governance layer. For AWS EC2 NitroTPM this includes `attestationMode = dstack-aws-nitro-tpm`, PCR4/7/12-derived `osImageHash`, PCR14-bound `mrAggregated`, app identity, instance/device identity, and a `tcbStatus` normalized to `UpToDate`.
+- **`boot_info`** — the policy object a relying party should feed to its auth/governance layer. For AWS EC2 NitroTPM this includes `teeVariant = dstack-aws-nitro-tpm`, PCR4/7/12-derived `osImageHash`, PCR14-bound `mrAggregated`, app identity, instance/device identity, and a `tcbStatus` normalized to `UpToDate`.
 
 `os_image_is_dev` and `os_image_version` are read from the image's `metadata.json`, which is part of `sha256sum.txt` and therefore bound to the `os_image_hash` that step 3 verifies against the quote — so they are as trustworthy as the os-image-hash check itself. They are `null` when the platform does not expose them (e.g. GCP TDX / Nitro Enclave) or when the image predates the field (images without `is_dev` are always production).

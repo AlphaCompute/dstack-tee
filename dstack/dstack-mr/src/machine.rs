@@ -20,6 +20,12 @@ pub struct Machine<'a> {
     pub initrd: &'a str,
     pub kernel_cmdline: &'a str,
     pub two_pass_add_pages: Option<bool>,
+    /// Whether this image's OVMF normalizes the Linux setup header before
+    /// measuring the kernel. Defaults to `false`, which is the behavior of
+    /// every image built before the normalization landed; callers that have
+    /// the image metadata set it from `kernel_header_normalized`.
+    #[builder(default = false)]
+    pub normalized_setup_header: bool,
     pub pic: Option<bool>,
     pub qemu_version: Option<String>,
     #[builder(default = false)]
@@ -33,6 +39,12 @@ pub struct Machine<'a> {
     /// predate this field keep the historical single-NIC layout.
     #[builder(default = 1)]
     pub num_nics: u32,
+    /// Number of virtio-blk verity volumes attached before the NICs.
+    #[builder(default)]
+    pub num_verity_volumes: u32,
+    /// Whether QEMU attaches a tpm-tis device backed by swtpm.
+    #[builder(default)]
+    pub swtpm: bool,
     pub hotplug_off: bool,
     pub root_verity: bool,
     #[builder(default)]
@@ -44,17 +56,26 @@ pub struct Machine<'a> {
 }
 
 fn parse_version_tuple(v: &str) -> Result<(u32, u32, u32)> {
-    let parts: Vec<u32> = v
-        .split('.')
-        .map(|p| p.parse::<u32>().context("Invalid version number"))
-        .collect::<Result<Vec<_>, _>>()?;
-    if parts.len() != 3 {
-        bail!(
-            "Version string must have exactly 3 parts (major.minor.patch), got {}",
-            parts.len()
-        );
+    let mut parts = v.split('.');
+    let major = parts
+        .next()
+        .context("Version string must have exactly 3 parts (major.minor.patch)")?
+        .parse::<u32>()
+        .context("Invalid version number")?;
+    let minor = parts
+        .next()
+        .context("Version string must have exactly 3 parts (major.minor.patch)")?
+        .parse::<u32>()
+        .context("Invalid version number")?;
+    let patch = parts
+        .next()
+        .context("Version string must have exactly 3 parts (major.minor.patch)")?
+        .parse::<u32>()
+        .context("Invalid version number")?;
+    if parts.next().is_some() {
+        bail!("Version string must have exactly 3 parts (major.minor.patch)");
     }
-    Ok((parts[0], parts[1], parts[2]))
+    Ok((major, minor, patch))
 }
 
 impl Machine<'_> {
@@ -122,6 +143,7 @@ impl Machine<'_> {
             initrd_data.len() as u32,
             self.memory_size,
             0x28000,
+            self.normalized_setup_header,
         )?;
         debug_print_log("RTMR1", &rtmr1_log);
         let rtmr1 = measure_log(&rtmr1_log);

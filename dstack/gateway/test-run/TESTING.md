@@ -2,190 +2,107 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Gateway test plan
+# Gateway integration tests
 
-This document records the local checks used for the gateway handshake-cache
-change. The goal is to verify three things:
+Three suites, all under docker compose, all driven from the host. None of them
+needs root on the machine running them, and none of them leaves anything behind.
 
-1. the generic `cached-cell` crate behaves correctly;
-2. existing gateway control-plane and WaveKV flows still work;
-3. the proxy data path does not call blocking `wg show latest-handshakes` per
-   request.
+| Suite | Covers | Run it |
+| --- | --- | --- |
+| `e2e/` | certbot, ACME, DNS-01 and `dns-persist-01` | `e2e/run-e2e.sh` |
+| `cluster/` | WaveKV replication, node identity, partition recovery, admin RPCs | `cluster/run-cluster-tests.sh` |
+| `proxy-e2e/` | the proxy data path: splice, kTLS, half-close, idle reaping | `proxy-e2e/run-proxy-tests.sh` |
 
-## Prerequisites
+Each has a `--skip-build` flag that reuses the `dstack-gateway` binary already
+staged next to its compose file, and a `down` subcommand that tears everything
+down.
 
-Run on Linux with:
+## Attestation is on
 
-- Rust toolchain;
-- `sudo`, `ip`, `wg` / `wireguard-tools`;
-- `curl`, `openssl`, `python3`;
-- `wrk` for the performance test.
+There is no switch to turn the checks off. The gateways obtain their
+RPC certificates from the guest agent simulator, which signs quotes under trust
+anchors derived from `attestation/tee-simulator.json`; the mock collateral
+service reconstructs the matching public roots from the same seed, and the
+gateways verify each other through the normal production path.
 
-The integration script creates temporary WireGuard interfaces named
-`wavekv-test1`, `wavekv-test2`, and `wavekv-test3`, so it needs root privileges.
+That is the point of the arrangement rather than a detail of it: the cluster's
+mTLS is what `cluster/` exists to exercise, and a suite that switched the checks
+off would be testing the switch.
+
+## One seed, one fixture per suite
+
+`attestation/fixture.yml` describes the simulator and the collateral service;
+each suite brings up its own copy under its own `FIXTURE_NS`, and tears down
+only that copy.
+
+The seed that signs the quotes and the seed that derives the verifying roots
+must not drift apart, and they cannot: both come from files in `attestation/`,
+so separate instances started from them agree by construction. Sharing one
+running instance across the suites was the earlier arrangement and bought
+nothing the files did not already guarantee -- while costing a teardown race,
+where whichever suite finished first removed a fixture the others were still
+using, and, in CI, three workflows that could not run at the same time.
+
+## One project per test
+
+The cluster suite gives each test a throwaway compose project of its own. Its
+containers, its logs and its data directory are empty when it starts because
+they are new -- not because something cleaned them up.
+
+That is the point rather than a detail. The version before it shared three
+containers across all 28 tests and cleaned between them, which needed a wipe
+helper, a time window on `docker logs`, and a lock to stop two runs from
+clearing each other's state. Each of those three was the direct cause of a bug
+during development, and each stops being possible here.
 
 ## Unit and build checks
 
-From the repository root:
+From `dstack/`:
 
 ```bash
 cargo test -p cached-cell
 cargo test --manifest-path gateway/Cargo.toml
-cargo check --manifest-path gateway/Cargo.toml
-cargo clippy -- \
-  -D warnings \
-  -D clippy::expect_used \
-  -D clippy::unwrap_used \
+cargo clippy -- -D warnings -D clippy::expect_used -D clippy::unwrap_used \
   --allow unused_variables
 ```
 
-Expected result: all commands pass.
+## What runs in CI
 
-## WaveKV / gateway integration test
-
-Build the gateway binary first:
-
-```bash
-cargo build --release --manifest-path gateway/Cargo.toml
-```
-
-Then run the integration suite:
-
-```bash
-cd gateway/test-run
-sudo -E GATEWAY_BIN="$(pwd)/../../target/release/dstack-gateway" ./test_suite.sh
-```
-
-The suite starts real gateway processes and exercises:
-
-- CVM registration through `POST /prpc/RegisterCvm` on the debug service;
-- admin RPCs such as `Admin.SetNodeUrl`, `Admin.SetNodeStatus`, and
-  `Admin.WaveKvStatus`;
-- WaveKV persistent and ephemeral sync between gateway nodes;
-- node restart, network partition recovery, periodic persistence, and node
-  up/down filtering.
-
-Expected result:
-
-```text
-Tests passed: 19
-```
-
-Important request paths covered by this suite:
-
-| Path | Purpose |
+| Workflow | Suite |
 | --- | --- |
-| `POST /prpc/RegisterCvm` | Register a CVM, allocate a WireGuard IP, update gateway state. |
-| `POST /prpc/Debug.Info` | Verify the debug service is available. |
-| `POST /prpc/Debug.GetSyncData` | Inspect peer/node/instance data synced through WaveKV. |
-| `POST /prpc/GetProxyState` | Compare in-memory proxy state with WaveKV state. |
-| `POST /prpc/Admin.SetNodeUrl` | Register peer gateway URLs. |
-| `POST /prpc/Admin.SetNodeStatus` | Mark nodes up/down and verify registration filtering. |
-| `POST /prpc/Admin.WaveKvStatus` | Inspect WaveKV store status. |
-| `POST /wavekv/sync/persistent` | Gateway-to-gateway persistent data sync. |
-| `POST /wavekv/sync/ephemeral` | Gateway-to-gateway last-seen/handshake/connection sync. |
-
-## Real proxy data-path smoke test
-
-The integration suite above validates registration and sync, but it does not
-open a client connection through the gateway proxy. For the proxy data path, use
-this shape:
-
-1. Start one `dstack-gateway` with debug/admin enabled and `insecure_skip_attestation = true`.
-2. Register a test CVM through the debug `RegisterCvm` RPC.
-3. Bind a local HTTPS backend to the allocated CVM IP, for example
-   `10.0.51.2:23143`.
-4. Serve a local DNS TXT response:
-
-   ```text
-   _dstack-app-address.proxy-flow.local TXT "proxyflow:23143"
-   ```
-
-5. Allow the backend port with `Admin.SetInstancePortPolicy` so the proxy data
-   path is not blocked by port-policy fail-close.
-6. Send a request through the proxy:
-
-   ```bash
-   curl -skf \
-     --connect-to proxy-flow.local:13114:127.0.0.1:13114 \
-     https://proxy-flow.local:13114/proxy-e2e
-   ```
-
-Expected response from the backend:
-
-```text
-proxy-e2e-ok path=/proxy-e2e
-```
-
-Expected gateway log shape:
-
-```text
-got sni: proxy-flow.local
-target address is proxyflow:23143
-connecting to 10.0.51.2:23143
-connected to 10.0.51.2:23143
-```
-
-This confirms the real data flow:
-
-```text
-client -> gateway proxy -> SNI parse -> DNS TXT lookup -> ProxyState selection -> backend TLS service
-```
-
-## Proxy performance / hot-path check
-
-The performance test uses the same real proxy data flow as the smoke test, with
-one extra control: put a temporary `wg` wrapper earlier in `PATH` for the gateway
-process. The wrapper delegates normal commands to `/usr/bin/wg`, but for
-
-```text
-wg show <iface> latest-handshakes
-```
-
-it returns a fixed test public key and records the call. This verifies that the
-proxy hot path does not execute blocking `wg show` for every request.
-
-Use `wrk` for three measurements:
-
-```bash
-# Direct backend baseline.
-wrk -t4 -c64 -d15s https://10.0.62.2:23243/bench
-
-# Gateway proxy with keep-alive.
-wrk -t4 -c64 -d15s https://proxy-perf.local:13214/bench
-
-# Gateway proxy with new TLS connections.
-wrk -t4 -c32 -d10s -H 'Connection: close' \
-  https://proxy-perf.local:13214/bench-close
-```
-
-Reference result from the local PR run:
-
-```text
-direct backend keep-alive:        71507 req/s, avg latency 1.14ms
-gateway proxy keep-alive:         33842 req/s, avg latency 8.83ms
-gateway proxy connection-close:     874 req/s, avg latency 33.45ms
-```
-
-The same run handled more than 500k proxy keep-alive requests. The `wg` wrapper
-recorded:
-
-```text
-wg show latest-handshakes: 7
-wg syncconf: 3
-```
-
-The important assertion is the call count: `wg show latest-handshakes` is only
-used by startup/preload and the periodic refresh task, not once per proxied
-request.
-
-## PR CI
-
-Check GitHub Actions before merging:
+| `.github/workflows/gateway-e2e-tests.yml` | `e2e/` |
+| `.github/workflows/gateway-cluster-tests.yml` | `cluster/` |
+| `.github/workflows/gateway-proxy-tests.yml` | `proxy-e2e/` |
 
 ```bash
 gh pr checks <PR_NUMBER> --repo Dstack-TEE/dstack --watch=false
 ```
 
-Expected result: all required checks pass, including `gateway`, `rust-checks`,
-`prek`, `reuse-lint`, and CodeQL.
+## The kTLS fallback arm
+
+One arm of the proxy suite asserts that a gateway configured for kTLS on a
+kernel without the TLS ULP falls back to userspace instead of truncating a gated
+transfer at the gate. It runs in its own container, because the condition is
+produced by a seccomp profile -- `setsockopt(IPPROTO_TCP, TCP_ULP)` returns
+`ENOPROTOOPT` -- and a seccomp profile is fixed when a container is created.
+
+See `proxy-e2e/README.md` for why that replaced taking the module away from the
+host with `rmmod`.
+
+## Proxy performance / hot-path check
+
+Not part of any suite, and not reproducible from this tree: the `wg` wrapper and
+the `/bench` endpoints it describes were never checked in. The numbers below are
+kept as the record of one manual run made for the handshake-cache change, and
+the claim they support -- that the proxy hot path does not shell out to
+`wg show latest-handshakes` per request -- is what the assertion in
+`test_proxy.sh` (`test_accel_status`) covers on every run.
+
+```text
+direct backend keep-alive:        71507 req/s, avg latency 1.14ms
+gateway proxy keep-alive:         33842 req/s, avg latency 8.83ms
+gateway proxy connection-close:     874 req/s, avg latency 33.45ms
+
+wg show latest-handshakes: 7   (over 500k proxied keep-alive requests)
+wg syncconf: 3
+```

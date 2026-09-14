@@ -11,16 +11,19 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dstack_gateway_rpc::GetPeersResponse;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use wavekv::{
-    sync::{ExchangeInterface, SyncConfig as KvSyncConfig, SyncManager, SyncMessage, SyncResponse},
+    sync::{
+        ExchangeInterface, PeerLinkStatus, SyncConfig as KvSyncConfig, SyncEnvelope, SyncManager,
+        SyncMessage, SyncResponse,
+    },
     types::NodeId,
     Node,
 };
 
 use crate::config::SyncConfig as GwSyncConfig;
 
-use super::https_client::{HttpsClient, HttpsClientConfig};
+use super::https_client::{HttpStatusError, HttpsClient, HttpsClientConfig};
 use super::KvStore;
 
 /// HTTP-based network transport for WaveKV sync.
@@ -37,15 +40,42 @@ pub struct HttpSyncNetwork {
 }
 
 impl HttpSyncNetwork {
+    /// Whether a peer rejected a send with HTTP 403.
+    fn was_rejected(err: &anyhow::Error) -> bool {
+        err.chain()
+            .filter_map(|cause| cause.downcast_ref::<HttpStatusError>())
+            .any(|status| status.0 == 403)
+    }
+
+    /// Count a 403 for this node's own monitoring. Sync endpoints use 403 for
+    /// both removal lockouts and app-identity mismatches, so the metric and log
+    /// deliberately report a rejection without claiming which condition caused it.
+    fn note_if_rejected(err: &anyhow::Error, peer: NodeId) {
+        if !Self::was_rejected(err) {
+            return;
+        }
+        crate::metrics::record_sync_rejected();
+        error!(
+            "peer {peer} rejected this node's sync envelope (HTTP 403); \
+             this can indicate a removal lockout or an app-identity mismatch"
+        );
+    }
+    /// `my_uuid` is passed in rather than read back out of the store.
+    ///
+    /// Our own uuid is local configuration, not replicated state, and sourcing
+    /// it from the store forced this node's `node/info` record to be written
+    /// before the service could be built — which is to say before `bootstrap`
+    /// had rebuilt the sequence counter. After a data-directory loss that made
+    /// the record spend a sequence number the peers already consider seen, so
+    /// the one record they check us against was the one guaranteed to be
+    /// dropped.
     pub fn new(
         kv_store: KvStore,
         store_path: &'static str,
         tls_config: &HttpsClientConfig,
+        my_uuid: Vec<u8>,
     ) -> Result<Self> {
         let client = HttpsClient::new(tls_config)?;
-        let my_uuid = kv_store
-            .get_peer_uuid(kv_store.my_node_id)
-            .context("failed to get my UUID")?;
         Ok(Self {
             client,
             kv_store,
@@ -69,29 +99,62 @@ impl ExchangeInterface for HttpSyncNetwork {
         self.kv_store.get_peer_uuid(node_id)
     }
 
-    async fn sync_to(&self, _node: &Node, peer: NodeId, msg: SyncMessage) -> Result<SyncResponse> {
+    async fn sync_to(
+        &self,
+        _node: &Node,
+        _peer: NodeId,
+        _msg: SyncMessage,
+    ) -> Result<SyncResponse> {
+        anyhow::bail!("wavekv v1 peer synchronization is not supported")
+    }
+
+    /// Native WaveKV exchange.
+    ///
+    /// All deployed clusters use this wire protocol. WaveKV 1.0 data directories are
+    /// migrated in place during a stopped single-node upgrade; no mixed-version network
+    /// protocol is exposed by the gateway.
+    async fn sync_v2_to(
+        &self,
+        _node: &Node,
+        peer: NodeId,
+        env: SyncEnvelope,
+    ) -> Result<Option<SyncEnvelope>> {
+        let sync_url = self.route_for(peer, "sync")?;
+
+        let body = self
+            .client
+            .post_bytes_response(&sync_url, env.encode()?)
+            .await
+            .with_context(|| format!("failed to sync to peer {peer} at {sync_url}"))
+            .inspect_err(|err| Self::note_if_rejected(err, peer))?;
+
+        self.kv_store.update_peer_last_seen(peer);
+        Ok(Some(SyncEnvelope::decode(&body)?))
+    }
+
+    /// Opportunistic push. Best-effort by design: the periodic round remains the
+    /// anti-entropy backstop and the only ack authority.
+    async fn push_to(&self, _node: &Node, peer: NodeId, env: SyncEnvelope) -> Result<()> {
+        let push_url = self.route_for(peer, "push")?;
+        self.client
+            .post_bytes_no_response(&push_url, env.encode()?)
+            .await
+            .with_context(|| format!("failed to push to peer {peer} at {push_url}"))
+            .inspect_err(|err| Self::note_if_rejected(err, peer))?;
+        Ok(())
+    }
+}
+
+impl HttpSyncNetwork {
+    fn route_for(&self, peer: NodeId, verb: &str) -> Result<String> {
         let url = self
             .get_peer_url(peer)
-            .ok_or_else(|| anyhow::anyhow!("peer {} address not found in DB", peer))?;
-
-        let sync_url = format!(
-            "{}/wavekv/sync/{}",
+            .ok_or_else(|| anyhow::anyhow!("peer {peer} address not found in DB"))?;
+        Ok(format!(
+            "{}/wavekv/{verb}/{}",
             url.trim_end_matches('/'),
             self.store_path
-        );
-
-        // Send request with msgpack + gzip encoding
-        // app_id verification happens during TLS handshake via AppIdVerifier
-        let sync_response: SyncResponse = self
-            .client
-            .post_compressed_msg(&sync_url, &msg)
-            .await
-            .with_context(|| format!("failed to sync to peer {peer} at {sync_url}"))?;
-
-        // Update peer last_seen on successful sync
-        self.kv_store.update_peer_last_seen(peer);
-
-        Ok(sync_response)
+        ))
     }
 }
 
@@ -101,6 +164,17 @@ pub struct WaveKvSyncService {
     pub ephemeral_manager: Arc<SyncManager<HttpSyncNetwork>>,
 }
 
+/// Wake the opportunistic push path after a latency-sensitive persistent write.
+pub trait PersistentWriteNotifier: Send + Sync {
+    fn notify_persistent_write(&self);
+}
+
+impl PersistentWriteNotifier for WaveKvSyncService {
+    fn notify_persistent_write(&self) {
+        self.persistent_manager.notify_local_write();
+    }
+}
+
 impl WaveKvSyncService {
     /// Create a new WaveKV sync service
     ///
@@ -108,19 +182,24 @@ impl WaveKvSyncService {
     /// * `kv_store` - The sync store containing persistent and ephemeral nodes
     /// * `sync_config` - Sync configuration
     /// * `tls_config` - TLS configuration for mTLS peer authentication
+    /// * `my_uuid` - This node's uuid, from local configuration
     pub fn new(
         kv_store: &KvStore,
         sync_config: &GwSyncConfig,
         tls_config: HttpsClientConfig,
+        my_uuid: Vec<u8>,
     ) -> Result<Self> {
         let sync_config = KvSyncConfig {
             interval: sync_config.interval,
             timeout: sync_config.timeout,
+            ..Default::default()
         };
 
         // Both networks use the same persistent node for URL lookup, but different paths
-        let persistent_network = HttpSyncNetwork::new(kv_store.clone(), "persistent", &tls_config)?;
-        let ephemeral_network = HttpSyncNetwork::new(kv_store.clone(), "ephemeral", &tls_config)?;
+        let persistent_network =
+            HttpSyncNetwork::new(kv_store.clone(), "persistent", &tls_config, my_uuid.clone())?;
+        let ephemeral_network =
+            HttpSyncNetwork::new(kv_store.clone(), "ephemeral", &tls_config, my_uuid)?;
 
         let persistent_manager = Arc::new(SyncManager::with_config(
             kv_store.persistent().clone(),
@@ -164,14 +243,30 @@ impl WaveKvSyncService {
         info!("WaveKV sync tasks started");
     }
 
-    /// Handle incoming sync request for persistent store
-    pub fn handle_persistent_sync(&self, msg: SyncMessage) -> Result<SyncResponse> {
-        self.persistent_manager.handle_sync(msg)
+    fn manager_for(&self, store: &str) -> Option<&Arc<SyncManager<HttpSyncNetwork>>> {
+        match store {
+            "persistent" => Some(&self.persistent_manager),
+            "ephemeral" => Some(&self.ephemeral_manager),
+            _ => None,
+        }
     }
 
-    /// Handle incoming sync request for ephemeral store
-    pub fn handle_ephemeral_sync(&self, msg: SyncMessage) -> Result<SyncResponse> {
-        self.ephemeral_manager.handle_sync(msg)
+    /// Handle an inbound sync envelope.
+    pub fn handle_envelope(&self, store: &str, env: SyncEnvelope) -> Option<Result<SyncEnvelope>> {
+        Some(self.manager_for(store)?.handle_envelope(env))
+    }
+
+    /// Handle an inbound opportunistic push (merges data only; never moves acks).
+    pub fn handle_push(&self, store: &str, env: SyncEnvelope) -> Option<Result<()>> {
+        Some(self.manager_for(store)?.handle_push(env))
+    }
+
+    /// Per-peer digest and failure telemetry for both stores.
+    pub fn link_status(&self) -> Vec<(&'static str, Vec<PeerLinkStatus>)> {
+        vec![
+            ("persistent", self.persistent_manager.link_status()),
+            ("ephemeral", self.ephemeral_manager.link_status()),
+        ]
     }
 }
 
@@ -235,4 +330,46 @@ pub async fn fetch_peers_from_bootnode(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sync_rejection_tests {
+    use super::*;
+
+    fn wrapped(status: u16) -> anyhow::Error {
+        anyhow::Error::new(HttpStatusError(status)).context(
+            "failed to sync to peer 2 at https://gw2.example.com:9202/wavekv/sync/persistent",
+        )
+    }
+
+    /// Only HTTP 403 is a rejection; transport errors and other HTTP failures
+    /// must not increment the rejection counter.
+    #[test]
+    fn only_a_403_reads_as_rejected() {
+        assert!(HttpSyncNetwork::was_rejected(&wrapped(403)));
+        for status in [400u16, 401, 404, 500, 503] {
+            assert!(
+                !HttpSyncNetwork::was_rejected(&wrapped(status)),
+                "status {status} must not read as a rejection"
+            );
+        }
+        assert!(!HttpSyncNetwork::was_rejected(&anyhow::anyhow!(
+            "connection refused"
+        )));
+    }
+
+    /// The rejection must reach the node's own monitoring.
+    #[test]
+    fn a_rejection_is_counted_for_the_senders_own_monitoring() {
+        // Process-wide static: assert on the delta, never the absolute value.
+        let before = crate::metrics::sync_rejected_count();
+        HttpSyncNetwork::note_if_rejected(&wrapped(500), 2);
+        assert_eq!(
+            crate::metrics::sync_rejected_count(),
+            before,
+            "an ordinary failure must not count as a rejection"
+        );
+        HttpSyncNetwork::note_if_rejected(&wrapped(403), 2);
+        assert!(crate::metrics::sync_rejected_count() > before);
+    }
 }

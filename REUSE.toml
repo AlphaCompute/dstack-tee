@@ -48,7 +48,7 @@ path = [
     "sdk/go/go.sum",
     "sdk/go/ratls/go.sum",
     "dstack/kms/dstack-app/builder/shared/builder-pinned-packages.txt",
-    "dstack/kms/dstack-app/builder/shared/qemu-pinned-packages.txt",
+    "dstack/kms/dstack-app/builder/shared/pinned-packages.txt",
     "dstack/gateway/dstack-app/builder/shared/builder-pinned-packages.txt",
     "dstack/gateway/dstack-app/builder/shared/pinned-packages.txt",
 ]
@@ -59,7 +59,6 @@ SPDX-License-Identifier = "Apache-2.0"
 path = [
     "dstack/gateway/templates/wg.conf",
     "dstack/guest-agent/templates/metrics.tpl",
-    "dstack/local-key-provider/build/sgx_default_qcnl.conf",
 ]
 SPDX-FileCopyrightText = "Copyright (c) 2024-2025 The Project Contributors"
 SPDX-License-Identifier = "Apache-2.0"
@@ -83,7 +82,11 @@ SPDX-FileCopyrightText = "Copyright (c) 2024-2025 The Project Contributors"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
-path = "os/common/rootfs/**"
+path = [
+    "os/common/nvidia/**",
+    "os/common/rootfs/**",
+    "os/common/scripts/**",
+]
 SPDX-FileCopyrightText = "Copyright (c) 2024-2025 The Project Contributors"
 SPDX-License-Identifier = "Apache-2.0"
 
@@ -123,6 +126,16 @@ SPDX-License-Identifier = "Apache-2.0"
 [[annotations]]
 path = "os/yocto/**"
 SPDX-FileCopyrightText = "Copyright (c) Hashforest Technology LLC"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Experimental Debian/mkosi guest OS backend. Supplies the copyright for the
+# formats that cannot carry a header; everything that can now does. It is
+# deliberately not precedence = "override", so a patch backported from an
+# upstream project keeps that project's license instead of being relabelled
+# Apache-2.0.
+[[annotations]]
+path = "os/mkosi/**"
+SPDX-FileCopyrightText = "© 2026 Phala Network <dstack@phala.network>"
 SPDX-License-Identifier = "Apache-2.0"
 
 # Legacy cross-component tools kept outside the Yocto backend.
@@ -170,6 +183,13 @@ precedence = "override"
 path = "dstack/kms/auth-eth/lib/forge-std/**"
 SPDX-FileCopyrightText = "NONE"
 SPDX-License-Identifier = "Apache-2.0"
+precedence = "override"
+
+# ktls 6.0.2 plus rustls/ktls#70; see dstack/vendor/README.md.
+[[annotations]]
+path = "dstack/vendor/ktls/**"
+SPDX-FileCopyrightText = "Copyright (c) 2022 Amos Wenger <amos@bearcove.net>"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
 precedence = "override"
 
 # Generated files
@@ -240,5 +260,10 @@ path = [
     "dstack/gateway/test-run/e2e/configs/*",
     "dstack/gateway/test-run/e2e/pebble-config.json",
 ]
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = "dstack/crates/qemu-acpi/fixtures/*.bin"
 SPDX-FileCopyrightText = "NONE"
 SPDX-License-Identifier = "CC0-1.0"

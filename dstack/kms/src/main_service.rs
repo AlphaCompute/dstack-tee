@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -13,21 +13,20 @@ use std::{
 use anyhow::{bail, Context, Result};
 use dstack_kms_rpc::{
     kms_server::{KmsRpc, KmsServer},
-    AppId, AppKeyResponse, ClearImageCacheRequest, GetAppKeyRequest, GetKmsKeyRequest,
-    GetMetaResponse, GetTempCaCertResponse, KmsKeyResponse, KmsKeys, PublicKeyResponse,
-    SignCertRequest, SignCertResponse,
+    AppId, AppKeyResponse, GetAppKeyRequest, GetKmsKeyRequest, GetMetaResponse,
+    GetTempCaCertResponse, KmsKeyResponse, KmsKeys, PublicKeyResponse, SignCertRequest,
+    SignCertResponse,
 };
 use dstack_verifier::{CvmVerifier, VerificationDetails};
 use fs_err as fs;
 use k256::ecdsa::SigningKey;
 use ra_rpc::{CallContext, RpcCall};
 use ra_tls::{
-    attestation::{AttestationMode, VerifiedAttestation},
+    attestation::{AttestationVerifier, TeeVariant, VerifiedAttestation},
     cert::{CaCert, CertRequest, CertSigningRequestV1, CertSigningRequestV2, Csr},
     kdf,
 };
 use scale::Decode;
-use sha2::Digest;
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 use upgrade_authority::{build_boot_info, ensure_app_id_len, local_kms_boot_info, BootInfo};
@@ -60,6 +59,7 @@ pub struct KmsStateInner {
     temp_ca_cert: String,
     temp_ca_key: String,
     verifier: CvmVerifier,
+    attestation_verifier: Arc<AttestationVerifier>,
     self_boot_info: OnceCell<BootInfo>,
     metrics: KmsMetrics,
 }
@@ -95,7 +95,44 @@ impl KmsMetrics {
     }
 }
 
+/// remove a single cache entry (a hex-named subdir/file) under `parent_dir`, or
+/// everything when `sub_dir == "all"`. A non-hex key is rejected to keep the
+/// deletion confined to the cache.
+fn remove_cache(parent_dir: &Path, sub_dir: &str) -> Result<()> {
+    if sub_dir.is_empty() {
+        return Ok(());
+    }
+    if sub_dir == "all" {
+        if parent_dir.exists() {
+            fs::remove_dir_all(parent_dir)?;
+        }
+        return Ok(());
+    }
+    if !sub_dir.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid cache key");
+    }
+    let path = parent_dir.join(sub_dir);
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else if path.is_file() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 impl KmsState {
+    /// clear cached image and measurement material for the given hashes. Used by
+    /// the admin `ClearImageCache` RPC; authorization is enforced by the admin
+    /// listener's HTTP authenticator, not here.
+    pub(crate) fn clear_image_cache(&self, image_hash: &str, config_hash: &str) -> Result<()> {
+        let images_dir = self.config.image.cache_dir.join("images");
+        remove_cache(&images_dir, image_hash).context("failed to clear image cache")?;
+        // measurement cache is kept by the verifier under measurements/.
+        let mr_cache_dir = self.config.image.cache_dir.join("measurements");
+        remove_cache(&mr_cache_dir, config_hash).context("failed to clear measurement cache")?;
+        Ok(())
+    }
+
     pub fn new(config: KmsConfig) -> Result<Self> {
         let root_ca = CaCert::load(config.root_ca_cert(), config.root_ca_key())
             .context("Failed to load root CA certificate")?;
@@ -106,11 +143,15 @@ impl KmsState {
             fs::read_to_string(config.tmp_ca_key()).context("Faeild to read temp ca key")?;
         let temp_ca_cert =
             fs::read_to_string(config.tmp_ca_cert()).context("Faeild to read temp ca cert")?;
+        let attestation_verifier = Arc::new(
+            AttestationVerifier::load(&config.attestation)
+                .context("failed to load attestation verifier")?,
+        );
         let verifier = CvmVerifier::new(
             config.image.cache_dir.display().to_string(),
             config.image.download_url.clone(),
             config.image.download_timeout,
-            config.pccs_url.clone(),
+            attestation_verifier.clone(),
         );
         if !config.enforce_self_authorization {
             warn!(
@@ -125,6 +166,7 @@ impl KmsState {
                 temp_ca_cert,
                 temp_ca_key,
                 verifier,
+                attestation_verifier,
                 self_boot_info: OnceCell::new(),
                 metrics: KmsMetrics::default(),
             }),
@@ -133,6 +175,10 @@ impl KmsState {
 
     pub(crate) fn metrics(&self) -> &KmsMetrics {
         &self.inner.metrics
+    }
+
+    pub(crate) fn attestation_verifier(&self) -> Arc<AttestationVerifier> {
+        self.inner.attestation_verifier.clone()
     }
 }
 
@@ -170,11 +216,11 @@ fn ensure_key_release_allowed(
     snp_enabled: bool,
     aws_nitro_tpm_enabled: bool,
 ) -> Result<()> {
-    match boot_info.attestation_mode {
-        AttestationMode::DstackAmdSevSnp if !snp_enabled => {
+    match boot_info.tee_variant {
+        TeeVariant::DstackAmdSevSnp if !snp_enabled => {
             bail!("amd sev-snp key release is not enabled")
         }
-        AttestationMode::DstackAwsNitroTpm if !aws_nitro_tpm_enabled => {
+        TeeVariant::DstackAwsNitroTpm if !aws_nitro_tpm_enabled => {
             bail!("aws nitro-tpm key release is not enabled")
         }
         _ => Ok(()),
@@ -200,7 +246,7 @@ impl RpcHandler {
         let boot_info = self
             .state
             .self_boot_info
-            .get_or_try_init(|| local_kms_boot_info(self.state.config.pccs_url.as_deref()))
+            .get_or_try_init(|| local_kms_boot_info(&self.state.attestation_verifier))
             .await
             .context("Failed to load cached self boot info")?;
         let response = self
@@ -234,43 +280,6 @@ impl RpcHandler {
         let att = self.ensure_attested()?;
         self.ensure_app_attestation_allowed(att, false, false, vm_config)
             .await
-    }
-
-    fn image_cache_dir(&self) -> PathBuf {
-        self.state.config.image.cache_dir.join("images")
-    }
-
-    fn remove_cache(&self, parent_dir: &Path, sub_dir: &str) -> Result<()> {
-        if sub_dir.is_empty() {
-            return Ok(());
-        }
-
-        if sub_dir == "all" {
-            fs::remove_dir_all(parent_dir)?;
-            return Ok(());
-        }
-
-        if !sub_dir.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!("Invalid cache key");
-        }
-
-        let path = parent_dir.join(sub_dir);
-
-        if path.is_dir() {
-            fs::remove_dir_all(path)?;
-        } else if path.is_file() {
-            fs::remove_file(path)?;
-        }
-
-        Ok(())
-    }
-
-    fn ensure_admin(&self, token: &str) -> Result<()> {
-        let token_hash = sha2::Sha256::new_with_prefix(token).finalize();
-        if token_hash.as_slice() != self.state.config.admin_token_hash.as_slice() {
-            bail!("Invalid token");
-        }
-        Ok(())
     }
 
     async fn verify_os_image_hash(
@@ -311,7 +320,7 @@ impl RpcHandler {
         // SNP rootfs/app/config binding is handled by the SNP launch-measurement
         // helper above. The legacy OS-image verifier is TDX-oriented and still
         // rejects SNP quotes; keep SNP on the explicit fail-closed helper path.
-        if boot_info.attestation_mode != AttestationMode::DstackAmdSevSnp {
+        if boot_info.tee_variant != TeeVariant::DstackAmdSevSnp {
             self.verify_os_image_hash(vm_config_str.into(), att)
                 .await
                 .context("Failed to verify os image hash")?;
@@ -485,6 +494,20 @@ impl KmsRpc for RpcHandler {
         })
     }
 
+    /// Serve the temp CA certificate and key.
+    ///
+    /// Both current callers - guests at boot, and KMS-to-KMS onboarding
+    /// ([`crate::onboard_service`]) - fetch this CA and mint their client certificate
+    /// from it, because the KMS used to pin the CA for mutual TLS and a self-issued
+    /// certificate had nothing to chain to.
+    ///
+    /// That pin is gone: client certificates are now verified by the attestation they
+    /// carry (`ra_rpc::ratls_client_verifier`), so a self-issued certificate would be
+    /// accepted on the same terms. Neither caller has been migrated yet, so this RPC
+    /// still has to work.
+    ///
+    /// The key it returns authenticates nobody: it is handed to any caller. Removing
+    /// this RPC needs both callers migrated first.
     async fn get_temp_ca_cert(self) -> Result<GetTempCaCertResponse> {
         let self_boot_info = self
             .ensure_self_allowed()
@@ -527,7 +550,7 @@ impl KmsRpc for RpcHandler {
             .attestation
             .clone()
             .into_v1()
-            .verify_with_ra_pubkey(&csr.pubkey, self.state.config.pccs_url.as_deref())
+            .verify_with_ra_pubkey(&csr.pubkey, &self.state.attestation_verifier)
             .await
             .context("Quote verification failed")?;
         let app_info = self
@@ -549,17 +572,6 @@ impl KmsRpc for RpcHandler {
                 self.state.root_ca.pem_cert.clone(),
             ],
         })
-    }
-
-    async fn clear_image_cache(self, request: ClearImageCacheRequest) -> Result<()> {
-        self.ensure_admin(&request.token)?;
-        self.remove_cache(&self.image_cache_dir(), &request.image_hash)
-            .context("Failed to clear image cache")?;
-        // Clear measurement cache (now handled by verifier's cache in measurements/ dir)
-        let mr_cache_dir = self.state.config.image.cache_dir.join("measurements");
-        self.remove_cache(&mr_cache_dir, &request.config_hash)
-            .context("Failed to clear measurement cache")?;
-        Ok(())
     }
 }
 
@@ -585,7 +597,30 @@ mod tests {
         compute_expected_measurement, MeasurementInput, OvmfSectionParam,
     };
     use cc_eventlog::RuntimeEvent;
-    use sha2::{Sha256, Sha384};
+    use sha2::{Digest, Sha256, Sha384};
+
+    #[test]
+    fn remove_cache_only_deletes_the_named_hex_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let keep = root.join("cafe");
+        let drop = root.join("beef");
+        fs::create_dir_all(&keep).unwrap();
+        fs::create_dir_all(&drop).unwrap();
+
+        remove_cache(root, "beef").unwrap();
+        assert!(!drop.exists(), "named entry must be removed");
+        assert!(keep.exists(), "other entries must be kept");
+
+        // empty key is a no-op; a non-hex key is rejected before touching disk.
+        remove_cache(root, "").unwrap();
+        assert!(remove_cache(root, "../escape").is_err());
+        assert!(keep.exists());
+
+        // "all" clears the whole cache dir.
+        remove_cache(root, "all").unwrap();
+        assert!(!root.exists());
+    }
     use std::collections::BTreeMap;
 
     fn hex_of(byte: u8, len: usize) -> String {
@@ -633,6 +668,7 @@ mod tests {
         dstack_types::mr_config::MrConfigV3::new(
             vec![0x11; 20],
             vec![0x22; 32],
+            None,
             dstack_types::KeyProviderKind::None,
             Vec::new(),
             vec![0x99; 20],
@@ -759,7 +795,7 @@ mod tests {
     }
 
     fn runtime_event(event: &str, payload: Vec<u8>) -> RuntimeEvent {
-        RuntimeEvent::new(event.to_string(), payload)
+        RuntimeEvent::new(event.to_string(), payload, Default::default())
     }
 
     fn verified_aws_nitro_tpm_attestation(
@@ -853,10 +889,7 @@ mod tests {
             .expect("aws nitrotpm attestation should produce KMS boot info");
         let pcrs = verified_aws_nitro_tpm_pcrs(&attestation);
 
-        assert_eq!(
-            boot_info.attestation_mode,
-            AttestationMode::DstackAwsNitroTpm
-        );
+        assert_eq!(boot_info.tee_variant, TeeVariant::DstackAwsNitroTpm);
         assert_eq!(boot_info.tcb_status, "UpToDate");
         assert!(boot_info.advisory_ids.is_empty());
         assert_eq!(boot_info.app_id, vec![0x11; 20]);
@@ -911,7 +944,7 @@ mod tests {
         ensure_key_release_allowed(&boot_info, false, true).unwrap();
 
         // A TDX boot info is unaffected by the AWS gate even when it is disabled.
-        boot_info.attestation_mode = AttestationMode::DstackTdx;
+        boot_info.tee_variant = TeeVariant::DstackTdx;
         ensure_key_release_allowed(&boot_info, false, false).unwrap();
     }
 
@@ -1004,7 +1037,7 @@ mod tests {
         let boot_info = build_boot_info_for_attestation(&attestation, false, &vm_config)
             .expect("snp attestation should build boot info through vm_config path");
 
-        assert_eq!(boot_info.attestation_mode, AttestationMode::DstackAmdSevSnp);
+        assert_eq!(boot_info.tee_variant, TeeVariant::DstackAmdSevSnp);
         assert_eq!(boot_info.mr_aggregated.len(), 32);
         assert_eq!(boot_info.device_id, vec![0xab; 64]);
         assert_eq!(boot_info.app_id, vec![0x11; 20]);
@@ -1026,7 +1059,7 @@ mod tests {
         let boot_info = build_boot_info_for_attestation(&attestation, false, "")
             .expect("snp local KMS attestation should use embedded vm_config");
 
-        assert_eq!(boot_info.attestation_mode, AttestationMode::DstackAmdSevSnp);
+        assert_eq!(boot_info.tee_variant, TeeVariant::DstackAmdSevSnp);
         assert_eq!(boot_info.mr_aggregated.len(), 32);
         assert_eq!(boot_info.app_id, vec![0x11; 20]);
     }
@@ -1041,7 +1074,7 @@ mod tests {
 
         let boot_info = build_boot_info_for_attestation(&attestation, false, &vm_config)
             .expect("self-contained SNP vm_config should not require KMS-local sev_snp config");
-        assert_eq!(boot_info.attestation_mode, AttestationMode::DstackAmdSevSnp);
+        assert_eq!(boot_info.tee_variant, TeeVariant::DstackAmdSevSnp);
         assert_eq!(boot_info.device_id, vec![0xab; 64]);
     }
 

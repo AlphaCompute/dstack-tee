@@ -25,7 +25,7 @@ quantified and bounded.
   parallel paths (a separate `GetAppKeyAmd` was rejected on these grounds, #630). When an
   existing API is the wrong shape, add a purpose-built one rather than overloading a return
   value (`is_app_allowed` returning policy → add `auth_api.get_app_policy` instead, #538).
-- **Names must say what the thing does.** `GetQuote` for an app key → `GetAttestationForAppKey`
+- **Names must say what the thing does.** `GetQuote` for an app key → `AttestAppKey`
   (#360). An RPC named `ComposeHash` that returns an `app_id` is wrong (#181).
 - **Avoid enums in protobuf APIs** that surface as JSON — proto has no way to express
   snake_case serde renaming, so use strings (#241).
@@ -257,6 +257,11 @@ not just the symptom:
 
 ## Readability and idioms
 
+- **Import for readability, not minimum path length.** Import specific types and
+  frequently repeated operations when their short names remain unambiguous
+  (`TcpListener::bind`, `timeout`, `Command::new`). Keep qualifiers that carry useful
+  semantic context (`serde_json::from_slice`, `tokio::spawn`, `anyhow::bail!`). Follow
+  the surrounding module when either form is equally clear.
 - **Errors**: `anyhow` everywhere in services — `thiserror` only in library crates whose
   callers match on error variants. `bail!` inside an `if` is the guard idiom; **`ensure!`
   is never used in this codebase** (0 occurrences) and reads as foreign. `let ... else

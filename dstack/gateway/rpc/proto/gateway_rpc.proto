@@ -12,6 +12,20 @@ package gateway;
 message RegisterCvmRequest {
   // The public key of the WireGuard interface of the CVM.
   string client_public_key = 1;
+  // Whether this CVM asked for its traffic to be gated on application health,
+  // i.e. `requirements.health_check` in its app-compose. When true the
+  // gateway polls `Health` on the v1 external surface (`/prpc/v1/Health`) and
+  // holds the instance out of rotation until the first poll answers.
+  //
+  // Declared here rather than discovered by probing because the poller treats
+  // every failed poll alike: a timeout, a refused connection, and the 404 an
+  // image without `/prpc/v1` answers all count as one failure, and telling an
+  // old image apart from a broken app would mean classifying error shapes on
+  // every poll -- guessing wrong either blackholes healthy legacy instances
+  // or lets broken ones serve. False -- including "absent", from a CVM that
+  // predates this field or an app that never opted in -- means the gateway
+  // never polls and always treats the instance as healthy, exactly as before.
+  bool health_check = 3;
   // Per-port policy the gateway should apply when proxying to this CVM.
   // Wrapped in a message so we can distinguish "not reported" (old CVM →
   // gateway falls back to fetching app-compose via Info()) from "reported
@@ -104,10 +118,48 @@ message StatusResponse {
   repeated GatewayNodeInfo nodes = 6;
   // Peer uuid
   bytes uuid = 7;
+  // What the data path is actually doing with kTLS and splice.
+  ProxyAccelStatus accel = 8;
+  // Whether this node polls application health at all
+  // (`core.proxy.health_check.enabled`).
+  //
+  // Reported for the same reason as ProxyAccelStatus: the configured value is
+  // not otherwise observable at runtime, and here it changes what a host's
+  // `health` means. With polling off, an instance that opted in sits at
+  // "unknown" forever *and is fully eligible for traffic* -- indistinguishable,
+  // from the host list alone, from one that is being held out of rotation
+  // pending its first answer. That is the reading an operator is most likely to
+  // need during the incident that made them switch polling off.
+  bool health_gating = 9;
+}
+
+// Effective state of the data-path acceleration options.
+//
+// The configured value does not say what is running: the startup probe can turn
+// kTLS off on a kernel without the TLS ULP, and both options engage per
+// connection only once their gate fires. These are reported so an operator can
+// tell the difference without reading the startup log.
+message ProxyAccelStatus {
+  // Effective kTLS mode: "off", "immediate", "after 64 KiB or 5s", or
+  // "disabled (kernel has no TLS ULP)" when the startup probe cleared it.
+  string ktls_mode = 1;
+  // Effective splice mode, same encoding minus the probe case.
+  string splice_mode = 2;
+  // Connections handed to the kernel's TLS ULP since start.
+  uint64 ktls_offloaded = 3;
+  // Connections whose handover to the kernel failed.
+  uint64 ktls_offload_failed = 4;
+  // Connections that entered a zero-copy splice relay, on either path.
+  uint64 splice_engaged = 5;
 }
 
 // HostInfo is the information of a host.
 message HostInfo {
+  // Field 5 was `uint32 port`, removed by b325c0f8bf when multi-port listening
+  // replaced the single-port field, with no reserved marker left behind.
+  // Reserved now so the next person to extend this message cannot silently
+  // reuse it and break every older client that still sends it.
+  reserved 5;
   // The Instance id
   string instance_id = 1;
   // The IP address of the host.
@@ -120,6 +172,16 @@ message HostInfo {
   uint64 latest_handshake = 6;
   // The number of connections of the host.
   uint64 num_connections = 7;
+  // Whether the operator has left this instance in its app's load-balancing
+  // rotation (see Admin.SetInstanceReady). Absent when talking to a gateway
+  // that predates the traffic gate; absent must not be read as "gated off".
+  optional bool ready = 8;
+  // This node's last application-health observation: "healthy", "unhealthy",
+  // "unknown" (opted in, but no poll has answered yet) or "ungated" (never
+  // opted in, so never polled). A string rather than an enum so it stays
+  // readable as JSON. Empty when talking to a gateway that predates health
+  // polling.
+  string health = 9;
 }
 
 message QuotedPublicKey {
@@ -140,6 +202,23 @@ message AcmeInfoResponse {
   string account_quote = 4;
   // The attestation of the ACME account URI.
   string account_attestation = 5;
+}
+
+// Result of replacing the shared ACME account credentials.
+message RotateAcmeCredentialsResponse {
+  // URI of the newly-created ACME account. The private credentials are never returned.
+  string account_uri = 1;
+  // Number of ZT domains whose CAA records were updated for the new account.
+  uint32 domains_updated = 2;
+  // Zone-file lines an operator must publish by hand, for domains the gateway
+  // cannot write (dns-persist-01). Non-empty means issuance for those domains
+  // stays broken until they name the new account.
+  repeated string required_dns_records = 3;
+  // Domains whose CAA records could not be re-pinned to the new account. The
+  // rotation itself succeeded -- the account exists and the cluster is using
+  // it -- so this is reported rather than raised: repeating the rotation would
+  // register yet another account. Rerun SetCaa until it succeeds.
+  repeated string repin_failed_domains = 4;
 }
 
 // Get HostInfo for associated instance id.
@@ -309,9 +388,15 @@ message PeerSyncStatus {
   uint32 id = 1;
   uint64 local_ack = 2;
   uint64 peer_ack = 3;
-  uint64 buffered_logs = 4;
   // Last seen timestamps: [(observer_node_id, timestamp), ...]
-  repeated LastSeenEntry last_seen = 5;
+  repeated LastSeenEntry last_seen = 4;
+  // Whether this peer has ever reported an ack map.
+  bool heard_from = 5;
+  // Consecutive quiescent rounds whose state digests disagreed. Non-zero means the
+  // replicas have silently diverged; wavekv 1.x could not detect this at all.
+  uint32 digest_mismatches = 6;
+  // Consecutive sync rounds that failed outright.
+  uint32 consecutive_failures = 7;
 }
 
 message LastSeenEntry {
@@ -328,6 +413,13 @@ message StoreSyncStatus {
   bool dirty = 5;
   bool wal_enabled = 6;
   repeated PeerSyncStatus peers = 7;
+  // Hex SHA-256 over the replicated state. Two converged replicas produce equal
+  // digests by construction, so comparing this across the cluster is the promotion
+  // gate for the wavekv v2 rollout and the standing divergence check afterwards.
+  string digest = 8;
+  uint64 entries_merged = 9;
+  // Entries refused by the admission policy or the ingest quotas.
+  uint64 entries_rejected = 10;
 }
 
 // WaveKV sync status response
@@ -372,13 +464,18 @@ message GetNodeStatusesResponse {
   repeated NodeStatusEntry statuses = 1;
 }
 
+message ExitRequest {
+  // Exit immediately without waiting for in-flight requests to drain.
+  bool force = 1;
+}
+
 service Admin {
   // Get the status of the gateway.
   rpc Status(google.protobuf.Empty) returns (StatusResponse) {}
   // Find Proxied HostInfo by instance ID
   rpc GetInfo(GetInfoRequest) returns (GetInfoResponse) {}
   // Exit the Gateway process.
-  rpc Exit(google.protobuf.Empty) returns (google.protobuf.Empty) {}
+  rpc Exit(ExitRequest) returns (google.protobuf.Empty) {}
   // Renew the proxy TLS certificate if certbot is enabled
   rpc RenewCert(google.protobuf.Empty) returns (RenewCertResponse) {}
   // Reload the proxy TLS certificate from files
@@ -387,7 +484,12 @@ service Admin {
   rpc SetCaa(google.protobuf.Empty) returns (google.protobuf.Empty) {}
   // Summary API for inspect.
   rpc GetMeta(google.protobuf.Empty) returns (GetMetaResponse) {}
-  // Set a node's sync URL - used for dynamic peer management
+  // Set a node's sync URL - used for dynamic peer management. Writing a
+  // node's address is also the explicit re-admission decision: it clears the
+  // durable removal marker RemoveNode leaves, so a node removed by mistake is
+  // brought back with this call. Re-admit a node with its old data directory
+  // only if it was never absent across a collected deletion; when in doubt,
+  // wipe the data directory first.
   rpc SetNodeUrl(SetNodeUrlRequest) returns (google.protobuf.Empty) {}
   // Set a node's status (up/down)
   rpc SetNodeStatus(SetNodeStatusRequest) returns (google.protobuf.Empty) {}
@@ -399,6 +501,23 @@ service Admin {
   rpc GetGlobalConnections(google.protobuf.Empty) returns (GlobalConnectionsStats) {}
   // Get all node statuses
   rpc GetNodeStatuses(google.protobuf.Empty) returns (GetNodeStatusesResponse) {}
+  // Remove a CVM from WaveKV and the local data plane. This is an idempotent
+  // operator recovery action and also works when the stored record is unreadable.
+  rpc RemoveCvm(RemoveCvmRequest) returns (RemoveCvmResponse) {}
+  // List the instance records this node currently refuses to import, with the
+  // reason for each. Pairs with RemoveCvm: list the bad records, then remove
+  // the ones that should not survive.
+  rpc ListRejectedInstances(google.protobuf.Empty) returns (ListRejectedInstancesResponse) {}
+  // Remove a decommissioned gateway node from WaveKV and this node's sync peer
+  // set. Idempotent operator recovery action; other gateways prune the node
+  // from their own peer sets when the removal replicates to them. Also writes
+  // a durable removal marker that every gateway's sync endpoints enforce: the
+  // removed node's envelopes are refused, so it cannot re-register itself by
+  // restarting, and a stale copy of its data directory cannot resurrect
+  // records whose deletes the cluster has already collected. Removal is meant
+  // to be permanent; the escape hatch for a mistake is SetNodeUrl, which
+  // clears the marker.
+  rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse) {}
 
   // ==================== DNS Credential Management ====================
   // List all DNS credentials
@@ -439,6 +558,23 @@ service Admin {
   rpc GetCertbotConfig(google.protobuf.Empty) returns (CertbotConfigResponse) {}
   // Set global certbot configuration (includes ACME URL)
   rpc SetCertbotConfig(SetCertbotConfigRequest) returns (google.protobuf.Empty) {}
+  // Create a new ACME account, publish the shared credentials, and re-pin
+  // every ZT-domain CAA record to the new account. If CAA re-pinning fails for
+  // some domains, the new credentials are already published; rerun SetCaa
+  // until it succeeds instead of retrying the rotation (each rotation
+  // registers a new rate-limited ACME account). Rotation is serialized across
+  // nodes by a best-effort lock (WaveKV has no compare-and-swap), so still
+  // avoid rotating from multiple gateways concurrently. This re-pins issuance
+  // to the new account; it does not deactivate the old ACME account at the CA.
+  rpc RotateAcmeCredentials(google.protobuf.Empty) returns (RotateAcmeCredentialsResponse) {}
+
+  // ==================== Tombstone GC Configuration ====================
+  // Get the effective tombstone GC pacing on this node
+  rpc GetTombstoneGcConfig(google.protobuf.Empty) returns (TombstoneGcConfigResponse) {}
+  // Store the tombstone GC pacing in the replicated KV, overriding every
+  // node's config-file default so the whole cluster collects on the same
+  // write-count boundaries. Zero disables collection cluster-wide.
+  rpc SetTombstoneGcConfig(SetTombstoneGcConfigRequest) returns (google.protobuf.Empty) {}
 
   // ==================== Per-Instance Port Policy Override ====================
   // Set an admin override for an instance's port policy. Takes precedence
@@ -451,6 +587,72 @@ service Admin {
   // Inspect both the admin override and the instance-reported policy for an
   // instance, plus the effective policy the proxy will enforce.
   rpc GetInstancePortPolicy(GetInstancePortPolicyRequest) returns (GetInstancePortPolicyResponse) {}
+
+  // ==================== Per-Instance Traffic Gate ====================
+  // Take an instance in or out of its app's load-balancing rotation without
+  // stopping the CVM. Errors if the instance is not registered.
+  //
+  // Only affects connections addressed to the app id. Connections addressed
+  // to the instance id are never gated, so an instance pulled from rotation
+  // stays directly reachable for investigation.
+  //
+  // The setting is persisted under a key only the Admin API writes, so a
+  // re-registration -- by this instance or from another gateway node -- cannot
+  // reopen the gate. An instance does not quietly rejoin the rotation by
+  // rebooting, and does not need the operator to re-issue the gate after one.
+  rpc SetInstanceReady(SetInstanceReadyRequest) returns (google.protobuf.Empty) {}
+}
+
+// Emergency operator request to remove one CVM's instance record.
+message RemoveCvmRequest {
+  string instance_id = 1;
+}
+
+// Outcome of a RemoveCvm request. Both fields are false when the request
+// names an instance this cluster has never seen (or a retry of a removal
+// that already completed), so a mistyped instance_id is visible to the
+// operator instead of silently reporting success.
+message RemoveCvmResponse {
+  // Whether a live instance record existed in WaveKV before the tombstone
+  // was written. Also true for records that existed but were unreadable.
+  bool record_existed = 1;
+  // Whether the CVM was present in this node's local data plane.
+  bool removed_locally = 2;
+}
+
+// One instance record this node refuses to import.
+message RejectedInstanceInfo {
+  string instance_id = 1;
+  // Why the record is refused.
+  string reason = 2;
+  // "unusable": the record fails validation or its bytes no longer decode.
+  // "lost_conflict": the record lost an IP or key conflict to an older
+  // registration.
+  string rejection = 3;
+  // Whether the instance still holds state in this node's data plane. An
+  // unusable record keeps whatever the data plane already had, so removing
+  // an active instance also drops its routing.
+  bool active_locally = 4;
+}
+
+message ListRejectedInstancesResponse {
+  repeated RejectedInstanceInfo rejected = 1;
+}
+
+// Emergency operator request to remove a decommissioned gateway node.
+message RemoveNodeRequest {
+  uint32 node_id = 1;
+}
+
+// Outcome of RemoveNode. Both fields are false when the node was never known
+// (or the removal already completed), so a mistyped node_id is visible to
+// the operator instead of silently reporting success.
+message RemoveNodeResponse {
+  // Whether any of the node's records (info, status, or sync address) was
+  // live in WaveKV before the tombstones were written.
+  bool record_existed = 1;
+  // Whether the node was still in this gateway's sync peer set.
+  bool removed_from_peer_set = 2;
 }
 
 // ==================== DNS Credential Messages ====================
@@ -549,6 +751,21 @@ message ZtDomainConfig {
   optional uint32 node = 4;
   // Priority for default base_domain selection (higher = preferred)
   int32 priority = 5;
+  // ACME challenge proving control of this domain: "dns-01" (default) or
+  // "dns-persist-01". Empty means "dns-01".
+  //
+  // "dns-persist-01" needs no DNS credential: control comes from a
+  // _validation-persist TXT record the operator publishes once, so the gateway
+  // CVM never holds write access to the zone. Experimental — the draft is still
+  // changing and Let's Encrypt serves it on staging only.
+  //
+  // Optional so that omitting it means "leave it alone" rather than "dns-01".
+  // UpdateZtDomain replaces the whole record, so a caller that predates this
+  // field -- a cached dashboard bundle, a script, an older SDK -- would
+  // otherwise downgrade a dns-persist-01 domain to dns-01 cluster-wide on any
+  // unrelated edit, and its hand-published CAA naming dns-persist-01 then
+  // refuses every order.
+  optional string challenge = 6;
 }
 
 // ZT-Domain information (config + certificate status)
@@ -557,6 +774,10 @@ message ZtDomainInfo {
   ZtDomainConfig config = 1;
   // Certificate status
   ZtDomainCertStatus cert_status = 2;
+  // Zone-file lines the domain's DNS must contain. Under "dns-01" the gateway
+  // writes these itself and they are informational; under "dns-persist-01" they
+  // are the one-time setup an operator has to publish.
+  repeated string required_dns_records = 3;
 }
 
 // ZT-Domain certificate status
@@ -612,12 +833,16 @@ message ForceReleaseCertLockRequest {
 message CertAttestationInfo {
   // Certificate public key (DER encoded)
   bytes public_key = 1;
-  // TDX Quote (JSON serialized)
+  // TDX Quote (JSON serialized). Empty when the node has no Intel TDX, or when
+  // the quote request failed; `attestation` is the evidence then.
   string quote = 2;
   // Node that generated this attestation
   uint32 generated_by = 3;
   // Timestamp when this attestation was generated
   uint64 generated_at = 4;
+  // Versioned attestation (JSON serialized `AttestResponse`). Present on every
+  // platform, and the only evidence on nodes without Intel TDX.
+  string attestation = 5;
 }
 
 // List certificate attestations request
@@ -647,6 +872,9 @@ message CertbotConfigResponse {
   uint64 renew_timeout_secs = 3;
   // ACME server URL (empty means default Let's Encrypt production)
   string acme_url = 4;
+  // Issuer Domain Name naming the CA in dns-persist-01 and CAA records
+  // (empty means letsencrypt.org)
+  string issuer_domain_name = 5;
 }
 
 // Set certbot configuration request
@@ -659,6 +887,27 @@ message SetCertbotConfigRequest {
   optional uint64 renew_timeout_secs = 3;
   // ACME server URL (empty means use default Let's Encrypt production)
   optional string acme_url = 4;
+  // Issuer Domain Name naming the CA in dns-persist-01 and CAA records
+  // (empty means letsencrypt.org). Must be one of the issuer-domain-names the
+  // ACME server at acme_url advertises, or every dns-persist-01 order fails.
+  optional string issuer_domain_name = 5;
+}
+
+// ==================== Tombstone GC Configuration Messages ====================
+
+// Tombstone GC configuration response
+message TombstoneGcConfigResponse {
+  // Collect tombstones once every this many replicated writes (0 = disabled)
+  uint64 writes_per_collection = 1;
+  // True when the value is the replicated KV override; false when it is this
+  // node's config-file default (which other nodes may not share)
+  bool stored_in_kv = 2;
+}
+
+// Set tombstone GC configuration request
+message SetTombstoneGcConfigRequest {
+  // Collect tombstones once every this many replicated writes (0 = disabled)
+  uint64 writes_per_collection = 1;
 }
 
 // ==================== Per-Instance Port Policy Override Messages ====================
@@ -675,6 +924,22 @@ message SetInstancePortPolicyRequest {
 // Clear the admin override for an instance.
 message ClearInstancePortPolicyRequest {
   string instance_id = 1;
+}
+
+// Take an instance in or out of its app's load-balancing rotation.
+message SetInstanceReadyRequest {
+  // The instance to gate.
+  string instance_id = 1;
+  // true puts the instance back into rotation, false removes it. Existing
+  // connections are left running either way; this only affects which
+  // instances new connections may be routed to.
+  //
+  // Required. It is `optional` so that absent and false stay distinguishable:
+  // a proto3 scalar decodes an omitted field as its zero value, and over the
+  // JSON transport -- where unknown keys are ignored -- a request that omits
+  // the field or misspells it would otherwise be a successful call that pulls
+  // the instance out of rotation. The server rejects absent instead.
+  optional bool ready = 2;
 }
 
 // Inspect an instance's port-policy state.

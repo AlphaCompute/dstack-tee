@@ -175,12 +175,10 @@ port = $KMS_RPC_LISTEN_PORT
 key = "$CERTS_DIR/rpc.key"
 certs = "$CERTS_DIR/rpc.crt"
 
-[rpc.tls.mutual]
-ca_certs = "$CERTS_DIR/tmp-ca.crt"
-mandatory = false
-
 [core]
 cert_dir = "$CERTS_DIR"
+attest_rpc_cert = false
+enforce_self_authorization = false
 
 [core.gpu]
 enabled = $VMM_ENABLE_GPU
@@ -189,7 +187,6 @@ enabled = $VMM_ENABLE_GPU
 type = "dev"
 
 [core.onboard]
-quote_enabled = false
 address = "127.0.0.1"
 port = $KMS_RPC_LISTEN_PORT
 auto_bootstrap_domain = "$KMS_DOMAIN"
@@ -213,9 +210,7 @@ ca_certs = "$CERTS_DIR/gateway-ca.cert"
 mandatory = false
 
 [core]
-kms_url = "https://localhost:$KMS_RPC_LISTEN_PORT"
-rpc_domain = "$GATEWAY_DOMAIN"
-run_in_dstack = false
+rpc_domain = ""
 
 [core.sync]
 enabled = false

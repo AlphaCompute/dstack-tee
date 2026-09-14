@@ -12,9 +12,13 @@ DSTACK_CORE_SRC ?= "${DSTACK_MONOREPO_ROOT}/dstack"
 
 S = "${UNPACKDIR}/repo/dstack"
 
-DEPENDS += "rsync-native"
-RDEPENDS:${PN} += "fuse3-utils kernel-module-fuse"
+DEPENDS += "rsync-native cmake-native"
+RDEPENDS:${PN} += "dstack-guest fuse3-utils swtpm tpm2-tools libtss2-tcti-device openssl"
 do_unpack[depends] += "rsync-native:do_populate_sysroot"
+
+# aws-lc-sys cannot detect this Yocto cross build reliably with its default
+# cc builder. Its supported CMake builder does not execute target binaries.
+export AWS_LC_SYS_CMAKE_BUILDER = "1"
 
 SYSTEMD_SERVICE:${PN} = "dstack-tee-simulator.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
@@ -48,9 +52,9 @@ do_install() {
     install -m 0644 ${THISDIR}/files/dstack-tee-simulator.service \
         ${D}${systemd_system_unitdir}
 
-    install -d ${D}${sysconfdir}/systemd/system/dstack-prepare.service.d
+    install -d ${D}${systemd_system_unitdir}/dstack-prepare.service.d
     install -m 0644 ${THISDIR}/files/tee-simulator.conf \
-        ${D}${sysconfdir}/systemd/system/dstack-prepare.service.d/tee-simulator.conf
+        ${D}${systemd_system_unitdir}/dstack-prepare.service.d/tee-simulator.conf
 }
 
 # Unit/drop-in live next to this recipe; include them in task checksums.
@@ -59,7 +63,7 @@ do_install[file-checksums] += "\
     ${THISDIR}/files/tee-simulator.conf:True \
 "
 
-FILES:${PN} += "${sysconfdir}/systemd/system/dstack-prepare.service.d/tee-simulator.conf"
+FILES:${PN} += "${systemd_system_unitdir}/dstack-prepare.service.d/tee-simulator.conf"
 
 # Cargo embeds build paths into binaries; allow TMPDIR references.
 INSANE_SKIP:${PN} += "buildpaths"

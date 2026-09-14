@@ -13,10 +13,47 @@ use serde_json::json;
 /// `kms_enabled` selects KMS mode (deterministic, upgradeable per-app keys);
 /// gateway and local-key-provider are off for the direct-port single-node flow.
 pub fn build_app_compose(name: &str, docker_compose_yaml: &str, kms_enabled: bool) -> String {
-    let manifest = json!({
-        "manifest_version": 2,
+    build_app_compose_with_runtime(
+        name,
+        docker_compose_yaml,
+        kms_enabled,
+        "docker-compose",
+        None,
+    )
+}
+
+/// Build an app-compose manifest with an explicitly selected compose frontend.
+/// `snapshotter` is meaningful only for `nerdctl-compose`.
+pub fn build_app_compose_with_runtime(
+    name: &str,
+    docker_compose_yaml: &str,
+    kms_enabled: bool,
+    runner: &str,
+    snapshotter: Option<&str>,
+) -> String {
+    build_app_compose_with_runtime_and_volumes(
+        name,
+        docker_compose_yaml,
+        kms_enabled,
+        runner,
+        snapshotter,
+        &[],
+    )
+}
+
+/// Build an app-compose manifest with measured verity volume declarations.
+pub fn build_app_compose_with_runtime_and_volumes(
+    name: &str,
+    docker_compose_yaml: &str,
+    kms_enabled: bool,
+    runner: &str,
+    snapshotter: Option<&str>,
+    verity_volumes: &[dstack_types::VerityVolume],
+) -> String {
+    let mut manifest = json!({
+        "manifest_version": if runner == "nerdctl-compose" { json!("3") } else { json!(2) },
         "name": name,
-        "runner": "docker-compose",
+        "runner": runner,
         "docker_compose_file": docker_compose_yaml,
         "kms_enabled": kms_enabled,
         "gateway_enabled": false,
@@ -31,6 +68,12 @@ pub fn build_app_compose(name: &str, docker_compose_yaml: &str, kms_enabled: boo
         // (NTS is also currently broken in guest images — see dstack#745.)
         "secure_time": false,
     });
+    if let Some(snapshotter) = snapshotter {
+        manifest["snapshotter"] = json!(snapshotter);
+    }
+    if !verity_volumes.is_empty() {
+        manifest["verity_volumes"] = json!(verity_volumes);
+    }
     // pretty-print via Value's Display (`{:#}`) — infallible, and byte-identical
     // to serde_json::to_string_pretty (avoids an expect on an unfailable Result).
     format!("{manifest:#}")

@@ -25,11 +25,27 @@ The MR register values indicate the following:
     - RTMR0: OVMF records CVM's virtual hardware setup, including CPU count, memory size, and device configuration. While dstack uses fixed devices, CPU and memory specifications can vary. RTMR0 can be computed from these specifications.
     - RTMR1: OVMF records the Linux kernel measurement.
     - RTMR2: Linux kernel records kernel cmdline (including rootfs hash) and initrd measurements.
-    - RTMR3: initrd records dstack App details, including compose hash, instance id, app id, and key provider.
+    - RTMR3: initrd records dstack App details, including compose hash, GPU policy and attestation events, instance id, app id, and key provider.
 
 MRTD, RTMR0, RTMR1, and RTMR2 can be pre-calculated from the built image (given CPU+RAM specifications). Compare these with the verified quote's MRs to confirm correct base image code execution.
 
 RTMR3 differs as it contains runtime information like compose hash and instance id. Verify this by replaying the event log - if the calculated RTMR3 matches the quote's RTMR3, the event log information is valid. Then verify the compose hash, key provider, and other event log details match expectations.
+
+After `compose-hash`, each configured init script produces an ordered
+`init-script-hash` event whose payload is the SHA-256 digest of the exact UTF-8
+script bytes. The event order matches the script array order. These events let
+an infrastructure provider contribute initialization code approved by
+multiple parties and let each party verify its code independently without
+reconstructing the complete compose document.
+
+For a GPU launch, any `init-script-hash` events are followed by
+`gpu-policy-hash` and, after successful NVIDIA attestation and policy
+evaluation, `gpu-attestation`. The `gpu-policy-hash` payload is
+`SHA-256(JCS(requirements.gpu_policy))`, using `{}` when the field is omitted.
+The `gpu-attestation` payload is JSON containing the verified device count,
+CC/DevTools state, and `evidence_sha256`.
+
+The guest-agent returns the complete `nvattest` record captured during boot from `/v1/Attest`, when the request sets `include_boottime_gpu_evidence`, so a verifier can fetch the quote and the GPU evidence in one round trip. `AttestResponse.boottime_gpu_evidence` is a list of `GpuEvidenceBundle` (`{vendor, format, evidence}`); the boot record is the bundle whose `vendor` is `nvidia` and whose `format` is `nvidia-nvattest-boottime-json-v1`, and its `evidence` is hex-encoded bytes that decode to the exact UTF-8 `nvattest` output. It is not trustworthy by itself. (`/v1/AttestGpu` runs a *fresh* attestation against a caller nonce and returns bundles tagged `nvidia-nvattest-collect-evidence-json-v1`, a deliberately distinct format that a boot-record verifier does not appraise; its result is not bound to the TD and must not be used as remote evidence; only the boot-time record below is.) After verifying the TDX quote and replaying the event log to RTMR3, hash the *decoded* bundle bytes — `SHA-256(hex_decode(bundle.evidence))`, never the JSON string as returned nor a re-serialized form — and require the result to equal the `gpu-attestation` event's `evidence_sha256`. See [GPU Security for AI Workloads](./security/security-model.md#gpu-security-for-ai-workloads) for the event schema, ordering, Rego example, and platform differences.
 
 ### 2.2. Determining expected MRs
 MRTD, RTMR0, RTMR1, and RTMR2 correspond to the image. dstack OS builds all related software from source.
@@ -44,7 +60,8 @@ git checkout <release-revision>
 make os-image
 ```
 
-The resulting `dstack-<version>.tar.gz` contains:
+The resulting `os/mkosi/repro-build/build/out/prod/dstack-<version>.tar.gz`
+contains:
 
 - ovmf.fd: virtual firmware
 - bzImage: kernel image
@@ -67,7 +84,7 @@ To verify dstack App data trustworthiness:
 
 - Review source code for correctness and safety.
 - Build image from source.
-- Calculate MRTD, RTMR0, RTMR1, and RTMR2 values using [dstack-mr](https://github.com/Dstack-TEE/dstack/tree/master/dstack/dstack-mr).
+- Calculate MRTD, RTMR0, RTMR1, and RTMR2 values using [dstack-mr](https://github.com/Dstack-TEE/dstack/tree/next/dstack/dstack-mr).
 - Verify quote measurements:
     - Confirm MRTD, RTMR0, RTMR1, and RTMR2 match pre-calculated values.
     - Verify RTMR3 matches the event log replay result.

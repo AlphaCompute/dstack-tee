@@ -85,6 +85,7 @@ cd ~/gateway-deploy
 set -a; source .env; set +a
 
 cd ~/dstack/dstack/vmm
+export DSTACK_VMM_AUTH_USER=admin
 export DSTACK_VMM_AUTH_PASSWORD=$(cat ~/.dstack/secrets/vmm-auth-token)
 
 ./src/vmm-cli.py --url http://127.0.0.1:9080 deploy \
@@ -318,6 +319,20 @@ curl -sf -X POST "http://$ADMIN_ADDR/prpc/SetCertbotConfig" \
   }' && echo "Certbot config set (PRODUCTION)"
 ```
 
+The stored ACME account still belongs to the staging directory, so rotate the
+shared credentials. This registers a production account and re-pins every ZT
+domain's CAA records to it in one step (renewals refuse to run while the
+stored account and the configured ACME URL disagree):
+
+```bash
+curl -sf -X POST "http://$ADMIN_ADDR/prpc/RotateAcmeCredentials" \
+  -H "Content-Type: application/json" -d '{}' && echo "ACME account rotated"
+```
+
+> If the rotation reports that CAA re-pinning failed for some domains, the new
+> account is already published — rerun `SetCaa` until it succeeds instead of
+> rotating again (each rotation registers a new rate-limited ACME account).
+
 After switching the ACME URL, the renewal loop may report "does not need renewal" because the staging cert is still valid. Force a renewal for each ZT domain to get production certificates immediately:
 
 ```bash
@@ -408,6 +423,7 @@ Navigate to the VMM directory first:
 
 ```bash
 cd ~/dstack/dstack/vmm
+export DSTACK_VMM_AUTH_USER=admin
 export DSTACK_VMM_AUTH_PASSWORD=$(cat ~/.dstack/secrets/vmm-auth-token)
 ```
 

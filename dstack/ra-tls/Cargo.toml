@@ -17,6 +17,7 @@ elliptic-curve.workspace = true
 fs-err.workspace = true
 hex.workspace = true
 hkdf.workspace = true
+k256.workspace = true
 p256.workspace = true
 rcgen = { workspace = true, features = ["x509-parser", "pem"] }
 ring = { workspace = true, features = ["std"] }
@@ -46,7 +47,16 @@ errify.workspace = true
 rmp-serde.workspace = true
 
 [features]
+simulator = ["dstack-attest/simulator"]
 quote = ["dstack-attest/quote"]
+# A self-signed CA and the leaves it signs, for tests that need a certificate but no
+# TEE. Off by default: the keys it mints are test material and must not be reachable
+# from a production binary.
+test-pki = []
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
+# `test_pki`'s own tests write PEMs to a scratch dir; the module itself takes a
+# caller-supplied path and does not depend on this.
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

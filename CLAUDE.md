@@ -146,11 +146,12 @@ forge clean
 
 ### Logging and Error Messages
 
-- **Never capitalize** the first letter of log messages and error messages
+- Start log messages and error messages with lowercase text
+- Preserve the conventional capitalization of identifiers and acronyms when they
+  begin a message (for example, `RIM`, `OCSP`, or `HTTP`)
 - Example: `log::info!("starting server on port {}", port);`
 - Example: `anyhow::bail!("failed to connect to server");`
-
-This rule is enforced in `.cursorrules`.
+- Example: `log::warn!("RIM upstream is unavailable");`
 
 ## Key Security Concepts
 
@@ -176,7 +177,11 @@ This rule is enforced in `.cursorrules`.
 
 ### Local Development Setup
 
-1. Build guest-OS artifacts through `os/build.sh` (see `os/README.md`)
+1. Build guest-OS artifacts with `make os-image`, which uses the default mkosi
+   backend (see `docs/building-guest-os.md`). The Yocto backend (`os/yocto/`,
+   `make os-image-yocto`, `--backend yocto`) is deprecated: never use it for new
+   images or features. Do not delete `os/yocto/` either: mkosi still reads
+   patches, units, and scripts from it (`grep -rn yocto os/mkosi`)
 2. Download or build guest OS image
 3. Run components in separate terminals:
    - KMS: `./dstack-kms -c kms.toml`

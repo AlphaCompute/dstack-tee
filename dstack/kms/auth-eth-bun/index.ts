@@ -8,18 +8,26 @@ import { z } from 'zod';
 import { createPublicClient, http, type Address, type Hex } from 'viem';
 
 // zod schemas for validation - compatible with original fastify implementation
+const boundedHex = (bytes: number, description: string) =>
+  z.string()
+    .regex(/^(?:0x)?[0-9a-fA-F]*$/, `${description} must be hexadecimal`)
+    .refine(
+      (value) => value.replace(/^0x/, '').length <= bytes * 2,
+      `${description} exceeds ${bytes} bytes`,
+    );
+
 const BootInfoSchema = z.object({
-  // required fields (matching original fastify schema)
-  mrAggregated: z.string().describe('aggregated MR measurement'),
-  osImageHash: z.string().describe('OS Image hash'),
-  appId: z.string().describe('application ID'),
-  composeHash: z.string().describe('compose hash'),
-  instanceId: z.string().describe('instance ID'),
-  deviceId: z.string().describe('device ID'),
-  // optional fields (for full compatibility with BootInfo interface)
-  tcbStatus: z.string().optional().default(''),
-  advisoryIds: z.array(z.string()).optional().default([]),
-  mrSystem: z.string().optional().default('')
+  // Short hexadecimal values remain compatible with the original backend,
+  // which left-pads them before making the contract call.
+  mrAggregated: boundedHex(32, 'aggregated MR measurement'),
+  osImageHash: boundedHex(32, 'OS Image hash'),
+  appId: boundedHex(20, 'application ID'),
+  composeHash: boundedHex(32, 'compose hash'),
+  instanceId: boundedHex(20, 'instance ID'),
+  deviceId: boundedHex(32, 'device ID'),
+  tcbStatus: z.string().max(128).optional().default(''),
+  advisoryIds: z.array(z.string().max(256)).max(128).optional().default([]),
+  mrSystem: boundedHex(32, 'system MR measurement').optional().default('')
 });
 
 const BootResponseSchema = z.object({
@@ -105,10 +113,31 @@ const DSTACK_KMS_ABI = [
 class EthereumBackend {
   private client: ReturnType<typeof createPublicClient>;
   private kmsContractAddr: Address;
+  private expectedChainId?: number;
+  private finalityConfirmations: bigint;
 
-  constructor(client: ReturnType<typeof createPublicClient>, kmsContractAddr: string) {
+  constructor(
+    client: ReturnType<typeof createPublicClient>,
+    kmsContractAddr: string,
+    expectedChainId: number | undefined,
+    finalityConfirmations: bigint,
+  ) {
     this.client = client;
     this.kmsContractAddr = kmsContractAddr as Address;
+    this.expectedChainId = expectedChainId;
+    this.finalityConfirmations = finalityConfirmations;
+  }
+
+  private async finalizedBlockNumber(): Promise<bigint> {
+    const chainId = await this.client.getChainId();
+    if (this.expectedChainId !== undefined && chainId !== this.expectedChainId) {
+      throw new Error('authorization backend chain ID mismatch');
+    }
+    const head = await this.client.getBlockNumber();
+    if (head < this.finalityConfirmations) {
+      throw new Error('authorization backend has not reached configured finality');
+    }
+    return head - this.finalityConfirmations;
   }
 
   private decodeHex(hex: string, sz: number = 32): Hex {
@@ -134,20 +163,23 @@ class EthereumBackend {
       advisoryIds: bootInfo.advisoryIds || []
     };
 
+    const blockNumber = await this.finalizedBlockNumber();
     let response;
     if (isKms) {
       response = await this.client.readContract({
         address: this.kmsContractAddr,
         abi: DSTACK_KMS_ABI,
         functionName: 'isKmsAllowed',
-        args: [bootInfoStruct]
+        args: [bootInfoStruct],
+        blockNumber
       });
     } else {
       response = await this.client.readContract({
         address: this.kmsContractAddr,
         abi: DSTACK_KMS_ABI,
         functionName: 'isAppAllowed',
-        args: [bootInfoStruct]
+        args: [bootInfoStruct],
+        blockNumber
       });
     }
 
@@ -155,7 +187,8 @@ class EthereumBackend {
     const gatewayAppId = await this.client.readContract({
       address: this.kmsContractAddr,
       abi: DSTACK_KMS_ABI,
-      functionName: 'gatewayAppId'
+      functionName: 'gatewayAppId',
+      blockNumber
     });
 
     return {
@@ -195,10 +228,33 @@ const app = new Hono();
 // initialize ethereum backend
 const rpcUrl = process.env.ETH_RPC_URL || 'http://localhost:8545';
 const kmsContractAddr = process.env.KMS_CONTRACT_ADDR || '0x0000000000000000000000000000000000000000';
+const parseNonNegativeInteger = (name: string, value: string | undefined): number | undefined => {
+  if (value === undefined || value === '') return undefined;
+  if (!/^(?:0|[1-9][0-9]*)$/.test(value)) throw new Error(`${name} must be a non-negative integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} exceeds the safe integer range`);
+  return parsed;
+};
+const expectedChainId = parseNonNegativeInteger('ETH_CHAIN_ID', process.env.ETH_CHAIN_ID);
+const finalityConfirmations = BigInt(
+  parseNonNegativeInteger('ETH_FINALITY_CONFIRMATIONS', process.env.ETH_FINALITY_CONFIRMATIONS) ?? 0,
+);
 const client = createPublicClient({
   transport: http(rpcUrl)
 });
-const ethereum = new EthereumBackend(client, kmsContractAddr);
+const ethereum = new EthereumBackend(client, kmsContractAddr, expectedChainId, finalityConfirmations);
+
+const publicRpcEndpoint = (value: string): string => {
+  try {
+    const endpoint = new URL(value);
+    return `${endpoint.protocol}//${endpoint.host}`;
+  } catch {
+    return 'configured';
+  }
+};
+
+const backendUnavailable = 'authorization backend unavailable';
+const invalidRequest = { isAllowed: false, reason: 'invalid authorization request', gatewayAppId: '' };
 
 // health check and info endpoint
 app.get('/', async (c) => {
@@ -213,35 +269,37 @@ app.get('/', async (c) => {
     return c.json({
       status: 'ok',
       kmsContractAddr: kmsContractAddr,
-      ethRpcUrl: rpcUrl,
+      ethRpcUrl: publicRpcEndpoint(rpcUrl),
       gatewayAppId: batch[0],
       chainId: batch[1],
       appAuthImplementation: batch[2], // NOTE: for backward compatibility
       appImplementation: batch[2],
     });
   } catch (error) {
-    console.error('error in health check:', error);
+    console.error('authorization backend health check failed');
     return c.json({
       status: 'error',
-      message: error instanceof Error ? error.message : String(error)
+      message: backendUnavailable
     }, 500);
   }
 });
 
 // app boot authentication
 app.post('/bootAuth/app',
-  zValidator('json', BootInfoSchema),
+  zValidator('json', BootInfoSchema, (result, c) => {
+    if (!result.success) return c.json(invalidRequest, 400);
+  }),
   async (c) => {
     try {
       const bootInfo = c.req.valid('json');
       const result = await ethereum.checkBoot(bootInfo, false);
       return c.json(result);
     } catch (error) {
-      console.error('error in app boot auth:', error);
+      console.error('application authorization backend failed');
       return c.json({
         isAllowed: false,
         gatewayAppId: '',
-        reason: error instanceof Error ? error.message : String(error)
+        reason: backendUnavailable
       });
     }
   }
@@ -249,7 +307,9 @@ app.post('/bootAuth/app',
 
 // KMS boot authentication
 app.post('/bootAuth/kms',
-  zValidator('json', BootInfoSchema),
+  zValidator('json', BootInfoSchema, (result, c) => {
+    if (!result.success) return c.json(invalidRequest, 400);
+  }),
   async (c) => {
     try {
       const bootInfo = c.req.valid('json');
@@ -258,12 +318,12 @@ app.post('/bootAuth/kms',
     } catch (error) {
       // don't log test backend errors
       if (!(error instanceof Error && "Test backend error" === error.message)) {
-        console.error('error in KMS boot auth:', error);
+        console.error('KMS authorization backend failed');
       }
       return c.json({
         isAllowed: false,
         gatewayAppId: '',
-        reason: error instanceof Error ? error.message : String(error)
+        reason: backendUnavailable
       });
     }
   }

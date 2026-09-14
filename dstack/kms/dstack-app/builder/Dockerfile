@@ -9,7 +9,7 @@ ARG DSTACK_REV
 ARG DSTACK_SRC_URL=https://github.com/Dstack-TEE/dstack.git
 WORKDIR /build
 RUN ./pin-packages.sh ./builder-pinned-packages.txt
-RUN apt-get update && \
+RUN apt-get update -o APT::Update::Error-Mode=any && \
     apt-get install -y --no-install-recommends \
     git \
     build-essential \
@@ -27,39 +27,24 @@ RUN cd repo/dstack && cargo build --release -p dstack-kms --target x86_64-unknow
 RUN echo "${DSTACK_REV}" > /build/.GIT_REV
 
 FROM debian:bookworm@sha256:0d8498a0e9e6a60011df39aab78534cfe940785e7c59d19dfae1eb53ea59babe
-COPY --from=build-shared /pin-packages.sh /config-qemu.sh /build/
-COPY ./shared/qemu-pinned-packages.txt /build/
+COPY --from=build-shared /pin-packages.sh /build/
+COPY ./shared/pinned-packages.txt /build/
 WORKDIR /build
-ARG QEMU_REV=dbcec07c0854bf873d346a09e87e4c993ccf2633
-RUN ./pin-packages.sh ./qemu-pinned-packages.txt && \
-    apt-get update && \
+# reqwest is built against rustls-platform-verifier, which reads the system
+# trust store and errors out when it finds none. The KMS builds its collateral
+# and AMD KDS clients eagerly at startup, so a base image without CA
+# certificates fails to boot before it serves anything.
+RUN ./pin-packages.sh ./pinned-packages.txt && \
+    apt-get update -o APT::Update::Error-Mode=any && \
     apt-get install -y --no-install-recommends \
-    git \
-    libslirp-dev \
-    python3-pip \
-    ninja-build \
-    pkg-config \
-    libglib2.0-dev \
-    python3-sphinx \
-    python3-sphinx-rtd-theme \
-    build-essential \
-    flex \
-    bison && \
-    rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
-RUN git clone https://github.com/kvinwang/qemu-tdx.git --depth 1 --branch dstack-qemu-9.2.1 --single-branch && \
-    cd qemu-tdx && git fetch --depth 1 origin ${QEMU_REV} && \
-    git checkout ${QEMU_REV} && \
-    ../config-qemu.sh ./build /usr/local && \
-    cd build && \
-    ninja && \
-    strip qemu-system-x86_64 && \
-    install -m 755 qemu-system-x86_64 /usr/local/bin/dstack-acpi-tables && \
-    cd ../ && \
-    install -d /usr/local/share/qemu && \
-    install -m 644 pc-bios/efi-virtio.rom /usr/local/share/qemu/ && \
-    install -m 644 pc-bios/kvmvapic.bin /usr/local/share/qemu/ && \
-    install -m 644 pc-bios/linuxboot_dma.bin /usr/local/share/qemu/ && \
-    cd .. && rm -rf qemu-tdx
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
+WORKDIR /
 COPY --from=kms-builder /build/repo/dstack/target/x86_64-unknown-linux-musl/release/dstack-kms /usr/local/bin/dstack-kms
 COPY --from=kms-builder /build/.GIT_REV /etc/
+# The OCI metadata is generated once by build-lib.sh and injected here, as
+# the config labels and as the manifest annotations, so the three views of
+# the image can never disagree.
+ARG IMAGE_METADATA
+RUN mkdir -p /etc/dstack-kms && printf '%s\n' "${IMAGE_METADATA}" > /etc/dstack-kms/build-info
 CMD ["dstack-kms"]

@@ -11,10 +11,11 @@
 //! `logs`, a global `-j/--json`).
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dstack_cli_core::layout::InstallLayout;
 use dstack_cli_core::vmm::{Vmm, DEFAULT_HOST};
 use dstack_cli_core::{compose, ports, rpc};
+use fs_err as fs;
 
 #[derive(Parser)]
 #[command(
@@ -32,7 +33,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     prefix: Option<String>,
 
-    /// auth token for a remote VMM.
+    /// auth token for a VMM with `[auth]` enabled (sent as `Authorization:
+    /// Bearer`). Falls back to `DSTACK_VMM_TOKEN`, then the token written by
+    /// `dstackup install`.
     #[arg(long, global = true)]
     token: Option<String>,
 
@@ -42,6 +45,37 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ComposeRunner {
+    #[default]
+    DockerCompose,
+    NerdctlCompose,
+}
+
+impl ComposeRunner {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DockerCompose => "docker-compose",
+            Self::NerdctlCompose => "nerdctl-compose",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Snapshotter {
+    Overlayfs,
+    Stargz,
+}
+
+impl Snapshotter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Overlayfs => "overlayfs",
+            Self::Stargz => "stargz",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -68,10 +102,16 @@ enum Command {
         /// disk size in GB.
         #[arg(long, default_value_t = 20)]
         disk: u32,
-        /// expose a port: `vm` | `host:vm` | `proto:host:vm` | `proto:addr:host:vm`
+        /// expose a port: `vm` | `host:vm` | `proto:host:vm` | `proto:addr:host:vm`,
+        /// each optionally suffixed `@<nic>` to name the NIC it enters through
         /// (host omitted/`auto`/`0` ⇒ a free host port is picked). Repeatable.
         #[arg(long = "port", value_name = "SPEC")]
         ports: Vec<String>,
+        /// attach a verity volume, as printed by `dstack verity`: the file name
+        /// in the vmm's volumes_dir, its verity_root, and the target
+        /// (an absolute mount path). Repeatable.
+        #[arg(long = "volume", value_name = "NAME:VERITY_ROOT:TARGET")]
+        volumes: Vec<String>,
         /// deploy in non-KMS mode (ephemeral keys; no KMS required).
         #[arg(long)]
         no_kms: bool,
@@ -82,6 +122,12 @@ enum Command {
         /// build + hash the compose and print it, without deploying.
         #[arg(long)]
         dry_run: bool,
+        /// compose frontend used inside the guest.
+        #[arg(long, value_enum, default_value = "docker-compose")]
+        runner: ComposeRunner,
+        /// containerd snapshotter (supported only with --runner nerdctl-compose).
+        #[arg(long, value_enum)]
+        snapshotter: Option<Snapshotter>,
     },
     /// List deployed apps.
     Apps,
@@ -100,13 +146,60 @@ enum Command {
     },
     /// Scaffold a new app project in the current directory.
     Init,
+    /// Build a read-only verity data volume from a directory or filesystem image.
+    ///
+    /// The build needs no daemon or TEE. It prints a verity_root to paste into
+    /// the deploy command. See docs/verity-volumes.md.
+    Verity {
+        /// Pack this directory into a read-only data volume.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<String>,
+        /// wrap an existing filesystem image instead of building squashfs. The
+        /// guest mounts it read-only after dm-verity verification.
+        #[arg(long = "fs-image", value_name = "PATH", conflicts_with = "dir")]
+        fs_image: Option<String>,
+        /// where to write the volume.
+        #[arg(long, short = 'o', default_value = "verity.img")]
+        output: String,
+        /// squashfs compression: `none` (the default), `zstd`, or `gzip`.
+        #[arg(long, value_enum, default_value_t, conflicts_with = "fs_image")]
+        compress: CompressionArg,
+    },
+}
+
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum CompressionArg {
+    #[default]
+    None,
+    Zstd,
+    Gzip,
+}
+
+impl From<CompressionArg> for dstack_volume::Compression {
+    fn from(value: CompressionArg) -> Self {
+        match value {
+            CompressionArg::None => Self::None,
+            CompressionArg::Zstd => Self::Zstd,
+            CompressionArg::Gzip => Self::Gzip,
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // progress (e.g. `verity` pulling layers) goes to stderr so it never mixes
+    // with `--json` on stdout. RUST_LOG overrides.
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("warn,dstack_volume=info")),
+        )
+        .init();
     let cli = Cli::parse();
-    // remote-auth wiring lands with the TLS+token transport.
-    let _ = &cli.token;
     let defaults = LocalDefaults::read(cli.prefix.as_deref());
     let use_local_defaults = cli.host.is_none();
     let host = cli
@@ -114,11 +207,24 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| defaults.as_ref().and_then(|d| d.client_url.clone()))
         .unwrap_or_else(|| DEFAULT_HOST.to_string());
+    // auth token: --token, then DSTACK_VMM_TOKEN, then the token file written
+    // by `dstackup install` (local defaults only).
+    let token = cli
+        .token
+        .clone()
+        .or_else(|| std::env::var("DSTACK_VMM_TOKEN").ok())
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            use_local_defaults
+                .then(|| defaults.as_ref().and_then(LocalDefaults::token))
+                .flatten()
+        });
+    let token = token.as_deref();
     let json = cli.json;
 
     match cli.command {
-        Command::Apps => cmd_apps(&host, json).await,
-        Command::Logs { id, lines } => cmd_logs(&host, &id, lines).await,
+        Command::Apps => cmd_apps(&host, token, json).await,
+        Command::Logs { id, lines } => cmd_logs(&host, token, &id, lines).await,
         Command::Deploy {
             compose,
             compose_file,
@@ -128,9 +234,12 @@ async fn main() -> Result<()> {
             memory,
             disk,
             ports,
+            volumes,
             no_kms,
             allowlist,
             dry_run,
+            runner,
+            snapshotter,
         } => {
             let compose = resolve_compose_arg(compose, compose_file)?;
             let image = if use_local_defaults {
@@ -149,6 +258,7 @@ async fn main() -> Result<()> {
             };
             cmd_deploy(
                 &host,
+                token,
                 &compose,
                 &name,
                 image.as_deref(),
@@ -156,16 +266,111 @@ async fn main() -> Result<()> {
                 memory,
                 disk,
                 &ports,
+                &volumes,
                 no_kms,
                 allowlist.as_deref(),
                 dry_run,
                 json,
+                runner,
+                snapshotter,
             )
             .await
         }
         Command::Info { .. } => stub("info"),
         Command::Init => stub("init"),
+        Command::Verity {
+            dir,
+            fs_image,
+            output,
+            compress,
+        } => cmd_verity(dir.as_deref(), fs_image.as_deref(), &output, compress, json).await,
     }
+}
+
+async fn cmd_verity(
+    dir: Option<&str>,
+    fs_image: Option<&str>,
+    output: &str,
+    compress: CompressionArg,
+    json: bool,
+) -> Result<()> {
+    let result = dstack_volume::verity(dstack_volume::VerityOptions {
+        dir: dir.map(std::path::PathBuf::from),
+        fs_image: fs_image.map(std::path::PathBuf::from),
+        output: output.into(),
+        compress: compress.into(),
+    })
+    .await?;
+
+    let volume_size = fs::metadata(&result.output)
+        .with_context(|| format!("stat {}", result.output.display()))?
+        .len();
+
+    if json {
+        print_json(&serde_json::json!({
+            "verityRoot": result.verity_root,
+            "output": result.output.display().to_string(),
+            "dataSize": result.data_size,
+            "volumeSize": volume_size,
+        }));
+        return Ok(());
+    }
+
+    let mib = volume_size as f64 / 1_048_576.0;
+    println!("wrote {} ({mib:.1} MiB)", result.output.display());
+    let file = result
+        .output
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| result.output.display().to_string());
+    // a data volume mounts at a path you choose; it must be writable (the guest
+    // rootfs is read-only), e.g. under /run.
+    let target = "/run/models";
+    println!("\ncopy {file} into the vmm's volumes_dir, then deploy with:");
+    println!(
+        "  dstack deploy -c docker-compose.yaml --volume {file}:{}:{target}",
+        result.verity_root
+    );
+    println!("  (change {target} to your mount path)");
+    Ok(())
+}
+
+/// Parse a `--volume` spec `NAME:VERITY_ROOT:TARGET`.
+///
+/// `NAME` is the volume file in the vmm's volumes_dir. `VERITY_ROOT` and `TARGET`
+/// become a measured `verity_volumes` entry in the app-compose, so the guest only
+/// seeds content matching the attested root. `dstack verity` prints the exact
+/// spec to paste.
+///
+/// `TARGET` is an absolute read-only mount path in the guest.
+fn parse_volume(spec: &str) -> Result<dstack_types::VerityVolume> {
+    let mut parts = spec.splitn(3, ':');
+    let name = parts.next().unwrap_or_default();
+    let (root, target) = match (parts.next(), parts.next()) {
+        (Some(root), Some(target)) if !root.is_empty() && !target.is_empty() => (root, target),
+        _ => bail!("--volume must be NAME:VERITY_ROOT:TARGET (as printed by `dstack verity`), got '{spec}'"),
+    };
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains("..")
+        || name.contains(',')
+        || name.contains('=')
+    {
+        bail!("volume name '{name}' must be a bare file name (no '/', '..', ',', '=')");
+    }
+    if root.len() != 64 || !root.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("verity_root '{root}' must be 64 hex chars (copy it from `dstack verity`)");
+    }
+    if !target.starts_with('/') {
+        bail!("target '{target}' must be an absolute path");
+    }
+    let mut verity_root = [0; 32];
+    hex::decode_to_slice(root, &mut verity_root).context("decoding verity_root")?;
+    Ok(dstack_types::VerityVolume {
+        source: name.to_string(),
+        verity_root,
+        target: target.into(),
+    })
 }
 
 fn resolve_compose_arg(positional: Option<String>, flagged: Option<String>) -> Result<String> {
@@ -178,6 +383,7 @@ fn resolve_compose_arg(positional: Option<String>, flagged: Option<String>) -> R
 
 struct LocalDefaults {
     client_url: Option<String>,
+    client_token_path: Option<String>,
     image: Option<String>,
     allowlist_path: Option<String>,
 }
@@ -185,7 +391,7 @@ struct LocalDefaults {
 impl LocalDefaults {
     fn read(prefix: Option<&str>) -> Option<Self> {
         let path = InstallLayout::state_path_for_prefix(prefix);
-        let body = std::fs::read_to_string(path).ok()?;
+        let body = fs::read_to_string(path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&body).ok()?;
         Some(Self::from_value(&v))
     }
@@ -194,6 +400,11 @@ impl LocalDefaults {
         Self {
             client_url: v
                 .get("client_url")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            client_token_path: v
+                .get("client_token_path")
                 .and_then(|x| x.as_str())
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
@@ -213,100 +424,20 @@ impl LocalDefaults {
     fn allowlist_path(&self) -> Option<String> {
         self.allowlist_path.clone()
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_local_install_defaults() {
-        let value = serde_json::json!({
-            "client_url": "http://127.0.0.1:19080",
-            "image": "dstack-0.5.11",
-            "allowlist_path": "/tmp/dstack/etc/dstack/auth-allowlist.json"
-        });
-        let defaults = LocalDefaults::from_value(&value);
-        assert_eq!(
-            defaults.client_url.as_deref(),
-            Some("http://127.0.0.1:19080")
-        );
-        assert_eq!(defaults.image.as_deref(), Some("dstack-0.5.11"));
-        assert_eq!(
-            defaults.allowlist_path().as_deref(),
-            Some("/tmp/dstack/etc/dstack/auth-allowlist.json")
-        );
-    }
-
-    #[test]
-    fn reads_local_install_defaults_from_prefix() {
-        let install_root =
-            std::env::temp_dir().join(format!("dstack-cli-state-test-{}", std::process::id()));
-        let state_dir = install_root.join("var/lib/dstack");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        std::fs::write(
-            state_dir.join(dstack_cli_core::layout::STATE_FILE),
-            r#"{
-              "client_url": "http://127.0.0.1:29080",
-              "image": "dstack-0.5.12",
-              "allowlist_path": "/tmp/custom-dstack/etc/dstack/auth-allowlist.json"
-            }"#,
-        )
-        .unwrap();
-
-        let prefix = dstack_cli_core::layout::path_string(&install_root);
-        let defaults = LocalDefaults::read(Some(&prefix)).unwrap();
-        assert_eq!(
-            defaults.client_url.as_deref(),
-            Some("http://127.0.0.1:29080")
-        );
-        assert_eq!(defaults.image.as_deref(), Some("dstack-0.5.12"));
-        assert_eq!(
-            defaults.allowlist_path().as_deref(),
-            Some("/tmp/custom-dstack/etc/dstack/auth-allowlist.json")
-        );
-
-        let _ = std::fs::remove_dir_all(install_root);
-    }
-
-    #[test]
-    fn parses_phala_style_deploy_flags() {
-        let cli = Cli::parse_from([
-            "dstack",
-            "deploy",
-            "-n",
-            "hello",
-            "-c",
-            "examples/hello-nginx/docker-compose.yaml",
-            "--port",
-            "8080:80",
-        ]);
-        match cli.command {
-            Command::Deploy {
-                compose,
-                compose_file,
-                name,
-                memory,
-                ports,
-                ..
-            } => {
-                assert_eq!(compose, None);
-                assert_eq!(
-                    compose_file.as_deref(),
-                    Some("examples/hello-nginx/docker-compose.yaml")
-                );
-                assert_eq!(name, "hello");
-                assert_eq!(memory, 2048);
-                assert_eq!(ports, vec!["8080:80"]);
-            }
-            _ => panic!("expected deploy command"),
-        }
+    /// read the VMM API token from the file recorded by `dstackup install`.
+    fn token(&self) -> Option<String> {
+        let path = self.client_token_path.as_ref()?;
+        let token = std::fs::read_to_string(path).ok()?;
+        let token = token.trim();
+        (!token.is_empty()).then(|| token.to_string())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_deploy(
     host: &str,
+    token: Option<&str>,
     compose_path: &str,
     name: &str,
     image: Option<&str>,
@@ -314,19 +445,40 @@ async fn cmd_deploy(
     memory: u32,
     disk: u32,
     port_specs: &[String],
+    volume_specs: &[String],
     no_kms: bool,
     allowlist: Option<&str>,
     dry_run: bool,
     json: bool,
+    runner: ComposeRunner,
+    snapshotter: Option<Snapshotter>,
 ) -> Result<()> {
-    let yaml = std::fs::read_to_string(compose_path)
-        .with_context(|| format!("reading compose file '{compose_path}'"))?;
-    let app_compose = compose::build_app_compose(name, &yaml, !no_kms);
-
-    let mut port_maps = Vec::new();
-    for spec in port_specs {
-        port_maps.push(ports::parse_port(spec)?);
+    if matches!(runner, ComposeRunner::DockerCompose) && snapshotter.is_some() {
+        bail!("--snapshotter is only supported with --runner nerdctl-compose");
     }
+    let yaml = fs::read_to_string(compose_path)
+        .with_context(|| format!("reading compose file '{compose_path}'"))?;
+
+    let port_maps = port_specs
+        .iter()
+        .map(|s| ports::parse_port(s))
+        .collect::<Result<Vec<_>>>()?;
+    let parsed_volumes = volume_specs
+        .iter()
+        .map(|s| parse_volume(s))
+        .collect::<Result<Vec<_>>>()?;
+    dstack_types::validate_verity_volumes(&parsed_volumes).map_err(anyhow::Error::msg)?;
+
+    // each --volume declares a measured verity_volumes entry, so the built
+    // app-compose (and thus app_id) binds the attested roots.
+    let app_compose = compose::build_app_compose_with_runtime_and_volumes(
+        name,
+        &yaml,
+        !no_kms,
+        runner.as_str(),
+        snapshotter.map(Snapshotter::as_str),
+        &parsed_volumes,
+    );
 
     let mut cfg = rpc::VmConfiguration {
         name: name.to_string(),
@@ -339,7 +491,7 @@ async fn cmd_deploy(
         ..Default::default()
     };
 
-    let vmm = Vmm::connect(host)?;
+    let vmm = Vmm::connect_with_token(host, token)?;
     let hash = vmm.get_compose_hash(&cfg).await?;
     let app_id = short(&hash, 40);
     cfg.app_id = Some(app_id.clone());
@@ -429,8 +581,8 @@ fn stub(name: &str) -> Result<()> {
     )
 }
 
-async fn cmd_apps(host: &str, json: bool) -> Result<()> {
-    let vmm = Vmm::connect(host)?;
+async fn cmd_apps(host: &str, token: Option<&str>, json: bool) -> Result<()> {
+    let vmm = Vmm::connect_with_token(host, token)?;
     let resp = vmm.status().await?;
     if json {
         let arr: Vec<_> = resp
@@ -470,8 +622,8 @@ async fn cmd_apps(host: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_logs(host: &str, id: &str, lines: u32) -> Result<()> {
-    let vmm = Vmm::connect(host)?;
+async fn cmd_logs(host: &str, token: Option<&str>, id: &str, lines: u32) -> Result<()> {
+    let vmm = Vmm::connect_with_token(host, token)?;
     let logs = vmm.logs(id, lines).await?;
     print!("{logs}");
     Ok(())
@@ -504,5 +656,150 @@ fn trunc(s: &str, n: usize) -> String {
         let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_local_install_defaults() {
+        let value = serde_json::json!({
+            "client_url": "http://127.0.0.1:19080",
+            "image": "dstack-0.5.11",
+            "allowlist_path": "/tmp/dstack/etc/dstack/auth-allowlist.json"
+        });
+        let defaults = LocalDefaults::from_value(&value);
+        assert_eq!(
+            defaults.client_url.as_deref(),
+            Some("http://127.0.0.1:19080")
+        );
+        assert_eq!(defaults.image.as_deref(), Some("dstack-0.5.11"));
+        assert_eq!(
+            defaults.allowlist_path().as_deref(),
+            Some("/tmp/dstack/etc/dstack/auth-allowlist.json")
+        );
+    }
+
+    #[test]
+    fn reads_local_install_defaults_from_prefix() {
+        let install_root =
+            std::env::temp_dir().join(format!("dstack-cli-state-test-{}", std::process::id()));
+        let state_dir = install_root.join("var/lib/dstack");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join(dstack_cli_core::layout::STATE_FILE),
+            r#"{
+              "client_url": "http://127.0.0.1:29080",
+              "image": "dstack-0.5.12",
+              "allowlist_path": "/tmp/custom-dstack/etc/dstack/auth-allowlist.json"
+            }"#,
+        )
+        .unwrap();
+
+        let prefix = dstack_cli_core::layout::path_string(&install_root);
+        let defaults = LocalDefaults::read(Some(&prefix)).unwrap();
+        assert_eq!(
+            defaults.client_url.as_deref(),
+            Some("http://127.0.0.1:29080")
+        );
+        assert_eq!(defaults.image.as_deref(), Some("dstack-0.5.12"));
+        assert_eq!(
+            defaults.allowlist_path().as_deref(),
+            Some("/tmp/custom-dstack/etc/dstack/auth-allowlist.json")
+        );
+
+        let _ = fs::remove_dir_all(install_root);
+    }
+
+    #[test]
+    fn parses_volume_specs() {
+        let root = "a".repeat(64);
+        let data = parse_volume(&format!("weights.img:{root}:/models/llama")).unwrap();
+        assert_eq!(data.source, "weights.img");
+        assert_eq!(data.verity_root, [0xaa; 32]);
+        assert_eq!(data.target, std::path::Path::new("/models/llama"));
+
+        assert!(parse_volume("weights.img").is_err()); // missing verity_root:target
+        assert!(parse_volume(&format!("weights.img:{root}")).is_err()); // missing target
+        assert!(parse_volume(&format!("../escape.img:{root}:/models")).is_err()); // path separator
+        assert!(parse_volume("x.img:nothex:/models").is_err()); // verity_root not hex
+        assert!(parse_volume(&format!("x.img:{root}:docker")).is_err()); // docker seed removed
+        assert!(parse_volume(&format!("x.img:{root}:relative/path")).is_err()); // bad target
+    }
+
+    #[test]
+    fn parses_phala_style_deploy_flags() {
+        let cli = Cli::parse_from([
+            "dstack",
+            "deploy",
+            "-n",
+            "hello",
+            "-c",
+            "examples/hello-nginx/docker-compose.yaml",
+            "--port",
+            "8080:80",
+        ]);
+        match cli.command {
+            Command::Deploy {
+                compose,
+                compose_file,
+                name,
+                memory,
+                ports,
+                ..
+            } => {
+                assert_eq!(compose, None);
+                assert_eq!(
+                    compose_file.as_deref(),
+                    Some("examples/hello-nginx/docker-compose.yaml")
+                );
+                assert_eq!(name, "hello");
+                assert_eq!(memory, 2048);
+                assert_eq!(ports, vec!["8080:80"]);
+            }
+            _ => panic!("expected deploy command"),
+        }
+    }
+
+    #[test]
+    fn parses_verity_fs_image_flag() {
+        let cli = Cli::parse_from(["dstack", "verity", "--fs-image", "rootfs.ext4"]);
+        match cli.command {
+            Command::Verity { dir, fs_image, .. } => {
+                assert_eq!(dir, None);
+                assert_eq!(fs_image.as_deref(), Some("rootfs.ext4"));
+            }
+            _ => panic!("expected verity command"),
+        }
+
+        assert!(Cli::try_parse_from([
+            "dstack",
+            "verity",
+            "--dir",
+            "data",
+            "--fs-image",
+            "rootfs.ext4"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "dstack",
+            "verity",
+            "--fs-image",
+            "rootfs.ext4",
+            "--compress",
+            "zstd"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "dstack",
+            "verity",
+            "--dir",
+            "data",
+            "--compress",
+            "invalid"
+        ])
+        .is_err());
     }
 }

@@ -73,8 +73,8 @@ Inside the CVM at `/etc/kms/certs/`:
 | `root-ca.key` | Root CA signing key (P256 ECDSA) |
 | `rpc.crt` | TLS certificate for RPC server |
 | `rpc.key` | RPC server private key |
-| `tmp-ca.crt` | Temporary CA for mutual TLS |
-| `tmp-ca.key` | Temporary CA private key |
+| `tmp-ca.crt` | Temp CA, served by the legacy `GetTempCaCert` bootstrap RPC |
+| `tmp-ca.key` | Temp CA private key, served alongside it |
 | `root-k256.key` | Ethereum signing key (secp256k1) |
 | `bootstrap-info.json` | Public keys and TDX attestation quote |
 
@@ -165,13 +165,11 @@ configs:
       key = "/etc/kms/certs/rpc.key"
       certs = "/etc/kms/certs/rpc.crt"
 
-      [rpc.tls.mutual]
-      ca_certs = "/etc/kms/certs/tmp-ca.crt"
-      # Keep the TLS listener optional because bootstrap/public endpoints must be
-      # reachable before a client has an RA-TLS certificate. Temp-CA bootstrap
-      # material is bootstrap-sensitive. Key-release RPCs still require verified
-      # caller attestation; certificate signing verifies CSR signature and attestation.
-      mandatory = false
+      # No mutual-TLS section: client certificates are verified by the attestation
+      # they carry, not by an issuer CA. Connections without a certificate are still
+      # accepted, because bootstrap and public endpoints must be reachable before a
+      # client has one. Key-release RPCs still require verified caller attestation;
+      # certificate signing verifies CSR signature and attestation.
 
       [core]
       cert_dir = "/etc/kms/certs"
@@ -256,6 +254,7 @@ Use the VMM CLI tool to deploy the CVM:
 cd ~/dstack/dstack/vmm
 
 # Set VMM auth from saved token
+export DSTACK_VMM_AUTH_USER=admin
 export DSTACK_VMM_AUTH_PASSWORD=$(cat ~/.dstack/secrets/vmm-auth-token)
 
 # Generate app-compose.json with local key provider enabled
@@ -306,7 +305,7 @@ curl -s -H "Authorization: Bearer $(cat ~/.dstack/secrets/vmm-auth-token)" \
   "http://127.0.0.1:9080/logs?id=VM_ID&follow=true&ansi=false"
 ```
 
-> **Note:** The VMM logs endpoint requires Bearer token authentication. The `vmm-cli.py logs` command may not work with token auth — use curl directly as shown above.
+> **Note:** The VMM logs endpoint requires authentication. `vmm-cli.py logs` sends credentials automatically when `DSTACK_VMM_TOKEN` (or `--token`) is set, so it works against an auth-enabled VMM; the curl form above is an equivalent alternative.
 
 Look for these log messages indicating KMS entered onboard mode:
 ```

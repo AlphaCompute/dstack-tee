@@ -2,6 +2,29 @@
 
 Thank you for your interest in contributing to this project!
 
+## Branches
+
+- `next` is the integration mainline and the default branch. Open every pull
+  request against it unless a maintainer asks otherwise.
+- `release/v<major>.<minor>.x` carries a released line — `release/v0.5.x` is
+  the current one. It only takes fixes cherry-picked back from `next`; do not
+  develop on it directly. Patch tags are cut here.
+
+Name a working branch whatever describes it. CI runs on pull requests, so a
+branch gets its checks once a PR is open rather than on every push.
+
+The default branch was renamed from `master` to `next`. Web links, raw file
+URLs, and the REST API redirect, but the old ref name is gone at the git
+level: `git fetch origin master` and `git clone -b master` now fail. Update an
+existing clone with:
+
+```bash
+git branch -m master next
+git fetch origin
+git branch -u origin/next next
+git remote set-head origin -a
+```
+
 ## Development
 
 1. Fork the repository
@@ -61,6 +84,12 @@ dstack deploy ./docker-compose.yml \
   --no-kms \
   --no-tee
 ```
+
+To exercise persistent TPM-backed app keys as well, install `swtpm` on the VMM
+host and select `key_provider=tpm` in the VMM console (or pass `--key-provider
+tpm` in tooling that exposes the compose option). The VMM keeps the software
+TPM state in the VM work directory so that seal/unseal survives guest restarts.
+The software TPM is host-controlled and does not provide hardware isolation.
 
 The simulator package is installed only in development images. This mode
 provides no hardware isolation and must never be used with production

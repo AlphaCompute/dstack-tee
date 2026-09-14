@@ -2,26 +2,29 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Display,
+    io::Write as _,
     ops::Deref,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     str::FromStr,
     time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use dstack_attest::emit_runtime_event;
+use dstack_attest::{default_verifier, emit_runtime_event, set_runtime_event_version};
 use dstack_kms_rpc as rpc;
 use dstack_types::{
+    gpu_policy_hash,
     shared_filenames::{
         APP_COMPOSE, APP_KEYS, DECRYPTED_ENV, DECRYPTED_ENV_JSON, ENCRYPTED_ENV,
-        HOST_SHARED_DIR_NAME, HOST_SHARED_DISK_LABEL, INSTANCE_INFO, SYS_CONFIG, USER_CONFIG,
+        HOST_SHARED_DIR_NAME, INSTANCE_INFO, SYS_CONFIG, USER_CONFIG,
     },
-    KeyProvider, KeyProviderInfo,
+    GpuPolicy, KeyProvider, KeyProviderInfo, GPU_ATTESTATION_OUTPUT,
 };
 use fs_err as fs;
 use luks2::{
@@ -33,13 +36,12 @@ use ra_rpc::{
     Attestation,
 };
 use ra_tls::{
-    attestation::{AttestationMode, QuoteContentType},
+    attestation::{detect_tee_variant, AttestationVerifier, QuoteContentType, TeeVariant},
     cert::{generate_ra_cert, CertConfigV2, CertSigningRequestV2, Csr},
 };
 use rand::Rng as _;
-use safe_write::safe_write;
+use safe_write::{safe_write, safe_write_with_mode};
 use scopeguard::defer;
-use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -48,6 +50,7 @@ use crate::{
     crypto::dh_decrypt,
     gen_app_keys_from_seed,
     host_api::HostApi,
+    host_shared::{mount_host_shared, unmount_host_shared},
     utils::{
         deserialize_json_file, sha256, sha256_file, AppCompose, AppKeys, KeyProviderKind, SysConfig,
     },
@@ -62,6 +65,10 @@ use ra_tls::rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use serde_human_bytes as hex_bytes;
 use serde_json::Value;
 use tpm_attest::{self as tpm, TpmContext};
+
+fn attestation_verifier(sys_config: &SysConfig) -> Result<Arc<AttestationVerifier>> {
+    Ok(Arc::new(default_verifier(&sys_config.collateral_urls())?))
+}
 
 async fn sign_cert_request(
     cert_client: &CertRequestClient,
@@ -87,12 +94,6 @@ async fn sign_cert_request(
 }
 
 mod config_id_verifier;
-
-fn is_unsupported_app_info_quote(err: &anyhow::Error) -> bool {
-    let message = format!("{err:#}");
-    message.contains("Unsupported attestation quote")
-        || message.contains("unsupported attestation quote for app info decoding")
-}
 
 #[derive(clap::Parser)]
 /// Prepare full disk encryption
@@ -160,6 +161,7 @@ impl FromStr for FsType {
 struct DstackOptions {
     storage_encrypted: bool,
     storage_fs: FsType,
+    storage_discard: bool,
 }
 
 fn parse_dstack_options(shared: &HostShared) -> Result<DstackOptions> {
@@ -168,6 +170,7 @@ fn parse_dstack_options(shared: &HostShared) -> Result<DstackOptions> {
     let mut options = DstackOptions {
         storage_encrypted: true, // Default to encryption enabled
         storage_fs: FsType::Zfs, // Default to ZFS
+        storage_discard: true,   // Reclaim unused blocks from sparse host images
     };
 
     for param in cmdline.split_whitespace() {
@@ -187,6 +190,7 @@ fn parse_dstack_options(shared: &HostShared) -> Result<DstackOptions> {
     if let Some(fs) = &shared.app_compose.storage_fs {
         options.storage_fs = fs.parse().context("Failed to parse storage_fs")?;
     }
+    options.storage_discard = shared.app_compose.storage_discard;
     Ok(options)
 }
 
@@ -245,42 +249,6 @@ struct HostShared {
 }
 
 impl HostShared {
-    /// Find block device by volume label
-    fn find_disk_by_label(label: &str) -> Option<String> {
-        let label_path = format!("/dev/disk/by-label/{}", label);
-        if Path::new(&label_path).exists() {
-            return Some(label_path);
-        }
-
-        // Fallback: scan /sys/block for devices and check their labels with blkid
-        if let Ok(entries) = fs::read_dir("/sys/block") {
-            for entry in entries.flatten() {
-                let dev_name = entry.file_name();
-                let dev_path = format!("/dev/{}", dev_name.to_string_lossy());
-
-                // Use blkid to check the label
-                if let Ok(output) = Command::new("blkid")
-                    .arg("-s")
-                    .arg("LABEL")
-                    .arg("-o")
-                    .arg("value")
-                    .arg(&dev_path)
-                    .output()
-                {
-                    if output.status.success() {
-                        let found_label =
-                            String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        if found_label == label {
-                            return Some(dev_path);
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
     fn load(host_shared_dir: impl Into<HostShareDir>) -> Result<Self> {
         let host_shared_dir = host_shared_dir.into();
         let sys_config = deserialize_json_file(host_shared_dir.sys_config_file())?;
@@ -330,32 +298,8 @@ impl HostShared {
             std::io::copy(&mut src_io, &mut dst_io)?;
             Ok(())
         };
-        cmd! {
-            info "Mounting host-shared";
-            mkdir -p $host_shared_dir;
-        }?;
-
-        // Try to detect and mount shared disk by label first, fallback to 9p
-        let disk_device = Self::find_disk_by_label(HOST_SHARED_DISK_LABEL);
-        let mounted_via_disk = if let Some(dev) = disk_device {
-            info!("Found shared disk at {}", dev);
-            let mount_result = cmd! {
-                info "Attempting to mount shared disk";
-                mount -o ro $dev $host_shared_dir;
-            };
-            mount_result.is_ok()
-        } else {
-            false
-        };
-
-        if !mounted_via_disk {
-            info!("Shared disk not found, trying 9p virtfs");
-            cmd! {
-                mount -t 9p -o trans=virtio,version=9p2000.L,ro host-shared $host_shared_dir;
-            }?;
-        } else {
-            info!("Successfully mounted shared disk");
-        }
+        info!("Mounting host-shared");
+        mount_host_shared(host_shared_dir)?;
 
         cmd! {
             mkdir -p $host_shared_copy_dir;
@@ -366,16 +310,14 @@ impl HostShared {
         copy(INSTANCE_INFO, SZ_1KB * 10, true)?;
         copy(ENCRYPTED_ENV, SZ_1KB * 256, true)?;
         copy(USER_CONFIG, SZ_1MB * 50, true)?;
-        cmd! {
-            info "Unmounting host-shared";
-            umount $host_shared_dir;
-        }?;
+        info!("Unmounting host-shared");
+        unmount_host_shared(host_shared_dir)?;
         HostShared::load(host_shared_copy_dir)
     }
 }
 
 const GATEWAY_CACHE_PATH: &str = "/run/dstack/gateway-cache.json";
-const WG_CONFIG_PATH: &str = "/etc/wireguard/dstack-wg0.conf";
+const GATEWAY_CACHE_PREFIX: &str = "/run/dstack/gateway-cache-";
 /// Certificate validity period in seconds (10 days)
 const CERT_VALIDITY_SECS: u64 = 10 * 24 * 3600;
 const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 3;
@@ -395,18 +337,87 @@ struct GatewayKeyStore {
     wg_sk: String,
     /// WireGuard public key
     wg_pk: String,
+    /// The gateway URL that last accepted a registration for this cluster.
+    ///
+    /// Tried first on the next refresh. Without it the list is walked in
+    /// configured order every time, which is sticky in the wrong way: every CVM
+    /// piles onto the first URL, and when that one has an outage the whole
+    /// fleet moves to the second and then moves *back* the moment the first
+    /// recovers. Each of those moves rewrites the instance record from a
+    /// different node's memory, which is exactly what loses per-instance state
+    /// that only lives there.
+    ///
+    /// Scoped to a boot, because the cache is on tmpfs. That is the right
+    /// scope: a boot regenerates the WireGuard key and re-registers from
+    /// scratch anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_url: Option<String>,
+}
+
+/// Freshly issued client certificate material for [`GatewayKeyStore::renewed`].
+struct IssuedClientCerts {
+    client_cert: String,
+    client_cert_with_quote: String,
+    client_key: String,
+    cert_not_after: u64,
 }
 
 impl GatewayKeyStore {
-    fn load() -> Option<Self> {
-        let content = fs::read_to_string(GATEWAY_CACHE_PATH).ok()?;
+    /// The store a certificate renewal produces: fresh certificates plus
+    /// everything the renewal must carry over from the previous cache — the
+    /// WireGuard identity, because the gateway maps this peer by its public
+    /// key, and the registration preference, because the renewed store is
+    /// saved over the cache before the per-cluster loop reads the preference
+    /// back, so dropping it here would drop it on disk too and drift the
+    /// fleet back onto the first configured URL at every renewal.
+    fn renewed(
+        cache: Option<Self>,
+        generate_wg: impl FnOnce() -> Result<(String, String)>,
+        certs: IssuedClientCerts,
+    ) -> Result<Self> {
+        let (wg_sk, wg_pk, last_url) = match cache {
+            Some(cache) => {
+                info!("reusing cached WireGuard keys");
+                (cache.wg_sk, cache.wg_pk, cache.last_url)
+            }
+            None => {
+                let (wg_sk, wg_pk) = generate_wg()?;
+                (wg_sk, wg_pk, None)
+            }
+        };
+        Ok(Self {
+            client_cert: certs.client_cert,
+            client_cert_with_quote: certs.client_cert_with_quote,
+            client_key: certs.client_key,
+            cert_not_after: certs.cert_not_after,
+            wg_sk,
+            wg_pk,
+            last_url,
+        })
+    }
+
+    fn load_from(path: &Path) -> Option<Self> {
+        let content = fs::read_to_string(path).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    fn save(&self) -> Result<()> {
+    fn load_from_default() -> Option<Self> {
+        Self::load_from(Path::new(GATEWAY_CACHE_PATH))
+    }
+
+    fn save_to(&self, path: &Path) -> Result<()> {
         let content = serde_json::to_string(self).context("Failed to serialize gateway cache")?;
-        safe_write(GATEWAY_CACHE_PATH, &content).context("Failed to write gateway cache")?;
+        safe_write_with_mode(path, &content, 0o600).context("Failed to write gateway cache")?;
         Ok(())
+    }
+
+    fn save_to_default(&self) -> Result<()> {
+        self.save_to(Path::new(GATEWAY_CACHE_PATH))
+    }
+
+    fn is_cert_valid_at(&self, now: u64) -> bool {
+        // Valid if at least 10 minutes remaining.
+        now.saturating_add(600) < self.cert_not_after
     }
 
     fn is_cert_valid(&self) -> bool {
@@ -414,8 +425,53 @@ impl GatewayKeyStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Valid if at least 10 minutes remaining
-        now + 600 < self.cert_not_after
+        self.is_cert_valid_at(now)
+    }
+}
+
+fn gateway_rpc_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/prpc") {
+        base.to_string()
+    } else {
+        format!("{base}/prpc")
+    }
+}
+
+#[derive(Debug)]
+struct GatewayTarget {
+    name: String,
+    urls: Vec<String>,
+}
+
+struct PreparedGatewayCluster {
+    name: String,
+    index: usize,
+    key_store: GatewayKeyStore,
+    response: RegisterCvmResponse,
+}
+
+fn wireguard_endpoint_hosts(config: &str) -> Result<Vec<String>> {
+    config
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Endpoint = "))
+        .map(|endpoint| {
+            endpoint
+                .rsplit_once(':')
+                .map(|(host, _)| host.trim_matches(['[', ']']).to_string())
+                .context("invalid WireGuard endpoint")
+        })
+        .collect()
+}
+
+fn remove_partial_wireguard_config(path: &str, cluster: &str) {
+    if let Err(error) = fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                cluster = cluster,
+                "failed to remove partially applied WireGuard config: {error}"
+            );
+        }
     }
 }
 
@@ -435,20 +491,20 @@ impl<'a> GatewayContext<'a> {
         gateway_url: &str,
         client_key: &str,
         client_cert: &str,
+        gateway_app_id: &str,
     ) -> Result<GatewayClient<RaClient>> {
-        let url = format!("{}/prpc", gateway_url);
+        let url = gateway_rpc_url(gateway_url);
         let ca_cert = self.keys.ca_cert.clone();
         let cert_validator = AppIdValidator {
-            allowed_app_id: self.keys.gateway_app_id.clone(),
+            allowed_app_id: gateway_app_id.to_string(),
         };
         let client = RaClientConfig::builder()
             .remote_uri(url)
-            .maybe_pccs_url(self.shared.sys_config.pccs_url.clone())
             .tls_client_cert(client_cert.to_string())
             .tls_client_key(client_key.to_string())
             .tls_ca_cert(ca_cert)
             .tls_built_in_root_certs(false)
-            .tls_no_check(self.keys.gateway_app_id == "any")
+            .tls_no_check(gateway_app_id == "any")
             .verify_server_attestation(false)
             .cert_validator(Box::new(move |cert| cert_validator.validate(cert)))
             .build()
@@ -461,6 +517,7 @@ impl<'a> GatewayContext<'a> {
         &self,
         gateway_url: &str,
         key_store: &GatewayKeyStore,
+        gateway_app_id: &str,
     ) -> Result<RegisterCvmResponse> {
         let port_policy = RpcPortPolicy {
             ports: self
@@ -476,12 +533,18 @@ impl<'a> GatewayContext<'a> {
                 .collect(),
             restrict_mode: self.shared.app_compose.port_policy.restrict_mode,
         };
-        let client =
-            self.create_gateway_client(gateway_url, &key_store.client_key, &key_store.client_cert)?;
+        let health_check = health_check_requested(&self.shared.app_compose);
+        let client = self.create_gateway_client(
+            gateway_url,
+            &key_store.client_key,
+            &key_store.client_cert,
+            gateway_app_id,
+        )?;
         let result = client
             .register_cvm(RegisterCvmRequest {
                 client_public_key: key_store.wg_pk.clone(),
                 port_policy: Some(port_policy.clone()),
+                health_check,
             })
             .await
             .context("Failed to register CVM");
@@ -498,11 +561,13 @@ impl<'a> GatewayContext<'a> {
             gateway_url,
             &key_store.client_key,
             &key_store.client_cert_with_quote,
+            gateway_app_id,
         )?;
         client
             .register_cvm(RegisterCvmRequest {
                 client_public_key: key_store.wg_pk.clone(),
                 port_policy: Some(port_policy),
+                health_check,
             })
             .await
             .context("Failed to register CVM")
@@ -510,7 +575,7 @@ impl<'a> GatewayContext<'a> {
 
     async fn get_or_generate_key_store(&self) -> Result<GatewayKeyStore> {
         // Try to load existing cache
-        let cache = GatewayKeyStore::load();
+        let cache = GatewayKeyStore::load_from_default();
 
         // If cache is fully valid, return it
         if let Some(ref cache) = cache {
@@ -520,18 +585,6 @@ impl<'a> GatewayContext<'a> {
             }
         }
 
-        // Reuse WireGuard keys from cache if available, otherwise generate new ones
-        let (wg_sk, wg_pk) = if let Some(ref cache) = cache {
-            info!("Reusing cached WireGuard keys");
-            (cache.wg_sk.clone(), cache.wg_pk.clone())
-        } else {
-            info!("Generating new WireGuard keys");
-            let sk = cmd!(wg genkey)?;
-            let pk =
-                cmd!(echo $sk | wg pubkey).or(Err(anyhow!("Failed to generate public key")))?;
-            (sk, pk)
-        };
-
         // Request new client certificates
         info!("Requesting new client certificates");
         let now = std::time::SystemTime::now()
@@ -539,9 +592,10 @@ impl<'a> GatewayContext<'a> {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let cert_not_after = now + CERT_VALIDITY_SECS;
+        let verifier = attestation_verifier(&self.shared.sys_config)?;
         let cert_client = CertRequestClient::create(
             self.keys,
-            self.shared.sys_config.pccs_url.as_deref(),
+            verifier,
             self.shared.sys_config.vm_config.clone(),
         )
         .await
@@ -585,14 +639,49 @@ impl<'a> GatewayContext<'a> {
             .context("Failed to request cert with quote")?;
         let client_cert_with_quote = certs_with_quote.join("\n");
 
-        Ok(GatewayKeyStore {
-            client_cert,
-            client_cert_with_quote,
-            client_key,
-            cert_not_after,
-            wg_sk,
-            wg_pk,
-        })
+        GatewayKeyStore::renewed(
+            cache,
+            || {
+                info!("generating new WireGuard keys");
+                let sk = cmd!(wg genkey)?;
+                let pk =
+                    cmd!(echo $sk | wg pubkey).or(Err(anyhow!("Failed to generate public key")))?;
+                Ok((sk, pk))
+            },
+            IssuedClientCerts {
+                client_cert,
+                client_cert_with_quote,
+                client_key,
+                cert_not_after,
+            },
+        )
+    }
+
+    fn key_store_for_additional_cluster(
+        &self,
+        name: &str,
+        certificate_source: &GatewayKeyStore,
+    ) -> Result<(GatewayKeyStore, PathBuf)> {
+        let path = PathBuf::from(format!("{GATEWAY_CACHE_PREFIX}{name}.json"));
+        if let Some(cache) = GatewayKeyStore::load_from(&path) {
+            if cache.is_cert_valid() {
+                info!(cluster = name, "Using cached gateway cluster key store");
+                return Ok((cache, path));
+            }
+        }
+        let old = GatewayKeyStore::load_from(&path);
+        let (wg_sk, wg_pk) = if let Some(old) = old {
+            (old.wg_sk, old.wg_pk)
+        } else {
+            let sk = cmd!(wg genkey)?;
+            let pk =
+                cmd!(echo $sk | wg pubkey).or(Err(anyhow!("Failed to generate public key")))?;
+            (sk, pk)
+        };
+        let mut key_store = certificate_source.clone();
+        key_store.wg_sk = wg_sk;
+        key_store.wg_pk = wg_pk;
+        Ok((key_store, path))
     }
 
     async fn setup(&self, force: bool) -> Result<()> {
@@ -604,110 +693,226 @@ impl<'a> GatewayContext<'a> {
             bail!("Missing allowed dstack-gateway app id");
         }
 
-        info!("Setting up dstack-gateway");
+        let targets = self.gateway_targets()?;
+        let uses_explicit_clusters = !self.shared.sys_config.gateway_clusters.is_empty();
+        info!(clusters = targets.len(), "Setting up dstack-gateway");
 
-        // Get or generate key store (includes WireGuard keys and client certificate)
-        let key_store = self.get_or_generate_key_store().await?;
-
-        if self.shared.sys_config.gateway_urls.is_empty() {
-            bail!("Missing gateway urls");
+        // Certificates are valid for every gateway identity authorized by KMS,
+        // while each cluster receives a distinct WireGuard identity.
+        let primary_key_store = self.get_or_generate_key_store().await?;
+        if let Err(err) = primary_key_store.save_to_default() {
+            warn!("failed to save gateway cache: {err:?}");
         }
-        // Read config and make API call
-        let response = 'out: {
-            let mut error = anyhow!("unknown error");
-            for (i, url) in self.shared.sys_config.gateway_urls.iter().enumerate() {
-                let response = self.register_cvm(url, &key_store).await;
-                match response {
-                    Ok(response) => {
-                        break 'out response;
+
+        let mut errors = Vec::new();
+        for (index, target) in targets.iter().enumerate() {
+            let key_store_result = if index == 0 && !uses_explicit_clusters {
+                Ok((primary_key_store.clone(), PathBuf::from(GATEWAY_CACHE_PATH)))
+            } else {
+                self.key_store_for_additional_cluster(&target.name, &primary_key_store)
+            };
+            let (mut key_store, cache_path) = match key_store_result {
+                Ok(value) => value,
+                Err(err) => {
+                    errors.push(format!("{}: {err:#}", target.name));
+                    continue;
+                }
+            };
+            carry_cluster_preference(&mut key_store, &cache_path, &target.urls);
+            if let Err(err) = key_store.save_to(&cache_path) {
+                warn!(cluster = %target.name, "failed to save gateway cluster cache: {err:?}");
+            }
+
+            let mut first_error = None;
+            let mut response = None;
+            let mut accepted_by = None;
+            for url in order_by_stickiness(&target.urls, key_store.last_url.as_deref()) {
+                match self
+                    .register_cvm(url, &key_store, &self.keys.gateway_app_id)
+                    .await
+                {
+                    Ok(value) => {
+                        response = Some(value);
+                        accepted_by = Some(url.clone());
+                        break;
                     }
                     Err(err) => {
-                        warn!("Failed to register CVM: {err:?}, retrying with next dstack-gateway");
-                        if i == 0 {
-                            error = err;
+                        warn!(cluster = %target.name, %url, "Failed to register CVM: {err:?}");
+                        if first_error.is_none() {
+                            first_error = Some(err);
                         }
                     }
                 }
             }
-            return Err(error).context("Failed to register CVM, all dstack-gateway urls are down");
+            record_accepting_url(&target.name, &mut key_store, &cache_path, accepted_by);
+            let Some(response) = response else {
+                errors.push(format!(
+                    "{}: {:#}",
+                    target.name,
+                    first_error.unwrap_or_else(|| anyhow!("no gateway URLs configured"))
+                ));
+                continue;
+            };
+            let cluster = PreparedGatewayCluster {
+                name: target.name.clone(),
+                index,
+                key_store,
+                response,
+            };
+            if let Err(err) = self.apply_wireguard(cluster, force) {
+                errors.push(format!("{}: {err:#}", target.name));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("failed to refresh gateway clusters: {}", errors.join("; "))
+        }
+    }
+
+    fn gateway_targets(&self) -> Result<Vec<GatewayTarget>> {
+        if !self.shared.sys_config.gateway_urls.is_empty()
+            && !self.shared.sys_config.gateway_clusters.is_empty()
+        {
+            warn!("both gateway_urls and gateway_clusters are configured; ignoring gateway_urls");
+        }
+        let targets = if self.shared.sys_config.gateway_clusters.is_empty() {
+            vec![GatewayTarget {
+                name: "default".to_string(),
+                urls: self.shared.sys_config.gateway_urls.clone(),
+            }]
+        } else {
+            self.shared
+                .sys_config
+                .gateway_clusters
+                .iter()
+                .map(|cluster| GatewayTarget {
+                    name: cluster.name.clone(),
+                    urls: cluster.urls.clone(),
+                })
+                .collect()
         };
-        let mut wg_info = response.wg.context("Missing wg info")?;
+        let mut names = std::collections::HashSet::new();
+        for target in &targets {
+            if target.name.is_empty()
+                || !target
+                    .name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                bail!("invalid gateway cluster name: {}", target.name);
+            }
+            if !names.insert(target.name.as_str()) {
+                bail!("duplicate gateway cluster name: {}", target.name);
+            }
+            if target.urls.is_empty() {
+                bail!("gateway cluster {} has no URLs", target.name);
+            }
+        }
+        Ok(targets)
+    }
 
-        let client_ip = &wg_info.client_ip;
-
-        // Sort peers by public key for consistent config generation
+    fn apply_wireguard(&self, mut cluster: PreparedGatewayCluster, force: bool) -> Result<()> {
+        let interface = format!("dstack-wg{}", cluster.index);
+        let config_path = format!("/etc/wireguard/{interface}.conf");
+        let listen_port = 9182_u16
+            .checked_add(
+                cluster
+                    .index
+                    .try_into()
+                    .context("too many gateway clusters")?,
+            )
+            .context("too many gateway clusters")?;
+        let mut wg_info = cluster.response.wg.take().context("missing wg info")?;
         wg_info.servers.sort_by(|a, b| a.pk.cmp(&b.pk));
-
-        // Create WireGuard config
-        let wg_listen_port = "9182";
         let mut new_config = format!(
-            "[Interface]\n\
-            PrivateKey = {}\n\
-            ListenPort = {wg_listen_port}\n\
-            Address = {client_ip}/32\n\n",
-            key_store.wg_sk
+            "[Interface]\nPrivateKey = {}\nListenPort = {listen_port}\nAddress = {}/32\n\n",
+            cluster.key_store.wg_sk, wg_info.client_ip
         );
         for WireGuardPeer { pk, ip, endpoint } in &wg_info.servers {
             let ip = ip.split('/').next().unwrap_or_default();
             new_config.push_str(&format!(
-                "[Peer]\n\
-                PublicKey = {pk}\n\
-                AllowedIPs = {ip}/32\n\
-                Endpoint = {endpoint}\n\
-                PersistentKeepalive = 25\n",
+                "[Peer]\nPublicKey = {pk}\nAllowedIPs = {ip}/32\nEndpoint = {endpoint}\nPersistentKeepalive = 25\n"
             ));
         }
-
-        // Save cache
-        if let Err(e) = key_store.save() {
-            warn!("Failed to save gateway cache: {e:?}");
+        let old_config = fs::read_to_string(&config_path).ok();
+        if !force && old_config.as_ref() == Some(&new_config) {
+            info!(cluster = %cluster.name, "WireGuard config unchanged");
+            return Ok(());
         }
-
-        // Check if config has changed (skip check if force is set)
-        if !force {
-            let current_config = fs::read_to_string(WG_CONFIG_PATH).ok();
-            if current_config.as_ref() == Some(&new_config) {
-                info!("WireGuard config unchanged, skipping reconfiguration");
-                return Ok(());
+        let new_endpoints = wireguard_endpoint_hosts(&new_config)?;
+        let applied = self.apply_wireguard_config(
+            &interface,
+            &config_path,
+            listen_port,
+            &new_config,
+            &new_endpoints,
+        );
+        if let Err(error) = applied {
+            // Registration and refresh are independent per cluster. Preserve
+            // this cluster's last-known-good config if applying its replacement
+            // fails; a cluster with no prior config removes the false marker so
+            // the checker takes its fast missing-config retry path.
+            if let Some(old_config) = old_config {
+                match wireguard_endpoint_hosts(&old_config).and_then(|endpoints| {
+                    self.apply_wireguard_config(
+                        &interface,
+                        &config_path,
+                        listen_port,
+                        &old_config,
+                        &endpoints,
+                    )
+                }) {
+                    Ok(()) => {
+                        warn!(cluster = %cluster.name, "restored previous WireGuard config after refresh failure")
+                    }
+                    Err(rollback_error) => {
+                        warn!(cluster = %cluster.name, "failed to restore previous WireGuard config: {rollback_error:#}");
+                        remove_partial_wireguard_config(&config_path, &cluster.name);
+                    }
+                }
+            } else {
+                remove_partial_wireguard_config(&config_path, &cluster.name);
             }
+            return Err(error);
         }
+        Ok(())
+    }
 
-        let wg_dir = Path::new("/etc/wireguard");
-        fs::create_dir_all(wg_dir)?;
-        fs::write(wg_dir.join("dstack-wg0.conf"), &new_config)?;
+    fn apply_wireguard_config(
+        &self,
+        interface: &str,
+        config_path: &str,
+        listen_port: u16,
+        config: &str,
+        endpoint_hosts: &[String],
+    ) -> Result<()> {
+        safe_write_with_mode(config_path, config, 0o600)
+            .context("failed to write WireGuard config")?;
+        cmd!(ignore wg-quick down $interface)?;
 
-        cmd! {
-            chmod 600 $wg_dir/dstack-wg0.conf;
-            ignore wg-quick down dstack-wg0;
-        }?;
-
-        // Setup WireGuard iptables rules
-        cmd! {
-            // Create the chain if it doesn't exist
-            ignore iptables -N DSTACK_WG 2>/dev/null;
-            // Flush the chain
-            iptables -F DSTACK_WG;
-            // Remove any existing jump rule
-            ignore iptables -D INPUT -p udp --dport $wg_listen_port -j DSTACK_WG 2>/dev/null;
-            // Insert the new jump rule at the beginning of the INPUT chain
-            iptables -I INPUT -p udp --dport $wg_listen_port -j DSTACK_WG
-        }?;
-
-        for peer in &wg_info.servers {
-            // Avoid issues with field-access in the macro by binding the IP to a local variable.
-            let endpoint_ip = peer
-                .endpoint
-                .split(':')
-                .next()
-                .context("Invalid wireguard endpoint")?;
-            cmd!(iptables -A DSTACK_WG -s $endpoint_ip -j ACCEPT)?;
+        // Docker also updates iptables throughout boot. Bound every lock wait
+        // so a transient xtables.lock holder neither breaks the cluster update
+        // nor stalls the checker indefinitely.
+        let xtables_wait = "5";
+        let chain = format!("DSTACK_WG{}", interface.trim_start_matches("dstack-wg"));
+        if interface == "dstack-wg0" {
+            // Remove the pre-multi-cluster chain after upgrading. The new
+            // per-interface chain below owns the same listen port.
+            cmd!(ignore iptables -w $xtables_wait -D INPUT -p udp --dport $listen_port -j DSTACK_WG 2>/dev/null)?;
+            cmd!(ignore iptables -w $xtables_wait -F DSTACK_WG 2>/dev/null)?;
+            cmd!(ignore iptables -w $xtables_wait -X DSTACK_WG 2>/dev/null)?;
         }
-
-        // Drop any UDP packets that don't come from an allowed IP.
-        cmd!(iptables -A DSTACK_WG -j DROP)?;
-
-        info!("Starting WireGuard");
-        cmd!(wg-quick up dstack-wg0)?;
+        cmd!(ignore iptables -w $xtables_wait -N $chain 2>/dev/null)?;
+        cmd!(iptables -w $xtables_wait -F $chain)?;
+        cmd!(ignore iptables -w $xtables_wait -D INPUT -p udp --dport $listen_port -j $chain 2>/dev/null)?;
+        cmd!(iptables -w $xtables_wait -I INPUT -p udp --dport $listen_port -j $chain)?;
+        for endpoint_host in endpoint_hosts {
+            cmd!(iptables -w $xtables_wait -A $chain -s $endpoint_host -j ACCEPT)?;
+        }
+        cmd!(iptables -w $xtables_wait -A $chain -j DROP)?;
+        info!(%interface, "starting WireGuard");
+        cmd!(wg-quick up $interface)?;
         Ok(())
     }
 }
@@ -799,22 +1004,17 @@ fn verify_app_compose_policy(shared: &HostShared) -> Result<()> {
     let Some(requirements) = app_compose.requirements.as_ref() else {
         return Ok(());
     };
-    if requirements.os_version.is_some() {
-        let current_os_version =
-            read_current_os_version().context("Failed to read current dstack OS version")?;
-        verify_os_version_requirement(app_compose, &current_os_version)?;
-    }
     if let Some(platforms) = requirements.platforms.as_deref() {
         if platforms.is_empty() {
             bail!("Unsupported attestation platform: requirements.platforms is empty");
         }
         let current_platform =
-            AttestationMode::detect().context("failed to detect current attestation platform")?;
+            detect_tee_variant().context("failed to detect current attestation platform")?;
         verify_platform_requirements(app_compose, current_platform)?;
     }
     if requirements.tdx_measure_acpi_tables.is_some() {
         let current_platform =
-            AttestationMode::detect().context("failed to detect current attestation platform")?;
+            detect_tee_variant().context("failed to detect current attestation platform")?;
         verify_tdx_measure_acpi_tables_requirement(
             app_compose,
             &sys_config.vm_config,
@@ -832,6 +1032,93 @@ fn verify_app_compose_policy(shared: &HostShared) -> Result<()> {
     Ok(())
 }
 
+/// The order to try a cluster's gateway URLs in, last accepting one first.
+///
+/// Walking the configured list every time is sticky in the wrong way. Every CVM
+/// piles onto the first URL, so one node takes all registration traffic; and
+/// when that node has an outage the whole fleet moves to the second URL and
+/// then moves *back* the instant the first recovers. Every one of those moves
+/// rewrites the instance record from a different node's memory, which is how
+/// per-instance state that lives only there gets lost.
+///
+/// Preferring the last node that accepted turns both into one-time events: a
+/// CVM that moved stays moved, and the fleet spreads over the outage rather
+/// than snapping back together.
+///
+/// `last` is only a preference. Everything else still follows in configured
+/// order, so a URL that is down costs one failed attempt and nothing more.
+fn order_by_stickiness<'a>(urls: &'a [String], last: Option<&str>) -> Vec<&'a String> {
+    let mut ordered = Vec::with_capacity(urls.len());
+    if let Some(last) = last {
+        ordered.extend(urls.iter().filter(|url| url.as_str() == last));
+    }
+    ordered.extend(urls.iter().filter(|url| Some(url.as_str()) != last));
+    ordered
+}
+
+/// Carry the cluster's own remembered URL into a freshly resolved key store.
+///
+/// The preference is per cluster. The store handed in may have just been
+/// rebuilt by a certificate renewal, or cloned from the primary's for an
+/// additional cluster — either way the preference that counts is the one this
+/// cluster's cache holds, and only while the operator still lists the URL: a
+/// URL removed from the config is dropped rather than resurrected.
+fn carry_cluster_preference(
+    key_store: &mut GatewayKeyStore,
+    cache_path: &Path,
+    configured: &[String],
+) {
+    key_store.last_url = GatewayKeyStore::load_from(cache_path)
+        .and_then(|cached| cached.last_url)
+        .filter(|url| configured.iter().any(|configured| configured == url));
+}
+
+/// Persist the URL that accepted this round's registration, if it changed.
+///
+/// Only an acceptance updates the preference. A round where every URL failed
+/// says nothing about where the instance record lives, and clearing on it
+/// would have one bad tick — a full-cluster outage, or a blip in this CVM's
+/// own networking — erase the fleet's spread and pile everyone back onto the
+/// first configured URL at recovery.
+fn record_accepting_url(
+    cluster: &str,
+    key_store: &mut GatewayKeyStore,
+    cache_path: &Path,
+    accepted_by: Option<String>,
+) {
+    let Some(url) = accepted_by else {
+        return;
+    };
+    if key_store.last_url.as_deref() == Some(url.as_str()) {
+        return;
+    }
+    if key_store.last_url.is_some() {
+        info!(cluster, %url, "gateway registration moved");
+    }
+    key_store.last_url = Some(url);
+    if let Err(err) = key_store.save_to(cache_path) {
+        warn!(cluster, "failed to record the accepting gateway: {err:?}");
+    }
+}
+
+/// Whether this app asked the gateway to gate its traffic on health.
+///
+/// Opt-in, not a build-time fact: the guest agent only refreshes a verdict when
+/// the app asked for one, so telling the gateway to poll an app that did not
+/// would cost every gateway node a round trip per interval to be told what it
+/// already assumes.
+///
+/// This is the only hop between the app's manifest and the gateway's behaviour,
+/// which is why it is a named function rather than an expression inside the
+/// registration call: getting it wrong makes the whole feature inert fleet-wide
+/// with nothing to show for it.
+fn health_check_requested(app_compose: &AppCompose) -> bool {
+    app_compose
+        .requirements
+        .as_ref()
+        .is_some_and(|requirements| requirements.health_check)
+}
+
 fn verify_manifest_feature_requirements(app_compose: &AppCompose) -> Result<()> {
     let manifest_version = verify_manifest_version(app_compose)?;
     if app_compose.requirements.is_some() && manifest_version < MANIFEST_VERSION_3 {
@@ -839,35 +1126,78 @@ fn verify_manifest_feature_requirements(app_compose: &AppCompose) -> Result<()> 
             "requirements requires manifest_version >= {MANIFEST_VERSION_3}; use string manifest_version \"{MANIFEST_VERSION_3}\" so older guests fail closed"
         );
     }
+    if app_compose.runner == "nerdctl-compose" && manifest_version < MANIFEST_VERSION_3 {
+        bail!(
+            "nerdctl-compose requires manifest_version >= {MANIFEST_VERSION_3}; use string manifest_version \"{MANIFEST_VERSION_3}\" so older guests fail closed"
+        );
+    }
+    if app_compose.init_script.len() > 1 && manifest_version < MANIFEST_VERSION_3 {
+        bail!(
+            "multiple init scripts require manifest_version >= {MANIFEST_VERSION_3}; use string manifest_version \"{MANIFEST_VERSION_3}\" so older guests fail closed"
+        );
+    }
+    if app_compose.runner != "nerdctl-compose" && app_compose.snapshotter.is_some() {
+        bail!("snapshotter is only supported by the nerdctl-compose runner");
+    }
+    verify_health_check_requirement(app_compose)?;
     Ok(())
 }
 
-fn verify_os_version_requirement(app_compose: &AppCompose, current_os_version: &str) -> Result<()> {
+/// Reject a health-gating request this guest could not act on.
+///
+/// Only checks that need nothing but the manifest. The obvious third
+/// check -- "does any service actually declare a `healthcheck:`?" -- is
+/// deliberately *not* here, even though an app whose containers declare none
+/// reports healthy forever, which is the failure this is meant to remove.
+///
+/// It is not here because at this point the only thing available is the raw
+/// compose text, and reading it is not the same question as the one the runtime
+/// answers. Scanning YAML for the key misses a `HEALTHCHECK` in the Dockerfile,
+/// misses a `<<:` merge from a shared anchor (the loader does not expand merge
+/// keys, so the service reads as having no `healthcheck` at all), misses
+/// `extends:` and multi-file overrides -- and *passes* `healthcheck: {disable:
+/// true}` and `test: ["NONE"]`, which are exactly the configurations that
+/// produce no verdict at runtime. It rejects working deployments and admits
+/// broken ones.
+///
+/// The guest agent asks the runtime instead, which is the authority, and
+/// reports "nothing here can be judged" as unhealthy-with-a-reason. That
+/// surfaces in the gateway log and on the dashboard rather than as a boot
+/// failure, and it is right in all of the cases above.
+fn verify_health_check_requirement(app_compose: &AppCompose) -> Result<()> {
     let Some(requirements) = app_compose.requirements.as_ref() else {
         return Ok(());
     };
-    let Some(os_version) = requirements.os_version.as_deref() else {
+    if !requirements.health_check {
+        // A path without gating enabled is inert, not an error: an operator
+        // turning gating off during an incident should not have to also delete
+        // the path they will want back.
         return Ok(());
-    };
-    let os_version_req = VersionReq::parse(os_version)
-        .with_context(|| format!("Invalid requirements.os_version: {os_version}"))?;
-    let current_os_version = Version::parse(current_os_version)
-        .with_context(|| format!("Invalid current dstack OS version: {current_os_version}"))?;
-    if !os_version_req.matches(&current_os_version) {
-        bail!(
-            "Unsupported dstack OS version: current {current_os_version}, required {os_version_req}"
-        );
     }
-    info!(
-        "dstack OS version requirement satisfied: current={}, requirement={}",
-        current_os_version, os_version_req
-    );
+    match requirements.health_status_file.as_deref() {
+        Some(path) => {
+            if !path.starts_with('/') {
+                bail!("requirements.health_status_file must be an absolute path: {path}");
+            }
+        }
+        None => {
+            // The container fallback has nothing to look at for a runner that
+            // starts no containers, so it would answer "healthy" unconditionally.
+            if app_compose.runner != "docker-compose" && app_compose.runner != "nerdctl-compose" {
+                bail!(
+                    "requirements.health_check needs health_status_file for the {} runner; \
+                     without containers to inspect there is nothing to judge",
+                    app_compose.runner
+                );
+            }
+        }
+    }
     Ok(())
 }
 
 fn verify_platform_requirements(
     app_compose: &AppCompose,
-    current_platform: AttestationMode,
+    current_platform: TeeVariant,
 ) -> Result<()> {
     let Some(requirements) = app_compose.requirements.as_ref() else {
         return Ok(());
@@ -895,7 +1225,7 @@ fn verify_platform_requirements(
     );
 }
 
-fn parse_requirement_platform(platform: &str, index: usize) -> Result<AttestationMode> {
+fn parse_requirement_platform(platform: &str, index: usize) -> Result<TeeVariant> {
     serde_json::from_value(serde_json::Value::String(platform.to_string()))
         .with_context(|| format!("Invalid requirements.platforms[{index}]: {platform}"))
 }
@@ -907,7 +1237,7 @@ fn format_requirement_platforms(platforms: &[String]) -> String {
 fn verify_tdx_measure_acpi_tables_requirement(
     app_compose: &AppCompose,
     vm_config: &str,
-    current_platform: AttestationMode,
+    current_platform: TeeVariant,
 ) -> Result<()> {
     let Some(measure_acpi_tables) = app_compose
         .requirements
@@ -916,7 +1246,7 @@ fn verify_tdx_measure_acpi_tables_requirement(
     else {
         return Ok(());
     };
-    if current_platform != AttestationMode::DstackTdx {
+    if current_platform != TeeVariant::DstackTdx {
         return Ok(());
     }
     let vm_config: dstack_types::VmConfig = serde_json::from_str(vm_config)
@@ -988,60 +1318,10 @@ fn launch_token_from_user_config(user_config: &str) -> Result<String> {
     Ok(token.to_string())
 }
 
-fn read_current_os_version() -> Result<String> {
-    const OS_RELEASE_PATHS: &[&str] = &["/etc/os-release", "/usr/lib/os-release"];
-    for path in OS_RELEASE_PATHS {
-        let content = match fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err).with_context(|| format!("Failed to read {path}")),
-        };
-        if let Some(version) = os_release_value(&content, "VERSION_ID") {
-            return Ok(version);
-        }
-    }
-    bail!("VERSION_ID not found in /etc/os-release or /usr/lib/os-release")
-}
-
-fn os_release_value(content: &str, key: &str) -> Option<String> {
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        if k == key {
-            return Some(unquote_os_release_value(v));
-        }
-    }
-    None
-}
-
-fn unquote_os_release_value(value: &str) -> String {
-    let value = value.trim();
-    if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-        // Double-quoted: a backslash escapes the next character.
-        let mut unescaped = String::with_capacity(inner.len());
-        let mut chars = inner.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => unescaped.push(chars.next().unwrap_or('\\')),
-                _ => unescaped.push(c),
-            }
-        }
-        return unescaped;
-    }
-    if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
-        // Single-quoted: shell single quotes have no escape sequences.
-        return inner.to_string();
-    }
-    value.to_string()
-}
-
 pub async fn cmd_sys_setup(args: SetupArgs) -> Result<()> {
     let stage0 = Stage0::load(&args)?;
+    set_runtime_event_version(stage0.shared.app_compose.event_log_version)
+        .context("failed to configure runtime event version")?;
     let vmm = stage0.host_api();
     let result = do_sys_setup(stage0).await;
     if let Err(err) = &result {
@@ -1061,93 +1341,278 @@ async fn do_sys_setup(stage0: Stage0<'_>) -> Result<()> {
     } else {
         info!("System time will be synchronized by chronyd in background");
     }
-    stage0
-        .setup_gpu()
-        .await
-        .context("Failed to verify GPU TEE attestation")?;
     let stage1 = stage0.setup_fs().await?;
     stage1.setup().await
 }
 
-/// GPU TEE attestation gate (`requirements.attest_gpu`, defaults to true).
+/// GPU TEE attestation gate (`requirements.gpu_policy.attest_gpu`, defaults to
+/// true).
 ///
 /// Runs before key provisioning so a CVM whose GPU cannot prove it is a
-/// genuine, CC-enabled NVIDIA TEE never gets its app keys. The GPU
-/// "ready" state (`nvidia-smi conf-compute -srs 1`) is only set from here —
-/// nvidia-persistenced deliberately does not set it — so CUDA work cannot be
-/// submitted to an unverified GPU either.
+/// genuine, CC-enabled NVIDIA TEE never gets its app keys. An optional
+/// application policy is measured and evaluated after `compose-hash`. The GPU
+/// "ready" state is only set through NVML from here — nvidia-persistenced
+/// deliberately does not set it — so CUDA work cannot be submitted to an
+/// unverified GPU either.
 mod gpu {
     use super::*;
 
-    const NVATTEST: &str = "/usr/bin/nvattest";
-    const NVIDIA_SMI: &str = "/usr/bin/nvidia-smi";
-    const ATTESTATION_OUTPUT: &str = "/run/nvidia-gpu-attestation/attestation.out";
-    const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(300);
-    const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(60);
+    const EVENT_VERSION: u32 = 2;
+    const POLICY_ENTRYPOINT: &str = "data.policy.nv_match";
+    /// Bound Rego evaluation so a runaway application policy cannot hang boot.
+    const POLICY_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// True if a passed-through NVIDIA GPU is present, detected via sysfs PCI
-    /// (vendor 0x10de, class VGA 0x0300xx or 3D controller 0x0302xx) so it
-    /// works even before the nvidia driver is loaded. Fails (rather than
-    /// reporting "no GPU") when the PCI bus cannot be enumerated, so a broken
-    /// /sys cannot bypass the attestation gate.
-    pub(super) fn nvidia_gpu_present() -> Result<bool> {
-        let entries =
-            fs::read_dir("/sys/bus/pci/devices").context("failed to enumerate PCI devices")?;
-        Ok(entries.filter_map(|e| e.ok()).any(|dev| {
-            let read = |name: &str| {
-                fs::read_to_string(dev.path().join(name))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
-            };
-            read("vendor") == "0x10de"
-                && matches!(read("class").get(..6), Some("0x0300") | Some("0x0302"))
-        }))
+    use lspci::sysfs::GpuInventory;
+
+    #[derive(Debug, Serialize)]
+    struct GpuAttestationEvent {
+        version: u32,
+        provider: &'static str,
+        devices: u32,
+        cc_mode: &'static str,
+        devtools: bool,
+        evidence_sha256: String,
     }
 
-    /// Run a GPU tool with a bounded timeout so a wedged driver/GPU cannot
-    /// hang the boot indefinitely (dstack-prepare is a oneshot unit with no
-    /// start timeout of its own).
-    async fn run_command(
-        program: &str,
-        args: &[&str],
-        timeout: Duration,
-    ) -> Result<std::process::Output> {
-        tokio::time::timeout(
-            timeout,
-            tokio::process::Command::new(program).args(args).output(),
-        )
-        .await
-        .with_context(|| format!("{program} timed out"))?
-        .with_context(|| format!("failed to run {program}"))
+    pub(super) struct GpuAttestationResult {
+        claims: Vec<Value>,
+        parsed_claims: Vec<NvidiaGpuClaim>,
+        output: Vec<u8>,
+        devices: u32,
     }
 
-    /// Mark the GPU as ready to accept work. Only meaningful (and only
-    /// succeeds) when the GPU runs in CC mode.
-    pub(super) async fn set_gpu_ready_state() -> Result<()> {
-        let output = run_command(
-            NVIDIA_SMI,
-            &["conf-compute", "-srs", "1"],
-            NVIDIA_SMI_TIMEOUT,
-        )
-        .await?;
-        if !output.status.success() {
+    impl GpuAttestationResult {
+        pub(super) fn claims(&self) -> &[Value] {
+            &self.claims
+        }
+
+        pub(super) fn event(&self, devtools: bool) -> Result<Vec<u8>> {
+            attestation_event(&self.output, self.devices, devtools)
+        }
+
+        pub(super) fn verify_claim_policy(
+            &self,
+            state: &GpuState,
+            policy: &GpuPolicy,
+        ) -> Result<()> {
+            verify_claim_policy(&self.parsed_claims, &state.devices, policy)
+        }
+    }
+
+    pub(super) struct GpuState {
+        nvml: nvml_wrapper::Nvml,
+        devices: Vec<GpuDeviceState>,
+    }
+
+    impl GpuState {
+        pub(super) fn any_devtools(&self) -> bool {
+            self.devices.iter().any(|device| device.devtools)
+        }
+
+        pub(super) fn set_ready(&self) -> Result<()> {
+            set_gpu_ready_state_with_nvml(&self.nvml)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct GpuDeviceState {
+        cc_enabled: bool,
+        devtools: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct NvattestOutput {
+        result_code: i64,
+        claims: Vec<Value>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NvidiaGpuClaim {
+        #[serde(rename = "x-nvidia-device-type")]
+        device_type: String,
+        eat_nonce: String,
+        #[serde(rename = "x-nvidia-gpu-attestation-report-nonce-match")]
+        nonce_match: bool,
+        measres: String,
+        secboot: bool,
+        dbgstat: NvidiaGpuDebugStatus,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    enum NvidiaGpuDebugStatus {
+        Disabled,
+        Enabled,
+    }
+
+    struct ValidatedClaims {
+        raw: Vec<Value>,
+        parsed: Vec<NvidiaGpuClaim>,
+    }
+
+    /// Count passed-through display-class GPUs through sysfs so devices which
+    /// the NVIDIA driver did not bind cannot be hidden from the gate. Reading
+    /// the inventory is fail-closed: a mixed NVIDIA/non-NVIDIA set must not be
+    /// represented by an attestation result for only the NVIDIA subset.
+    ///
+    /// The scan itself lives in `lspci::sysfs` because the guest agent's GPU
+    /// telemetry gate needs the same answer with a different failure policy.
+    pub(super) fn gpu_inventory() -> Result<GpuInventory> {
+        lspci::sysfs::gpu_inventory()
+    }
+
+    pub(super) fn nvidia_gpu_count(inventory: GpuInventory) -> Result<u32> {
+        if inventory.total != inventory.nvidia {
             bail!(
-                "nvidia-smi conf-compute -srs 1 failed ({}): {}",
-                output.status,
-                truncated_lossy(&output.stderr, 512),
+                "unsupported non-NVIDIA GPU attached: found {} display GPUs, {} NVIDIA",
+                inventory.total,
+                inventory.nvidia
             );
         }
+        Ok(inventory.nvidia)
+    }
+
+    fn init_nvml(expected_devices: u32) -> Result<nvml_wrapper::Nvml> {
+        let nvml = nvml_wrapper::Nvml::init().context("failed to initialize NVML")?;
+        let devices = nvml
+            .device_count()
+            .context("failed to get NVML GPU count")?;
+        if devices != expected_devices {
+            bail!("nvml GPU count mismatch: expected {expected_devices}, got {devices}");
+        }
+        Ok(nvml)
+    }
+
+    fn set_gpu_ready_state_with_nvml(nvml: &nvml_wrapper::Nvml) -> Result<()> {
+        // nvml-wrapper exposes nvmlSystemSetConfComputeGpusReadyState through
+        // Device, but the transition applies to all CC GPUs in the system.
+        let first = nvml
+            .device_by_index(0)
+            .context("failed to get first NVML GPU")?;
+        first
+            .set_confidential_compute_state(true)
+            .context("failed to set GPU ready state")?;
         info!("GPU ready state set");
         Ok(())
     }
 
-    /// Run local GPU attestation via nvattest with a fresh nonce, keeping the
-    /// verifier output in /run for debugging. Fails on any non-zero exit —
-    /// including a GPU that cannot produce an attestation report at all (a
-    /// non-CC GPU, or CC mode left off by the host).
-    pub(super) async fn attest_gpu() -> Result<()> {
-        if !Path::new(NVATTEST).exists() {
+    /// Read the CC and DevTools state through NVML for every expected GPU.
+    /// NVML exposes these settings as system values through Device methods;
+    /// call them for every handle so every expected device must be enumerable.
+    pub(super) fn query_gpu_state(expected_devices: u32) -> Result<GpuState> {
+        let nvml = init_nvml(expected_devices)?;
+        let mut devices = Vec::with_capacity(expected_devices as usize);
+        for index in 0..expected_devices {
+            let device = nvml
+                .device_by_index(index)
+                .with_context(|| format!("failed to get NVML GPU at index {index}"))?;
+            let cc_enabled = device
+                .is_cc_enabled()
+                .with_context(|| format!("failed to query CC mode for GPU at index {index}"))?;
+            let devtools = device.is_cc_dev_mode_enabled().with_context(|| {
+                format!("failed to query DevTools mode for GPU at index {index}")
+            })?;
+            devices.push(GpuDeviceState {
+                cc_enabled,
+                devtools,
+            });
+        }
+        Ok(GpuState { nvml, devices })
+    }
+
+    /// Set the system-wide GPU ready state without appraisal for the explicit
+    /// `gpu_policy.attest_gpu: false` compatibility path.
+    pub(super) fn set_gpu_ready_state(expected_devices: u32) -> Result<()> {
+        let nvml = init_nvml(expected_devices)?;
+        set_gpu_ready_state_with_nvml(&nvml)
+    }
+
+    fn validate_attestation_output(
+        stdout: &[u8],
+        nonce: &str,
+        expected_devices: u32,
+    ) -> Result<ValidatedClaims> {
+        let output: NvattestOutput =
+            serde_json::from_slice(stdout).context("failed to parse nvattest JSON output")?;
+        if output.result_code != 0 {
+            bail!(
+                "nvattest JSON result is not successful (result_code={})",
+                output.result_code
+            );
+        }
+        if output.claims.len() != expected_devices as usize {
+            bail!(
+                "gpu attestation count mismatch: expected {expected_devices}, got {}",
+                output.claims.len()
+            );
+        }
+        let mut parsed_claims = Vec::with_capacity(output.claims.len());
+        for (index, claim) in output.claims.iter().enumerate() {
+            let claim: NvidiaGpuClaim = serde_json::from_value(claim.clone())
+                .with_context(|| format!("invalid GPU claim at index {index}"))?;
+            if claim.device_type != "gpu" {
+                bail!("gpu claim at index {index} has an invalid device type");
+            }
+            if claim.eat_nonce != nonce || !claim.nonce_match {
+                bail!("gpu claim at index {index} has an invalid nonce");
+            }
+            parsed_claims.push(claim);
+        }
+        Ok(ValidatedClaims {
+            raw: output.claims,
+            parsed: parsed_claims,
+        })
+    }
+
+    fn verify_claim_policy(
+        claims: &[NvidiaGpuClaim],
+        devices: &[GpuDeviceState],
+        policy: &GpuPolicy,
+    ) -> Result<()> {
+        for (index, device) in devices.iter().enumerate() {
+            if !device.cc_enabled {
+                bail!("gpu at index {index} does not enable confidential compute mode");
+            }
+            if device.devtools && !policy.allow_devtools {
+                bail!("gpu at index {index} enables NVIDIA DevTools mode");
+            }
+        }
+        for (index, claim) in claims.iter().enumerate() {
+            if claim.measres != "success" {
+                bail!("gpu claim at index {index} has unsuccessful measurements");
+            }
+            if !policy.allow_insecure_boot && !claim.secboot {
+                bail!("gpu claim at index {index} does not assert secure boot");
+            }
+            if !policy.allow_debug && claim.dbgstat != NvidiaGpuDebugStatus::Disabled {
+                bail!("gpu claim at index {index} does not disable debug mode");
+            }
+        }
+        Ok(())
+    }
+
+    fn attestation_event(stdout: &[u8], devices: u32, devtools: bool) -> Result<Vec<u8>> {
+        let event = GpuAttestationEvent {
+            version: EVENT_VERSION,
+            provider: "nvidia",
+            devices,
+            cc_mode: "on",
+            devtools,
+            evidence_sha256: hex::encode(sha256(stdout)),
+        };
+        serde_json::to_vec(&event).context("failed to serialize GPU attestation event")
+    }
+
+    /// Run local GPU attestation via nvattest with a fresh evidence nonce. If
+    /// sys-config selects a collateral proxy, both RIM and OCSP traffic is
+    /// routed through it and NVIDIA's Trust Outpost policy accepts cached OCSP
+    /// responses whose responder nonce no longer matches. The independent GPU
+    /// evidence nonce remains mandatory and is checked below.
+    pub(super) async fn attest_gpu(
+        expected_devices: u32,
+        proxy_url: Option<&str>,
+    ) -> Result<GpuAttestationResult> {
+        if !nvattest::available() {
             bail!("nvattest is not available in this image");
         }
         // Certificate/OCSP validation needs a sane clock even when
@@ -1155,39 +1620,72 @@ mod gpu {
         if let Err(err) = cmd!(chronyc makestep) {
             warn!("failed to step system clock: {err:?}");
         }
-        let nonce = hex::encode(rand::thread_rng().gen::<[u8; 32]>());
-        let output = run_command(
-            NVATTEST,
-            &[
-                "attest",
-                "--device",
-                "gpu",
-                "--verifier",
-                "local",
-                "--nonce",
-                &nonce,
-            ],
-            ATTESTATION_TIMEOUT,
-        )
-        .await?;
-        if !output.stderr.is_empty() {
-            info!("nvattest: {}", truncated_lossy(&output.stderr, 2048));
-        }
-        if !output.status.success() {
-            bail!(
-                "nvattest exited with {}: {}",
-                output.status,
-                truncated_lossy(&output.stderr, 512),
-            );
-        }
-        if let Err(err) = save_attestation_output(&output.stdout) {
-            warn!("failed to save GPU attestation output: {err:?}");
+        let nonce: [u8; nvattest::NONCE_LEN] = rand::thread_rng().gen();
+        let (nonce, output) = nvattest::run(&nonce, proxy_url, nvattest::DEFAULT_TIMEOUT).await?;
+        // Persist before judging the exit status: a failed appraisal is exactly
+        // when the evidence is worth having on disk.
+        save_attestation_output(&output.stdout).context("failed to save GPU attestation output")?;
+        nvattest::check_status(&output)?;
+        let claims = validate_attestation_output(&output.stdout, &nonce, expected_devices)?;
+        Ok(GpuAttestationResult {
+            claims: claims.raw,
+            parsed_claims: claims.parsed,
+            output: output.stdout,
+            devices: expected_devices,
+        })
+    }
+
+    pub(super) fn measure_gpu_policy(compose_path: &Path) -> Result<[u8; 32]> {
+        let compose_json = fs::read(compose_path)
+            .with_context(|| format!("failed to read {}", compose_path.display()))?;
+        let digest = gpu_policy_hash(&compose_json).context("failed to hash raw GPU policy")?;
+        emit_runtime_event("gpu-policy-hash", &digest)
+            .context("failed to emit GPU policy measurement")?;
+        Ok(digest)
+    }
+
+    pub(super) fn evaluate_rego_policy(policy: &GpuPolicy, claims: &[Value]) -> Result<()> {
+        let Some(rego) = policy.rego.as_deref() else {
+            return Ok(());
+        };
+        evaluate_policy(rego, claims).context("failed to apply GPU Rego policy")
+    }
+
+    /// Evaluate the app-provided Rego v0 policy using the same input shape as
+    /// NVIDIA relying-party policies: the nvattest `claims` JSON array.
+    pub(super) fn evaluate_policy(policy: &str, claims: &[Value]) -> Result<()> {
+        evaluate_policy_with_timeout(policy, claims, POLICY_TIMEOUT)
+    }
+
+    fn evaluate_policy_with_timeout(
+        policy: &str,
+        claims: &[Value],
+        timeout: Duration,
+    ) -> Result<()> {
+        let mut engine = regorus::Engine::new();
+        engine.set_rego_v0(true);
+        engine.set_execution_timer_config(regorus::utils::limits::ExecutionTimerConfig {
+            limit: timeout,
+            check_interval: std::num::NonZeroU32::new(1024).unwrap_or(std::num::NonZeroU32::MIN),
+        });
+        engine
+            .add_policy("gpu-policy.rego".to_string(), policy.to_string())
+            .context("failed to load GPU policy")?;
+        let input = serde_json::to_string(claims).context("failed to serialize GPU claims")?;
+        engine
+            .set_input_json(&input)
+            .context("failed to set GPU policy input")?;
+        if !engine
+            .eval_bool_query(POLICY_ENTRYPOINT.to_string(), false)
+            .context("failed to evaluate GPU policy")?
+        {
+            bail!("gpu policy rejected the attestation claims");
         }
         Ok(())
     }
 
     fn save_attestation_output(stdout: &[u8]) -> Result<()> {
-        let output_path = Path::new(ATTESTATION_OUTPUT);
+        let output_path = Path::new(GPU_ATTESTATION_OUTPUT);
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1199,54 +1697,513 @@ mod gpu {
         Ok(())
     }
 
-    fn truncated_lossy(bytes: &[u8], limit: usize) -> String {
-        let text = String::from_utf8_lossy(bytes);
-        let text = text.trim();
-        match text.char_indices().nth(limit) {
-            Some((idx, _)) => format!("{}...", &text[..idx]),
-            None => text.to_string(),
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn nvattest_output(nonce: &str, claims: usize) -> Vec<u8> {
+            let claims = (0..claims)
+                .map(|_| {
+                    serde_json::json!({
+                        "x-nvidia-device-type": "gpu",
+                        "eat_nonce": nonce,
+                        "x-nvidia-gpu-attestation-report-nonce-match": true,
+                        "measres": "success",
+                        "secboot": true,
+                        "dbgstat": "disabled"
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_vec(&serde_json::json!({
+                "result_code": 0,
+                "claims": claims,
+                "detached_eat": {}
+            }))
+            .unwrap()
+        }
+
+        // Captured with the pinned nvattest SDK on an Ubuntu 22.04 GCP A3 TDX
+        // VM with an H100 and the NVIDIA 580 open kernel driver.
+        const H100_ATTESTATION_OUTPUT: &[u8] =
+            include_bytes!("../tests/fixtures/gpu_attestation_h100.json");
+
+        /// The `AttestGpu` API documents that its output cannot be verified by a
+        /// third party, because the local verifier reports a conclusion rather
+        /// than the GPU's signed report. That is a claim about NVIDIA's output
+        /// format, so pin it: if a future SDK starts signing the detached EAT,
+        /// this fails and the API docs need revisiting rather than quietly
+        /// becoming wrong.
+        #[test]
+        fn local_verifier_output_is_unsigned_self_report() {
+            let output: Value = serde_json::from_slice(H100_ATTESTATION_OUTPUT).unwrap();
+            let eat = &output["detached_eat"];
+            let jwt = eat[0][1].as_str().expect("detached EAT carries a JWT");
+            let (header_b64, rest) = jwt.split_once('.').unwrap();
+            let (_, signature) = rest.split_once('.').unwrap();
+            assert!(
+                signature.is_empty(),
+                "detached EAT is signed; AttestGpu docs claim it is not"
+            );
+
+            use base64::Engine as _;
+            let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(header_b64)
+                .unwrap();
+            let header: Value = serde_json::from_slice(&header).unwrap();
+            assert_eq!(header["alg"], "none");
+
+            // And the signed artifacts really are absent: the claims carry
+            // verdicts about the certificate chain, not the chain itself.
+            let claim = &output["claims"][0];
+            assert_eq!(
+                claim["x-nvidia-gpu-attestation-report-signature-verified"],
+                true
+            );
+            assert!(
+                claim["x-nvidia-gpu-attestation-report-cert-chain"]
+                    .as_object()
+                    .expect("cert-chain claim is a verdict object")
+                    .keys()
+                    .all(|key| key.starts_with("x-nvidia-cert-")),
+                "cert-chain claim carries certificates, not just verdicts"
+            );
+        }
+
+        #[test]
+        fn gpu_count_rejects_non_nvidia_gpus() {
+            let mixed = GpuInventory {
+                total: 2,
+                nvidia: 1,
+            };
+            assert!(nvidia_gpu_count(mixed).is_err());
+
+            let nvidia = GpuInventory {
+                total: 2,
+                nvidia: 2,
+            };
+            assert_eq!(nvidia_gpu_count(nvidia).unwrap(), 2);
+        }
+
+        #[test]
+        fn basic_policy_requires_cc_and_rejects_devtools_by_default() {
+            let nonce = "44".repeat(32);
+            let output = nvattest_output(&nonce, 1);
+            let claims = validate_attestation_output(&output, &nonce, 1).unwrap();
+            let production = [GpuDeviceState {
+                cc_enabled: true,
+                devtools: false,
+            }];
+            verify_claim_policy(&claims.parsed, &production, &GpuPolicy::default()).unwrap();
+
+            let non_cc = [GpuDeviceState {
+                cc_enabled: false,
+                devtools: false,
+            }];
+            let err =
+                verify_claim_policy(&claims.parsed, &non_cc, &GpuPolicy::default()).unwrap_err();
+            assert!(err.to_string().contains("confidential compute mode"));
+
+            let devtools = [GpuDeviceState {
+                cc_enabled: true,
+                devtools: true,
+            }];
+            assert!(verify_claim_policy(&claims.parsed, &devtools, &GpuPolicy::default()).is_err());
+            verify_claim_policy(
+                &claims.parsed,
+                &devtools,
+                &GpuPolicy {
+                    allow_devtools: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn nvattest_output_requires_every_expected_gpu_and_fresh_nonce() {
+            let nonce = "11".repeat(32);
+            let valid = nvattest_output(&nonce, 2);
+            validate_attestation_output(&valid, &nonce, 2).unwrap();
+            assert!(validate_attestation_output(&valid, &nonce, 1).is_err());
+
+            let mut invalid: Value = serde_json::from_slice(&valid).unwrap();
+            invalid["claims"][1]["eat_nonce"] = Value::String("stale".to_string());
+            assert!(
+                validate_attestation_output(&serde_json::to_vec(&invalid).unwrap(), &nonce, 2)
+                    .is_err()
+            );
+
+            // Basic claim settings are enforced after structural validation.
+            let mut extra_claims: Value = serde_json::from_slice(&valid).unwrap();
+            extra_claims["claims"][0]["dbgstat"] = Value::String("enabled".to_string());
+            validate_attestation_output(&serde_json::to_vec(&extra_claims).unwrap(), &nonce, 2)
+                .unwrap();
+        }
+
+        #[test]
+        fn basic_claim_policy_is_fail_closed_and_honors_opt_ins() {
+            let nonce = "33".repeat(32);
+            let output = nvattest_output(&nonce, 1);
+            let claims = validate_attestation_output(&output, &nonce, 1).unwrap();
+            let devices = [GpuDeviceState {
+                cc_enabled: true,
+                devtools: false,
+            }];
+            verify_claim_policy(&claims.parsed, &devices, &GpuPolicy::default()).unwrap();
+
+            let with_policy = |name: &str, value: Value, policy: &GpuPolicy| {
+                let mut output: Value = serde_json::from_slice(&output).unwrap();
+                output["claims"][0][name] = value;
+                let output = serde_json::to_vec(&output).unwrap();
+                let claims = validate_attestation_output(&output, &nonce, 1).unwrap();
+                verify_claim_policy(&claims.parsed, &devices, policy)
+            };
+
+            assert!(with_policy("secboot", Value::Bool(false), &GpuPolicy::default()).is_err());
+            with_policy(
+                "secboot",
+                Value::Bool(false),
+                &GpuPolicy {
+                    allow_insecure_boot: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert!(with_policy(
+                "dbgstat",
+                Value::String("enabled".to_string()),
+                &GpuPolicy::default(),
+            )
+            .is_err());
+            with_policy(
+                "dbgstat",
+                Value::String("enabled".to_string()),
+                &GpuPolicy {
+                    allow_debug: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let mut unknown_debug: Value = serde_json::from_slice(&output).unwrap();
+            unknown_debug["claims"][0]["dbgstat"] = Value::String("unknown".to_string());
+            assert!(validate_attestation_output(
+                &serde_json::to_vec(&unknown_debug).unwrap(),
+                &nonce,
+                1,
+            )
+            .is_err());
+
+            assert!(with_policy(
+                "measres",
+                Value::String("failure".to_string()),
+                &GpuPolicy {
+                    allow_debug: true,
+                    allow_insecure_boot: true,
+                    ..Default::default()
+                },
+            )
+            .is_err());
+
+            for required in ["measres", "secboot", "dbgstat"] {
+                let mut missing: Value = serde_json::from_slice(&output).unwrap();
+                missing["claims"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(required);
+                assert!(validate_attestation_output(
+                    &serde_json::to_vec(&missing).unwrap(),
+                    &nonce,
+                    1,
+                )
+                .is_err());
+            }
+        }
+
+        #[test]
+        fn real_h100_attestation_fixture_validates_and_drives_rego() {
+            let nonce = "11".repeat(32);
+            let claims = validate_attestation_output(H100_ATTESTATION_OUTPUT, &nonce, 1).unwrap();
+            assert_eq!(claims.raw[0]["hwmodel"], "GH100 A01 GSP BROM");
+            assert_eq!(claims.raw[0]["x-nvidia-gpu-claims-version"], "3.0");
+            verify_claim_policy(
+                &claims.parsed,
+                &[GpuDeviceState {
+                    cc_enabled: true,
+                    devtools: false,
+                }],
+                &GpuPolicy::default(),
+            )
+            .unwrap();
+
+            let policy = r#"
+                package policy
+                default nv_match = false
+                nv_match {
+                    count(input) == 1
+                    input[0].secboot == true
+                    input[0].dbgstat == "disabled"
+                    input[0].measres == "success"
+                }
+            "#;
+            evaluate_policy(policy, &claims.raw).unwrap();
+        }
+
+        #[test]
+        fn event_commits_to_complete_nvattest_output() {
+            let nonce = "22".repeat(32);
+            let output = nvattest_output(&nonce, 1);
+            let event: Value =
+                serde_json::from_slice(&attestation_event(&output, 1, true).unwrap()).unwrap();
+            assert_eq!(event["version"], EVENT_VERSION);
+            assert_eq!(event["devices"], 1);
+            assert!(event.get("policy").is_none());
+            assert_eq!(event["cc_mode"], "on");
+            assert_eq!(event["devtools"], true);
+            assert_eq!(event["evidence_sha256"], hex::encode(sha256(&output)));
+        }
+
+        #[test]
+        fn app_policy_receives_claims_array_and_must_return_true() {
+            let claims = vec![serde_json::json!({"status": "accepted"})];
+            let policy = r#"
+                package policy
+                default nv_match = false
+                nv_match {
+                    count(input) == 1
+                    input[0].status == "accepted"
+                }
+            "#;
+            evaluate_policy(policy, &claims).unwrap();
+            assert!(evaluate_policy(policy, &[]).is_err());
+
+            let rejected = vec![serde_json::json!({"status": "rejected"})];
+            assert!(evaluate_policy(policy, &rejected).is_err());
+            assert!(evaluate_policy("package policy", &claims).is_err());
+            assert!(evaluate_policy("not valid rego", &claims).is_err());
+
+            let allow_no_gpus = GpuPolicy {
+                rego: Some(
+                    r#"
+                        package policy
+                        default nv_match = false
+                        nv_match { count(input) == 0 }
+                    "#
+                    .to_string(),
+                ),
+                ..Default::default()
+            };
+            evaluate_rego_policy(&allow_no_gpus, &[]).unwrap();
+
+            let require_one_gpu = GpuPolicy {
+                rego: Some(policy.to_string()),
+                ..Default::default()
+            };
+            assert!(evaluate_rego_policy(&require_one_gpu, &[]).is_err());
+            evaluate_rego_policy(&GpuPolicy::default(), &[]).unwrap();
+        }
+
+        #[test]
+        fn rego_policy_evaluation_is_time_bounded() {
+            let policy = r#"
+                package policy
+                default nv_match = false
+                nv_match {
+                    count([x |
+                        x := numbers.range(0, 5000)[_]
+                        y := numbers.range(0, 5000)[_]
+                        x == y
+                    ]) > 0
+                }
+            "#;
+            evaluate_policy_with_timeout(policy, &[], Duration::from_millis(50)).unwrap_err();
+        }
+
+        #[test]
+        fn gpu_policy_measurement_defaults_to_empty_object_and_uses_raw_json() {
+            let no_requirements = br#"{}"#;
+            let absent = br#"{"requirements": {}}"#;
+            let empty_digest = sha256(b"{}");
+            assert_eq!(gpu_policy_hash(no_requirements).unwrap(), empty_digest);
+            assert_eq!(gpu_policy_hash(absent).unwrap(), empty_digest);
+
+            let empty = br#"{"requirements": {"gpu_policy": {}}}"#;
+            assert_eq!(gpu_policy_hash(empty).unwrap(), empty_digest);
+
+            let explicit_default = br#"{"requirements":{"gpu_policy":{"attest_gpu":true}}}"#;
+            let explicit_default_digest = gpu_policy_hash(explicit_default).unwrap();
+            assert_ne!(explicit_default_digest, empty_digest);
+
+            let reordered = br#"
+                {
+                    "requirements": {
+                        "gpu_policy": {
+                            "rego": "package policy",
+                            "allow_debug": false
+                        }
+                    }
+                }
+            "#;
+            let canonical_order =
+                br#"{"requirements":{"gpu_policy":{"allow_debug":false,"rego":"package policy"}}}"#;
+            assert_eq!(
+                gpu_policy_hash(reordered).unwrap(),
+                gpu_policy_hash(canonical_order).unwrap()
+            );
         }
     }
 }
 
 impl Stage0<'_> {
-    /// Enforce `requirements.attest_gpu` (default true): attest an attached
-    /// NVIDIA GPU before continuing to key provisioning, or — when explicitly
-    /// disabled — set the GPU ready state without verification.
-    async fn setup_gpu(&self) -> Result<()> {
-        if !gpu::nvidia_gpu_present()? {
-            return Ok(());
-        }
-        if !self.shared.app_compose.attest_gpu() {
-            warn!("requirements.attest_gpu is false; setting GPU ready state without attestation");
+    /// Enforce `requirements.gpu_policy.attest_gpu` (default true): attest an
+    /// attached NVIDIA GPU before continuing to key provisioning, or — when
+    /// explicitly disabled — set the GPU ready state without verification. The
+    /// optional Rego policy is always evaluated; when no attestation is
+    /// performed, its claims-array input is empty.
+    async fn measure_gpu(&self) -> Result<[u8; 32]> {
+        let gpu_policy_hash = gpu::measure_gpu_policy(&self.shared.dir.app_compose_file())?;
+
+        let gpu_policy = self
+            .shared
+            .app_compose
+            .requirements
+            .as_ref()
+            .map(|requirements| requirements.gpu_policy.clone())
+            .unwrap_or_default();
+
+        let inventory = gpu::gpu_inventory()?;
+        if !gpu_policy.attest_gpu {
+            // Attestation is explicitly disabled, so there are no claims. Rego
+            // still runs with an empty input before any GPU is made ready.
+            gpu::evaluate_rego_policy(&gpu_policy, &[])?;
+            if gpu_policy.rego.is_some() {
+                info!("application GPU Rego policy accepted an empty claims array");
+            }
+            if inventory.nvidia == 0 {
+                return Ok(gpu_policy_hash);
+            }
+            warn!(
+                "requirements.gpu_policy.attest_gpu is false; setting GPU ready state without attestation"
+            );
             // Best-effort: a GPU with CC mode off has no ready state to set.
-            if let Err(err) = gpu::set_gpu_ready_state().await {
+            if let Err(err) = gpu::set_gpu_ready_state(inventory.nvidia) {
                 warn!("failed to set GPU ready state: {err:?}");
             }
-            return Ok(());
+            return Ok(gpu_policy_hash);
+        }
+        let expected_devices = gpu::nvidia_gpu_count(inventory)?;
+        if expected_devices == 0 {
+            gpu::evaluate_rego_policy(&gpu_policy, &[])?;
+            if gpu_policy.rego.is_some() {
+                info!("application GPU Rego policy accepted an empty claims array");
+            }
+            return Ok(gpu_policy_hash);
         }
         self.vmm.notify_q("boot.progress", "attesting GPU").await;
         info!("verifying GPU TEE attestation");
-        gpu::attest_gpu().await?;
-        gpu::set_gpu_ready_state().await?;
+        let attestation = gpu::attest_gpu(
+            expected_devices,
+            self.shared
+                .sys_config
+                .nvidia_attestation_proxy_url
+                .as_deref(),
+        )
+        .await?;
+
+        let gpu_state = gpu::query_gpu_state(expected_devices)?;
+        attestation
+            .verify_claim_policy(&gpu_state, &gpu_policy)
+            .context("failed to apply basic GPU policy")?;
+        gpu::evaluate_rego_policy(&gpu_policy, attestation.claims())?;
+
+        info!("application GPU policy accepted the attestation claims and state");
+        gpu_state.set_ready()?;
+        let devtools = gpu_state.any_devtools();
+        let event = attestation.event(devtools)?;
+        emit_runtime_event("gpu-attestation", &event)
+            .context("failed to emit GPU attestation event")?;
         info!("GPU TEE attestation succeeded");
+        Ok(gpu_policy_hash)
+    }
+}
+
+/// Owns the inputs needed to (re)register this CVM with dstack-gateway.
+///
+/// Loading is separated from refreshing so a long-running caller (the gateway
+/// checker) can pay the parsing cost once and then refresh repeatedly.
+pub struct GatewayRefresher {
+    shared: HostShared,
+    keys: AppKeys,
+}
+
+impl GatewayRefresher {
+    /// Load the host-shared config and app keys from `work_dir`.
+    pub fn load(work_dir: &Path) -> Result<Self> {
+        let host_shared_dir = work_dir.join(HOST_SHARED_DIR_NAME);
+        let shared = HostShared::load(host_shared_dir.as_path()).with_context(|| {
+            format!(
+                "Failed to load host-shared dir: {}",
+                host_shared_dir.display()
+            )
+        })?;
+        let keys_path = shared.dir.join(APP_KEYS);
+        let keys: AppKeys = deserialize_json_file(&keys_path)
+            .with_context(|| format!("Failed to load app keys from {}", keys_path.display()))?;
+        Ok(Self { shared, keys })
+    }
+
+    /// Whether this app opted into dstack-gateway at all.
+    pub fn gateway_enabled(&self) -> bool {
+        self.shared.app_compose.gateway_enabled()
+    }
+
+    /// Validate the parts of the gateway config that can never become valid by
+    /// waiting. These are deployment mistakes, not outages, so callers that
+    /// retry should give up instead of looping forever.
+    pub fn check_config(&self) -> Result<()> {
+        if self.keys.gateway_app_id.is_empty() {
+            bail!("Missing allowed dstack-gateway app id");
+        }
+        if self.shared.sys_config.gateway_urls.is_empty()
+            && self.shared.sys_config.gateway_clusters.is_empty()
+        {
+            bail!("Missing gateway urls");
+        }
         Ok(())
+    }
+
+    /// Register with dstack-gateway and apply the returned WireGuard config.
+    pub async fn refresh(&self, force: bool) -> Result<()> {
+        GatewayContext::new(&self.shared, &self.keys)
+            .setup(force)
+            .await
     }
 }
 
 pub async fn cmd_gateway_refresh(args: GatewayRefreshArgs) -> Result<()> {
-    let host_shared_dir = args.work_dir.join(HOST_SHARED_DIR_NAME);
-    let shared = HostShared::load(host_shared_dir.as_path()).with_context(|| {
-        format!(
-            "Failed to load host-shared dir: {}",
-            host_shared_dir.display()
-        )
-    })?;
-    let keys_path = shared.dir.join(APP_KEYS);
-    let keys: AppKeys = deserialize_json_file(&keys_path)
-        .with_context(|| format!("Failed to load app keys from {}", keys_path.display()))?;
+    GatewayRefresher::load(&args.work_dir)?
+        .refresh(args.force)
+        .await
+}
 
-    GatewayContext::new(&shared, &keys).setup(args.force).await
+/// Accept only a certificate the KMS issued for its own RPC endpoint.
+///
+/// The attestation behind this certificate is already verified by the RA-TLS
+/// layer, and the KMS identity that matters to the guest is its CA public key,
+/// pinned separately by `verify_key_provider_id`. All that is left here is
+/// refusing a certificate minted for some other purpose.
+fn validate_kms_rpc_cert(cert: Option<CertInfo>) -> Result<()> {
+    let Some(cert) = cert else {
+        bail!("missing server cert");
+    };
+    let Some(usage) = cert.special_usage else {
+        bail!("missing server cert usage");
+    };
+    if usage != "kms:rpc" {
+        bail!("Invalid server cert usage: {usage}");
+    }
+    Ok(())
 }
 
 struct AppIdValidator {
@@ -1279,6 +2236,8 @@ impl AppIdValidator {
 struct AppInfo {
     instance_info: InstanceInfo,
     compose_hash: [u8; 32],
+    gpu_policy_hash: [u8; 32],
+    init_script_hashes: Vec<Vec<u8>>,
 }
 
 struct Stage0<'a> {
@@ -1294,11 +2253,27 @@ struct Stage1<'a> {
     keys: AppKeys,
 }
 
+fn validate_key_provider_inputs(kind: KeyProviderKind, kms_urls: &[String]) -> Result<()> {
+    if kind.is_kms() && kms_urls.is_empty() {
+        bail!("No KMS URLs are set");
+    }
+    Ok(())
+}
+
+fn kms_rpc_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/prpc") {
+        base.to_string()
+    } else {
+        format!("{base}/prpc")
+    }
+}
+
 impl<'a> Stage0<'a> {
     fn host_api(&self) -> HostApi {
         HostApi::new(
             self.shared.sys_config.host_api_url.clone(),
-            self.shared.sys_config.pccs_url.clone(),
+            self.shared.sys_config.collateral_urls().pccs,
         )
     }
     fn load(args: &'a SetupArgs) -> Result<Self> {
@@ -1314,7 +2289,7 @@ impl<'a> Stage0<'a> {
         let host_shared = HostShared::copy("/tmp/.host-shared".as_ref(), &host_shared_copy_dir)?;
         let host_api = HostApi::new(
             host_shared.sys_config.host_api_url.clone(),
-            host_shared.sys_config.pccs_url.clone(),
+            host_shared.sys_config.collateral_urls().pccs,
         );
         Ok(Self {
             args,
@@ -1339,6 +2314,7 @@ impl<'a> Stage0<'a> {
                 .context("Failed to get temp ca cert")?
         };
         let cert_pair = generate_ra_cert(tmp_ca.temp_ca_cert.clone(), tmp_ca.temp_ca_key.clone())?;
+        let attestation_verifier = attestation_verifier(&self.shared.sys_config)?;
         let ra_client = RaClientConfig::builder()
             .tls_no_check(false)
             .tls_built_in_root_certs(false)
@@ -1346,29 +2322,8 @@ impl<'a> Stage0<'a> {
             .tls_client_cert(cert_pair.cert_pem)
             .tls_client_key(cert_pair.key_pem)
             .tls_ca_cert(tmp_ca.ca_cert.clone())
-            .maybe_pccs_url(self.shared.sys_config.pccs_url.clone())
-            .cert_validator(Box::new(|cert| {
-                let Some(cert) = cert else {
-                    bail!("Missing server cert");
-                };
-                let Some(usage) = cert.special_usage else {
-                    bail!("Missing server cert usage");
-                };
-                if usage != "kms:rpc" {
-                    bail!("Invalid server cert usage: {usage}");
-                }
-                if let Some(att) = &cert.attestation {
-                    match att.decode_app_info(false) {
-                        Ok(kms_info) => emit_runtime_event("mr-kms", &kms_info.mr_aggregated)
-                            .context("failed to extend mr-kms to the launch measurement")?,
-                        Err(err) if is_unsupported_app_info_quote(&err) => {
-                            warn!("Skipping mr-kms runtime event for unsupported attestation quote: {err:#}");
-                        }
-                        Err(err) => return Err(err).context("Failed to decode app_info"),
-                    }
-                }
-                Ok(())
-            }))
+            .attestation_verifier(attestation_verifier)
+            .cert_validator(Box::new(validate_kms_rpc_cert))
             .build()
             .into_client()
             .context("Failed to create client")?;
@@ -1413,7 +2368,7 @@ impl<'a> Stage0<'a> {
         let keys = 'out: {
             let mut error = anyhow!("unknown error");
             for (i, kms_url) in self.shared.sys_config.kms_urls.iter().enumerate() {
-                let kms_url = format!("{kms_url}/prpc");
+                let kms_url = kms_rpc_url(kms_url);
                 let response = self.request_app_keys_from_kms_url(kms_url.clone()).await;
                 match response {
                     Ok(response) => {
@@ -1503,6 +2458,7 @@ impl<'a> Stage0<'a> {
 
     async fn request_app_keys(&self) -> Result<AppKeys> {
         let key_provider = self.shared.app_compose.key_provider();
+        validate_key_provider_inputs(key_provider, &self.shared.sys_config.kms_urls)?;
         match key_provider {
             KeyProviderKind::Kms => self.request_app_keys_from_kms().await,
             KeyProviderKind::Local => self.get_keys_from_local_key_provider().await,
@@ -1680,7 +2636,7 @@ impl<'a> Stage0<'a> {
 
             if opts.storage_encrypted {
                 info!("Setting up disk encryption");
-                self.luks_setup(disk_crypt_key, name)?;
+                self.luks_setup(disk_crypt_key, name, opts.storage_discard)?;
             } else {
                 info!("Skipping disk encryption as requested by kernel cmdline");
             }
@@ -1688,19 +2644,23 @@ impl<'a> Stage0<'a> {
             match opts.storage_fs {
                 FsType::Zfs => {
                     info!("Creating ZFS filesystem");
+                    let autotrim = if opts.storage_discard { "on" } else { "off" };
                     cmd! {
-                        zpool create -o autoexpand=on dstack $fs_dev;
+                        zpool create -o autoexpand=on -o autotrim=$autotrim -m none dstack $fs_dev;
                         zfs create -o mountpoint=$mount_point -o atime=off -o checksum=blake3 dstack/data;
                     }
                     .context("Failed to create zpool")?;
                 }
                 FsType::Ext4 => {
                     info!("Creating ext4 filesystem");
-                    cmd! {
-                        mkfs.ext4 -F $fs_dev;
-                        mount $fs_dev $mount_point;
+                    cmd!(mkfs.ext4 -F $fs_dev).context("Failed to create ext4 filesystem")?;
+                    if opts.storage_discard {
+                        cmd!(mount -o discard $fs_dev $mount_point)
+                            .context("failed to mount ext4 filesystem with discard")?;
+                    } else {
+                        cmd!(mount $fs_dev $mount_point)
+                            .context("failed to mount ext4 filesystem")?;
                     }
-                    .context("Failed to create ext4 filesystem")?;
                 }
             }
         } else {
@@ -1710,7 +2670,7 @@ impl<'a> Stage0<'a> {
 
             if opts.storage_encrypted {
                 info!("Mounting encrypted data disk");
-                self.open_encrypted_volume(disk_crypt_key, name)?;
+                self.open_encrypted_volume(disk_crypt_key, name, opts.storage_discard)?;
             } else {
                 info!("Mounting unencrypted data disk");
             }
@@ -1719,16 +2679,32 @@ impl<'a> Stage0<'a> {
                 FsType::Zfs => {
                     cmd! {
                         zpool import dstack;
+                    }
+                    .context("Failed to import zpool")?;
+                    let previous_autotrim = cmd!(zpool get -H -o value autotrim dstack)
+                        .map(|value| value.trim().to_owned())
+                        .unwrap_or_default();
+                    let autotrim = if opts.storage_discard { "on" } else { "off" };
+                    cmd! {
+                        zpool set autotrim=$autotrim dstack;
                         zpool status dstack;
                         zpool online -e dstack $fs_dev; // triggers autoexpand
                     }
-                    .context("Failed to import zpool")?;
+                    .context("Failed to configure zpool")?;
+                    if opts.storage_discard && previous_autotrim == "off" {
+                        // autotrim only covers future frees. Start an asynchronous
+                        // trim on first upgrade so historical free space is returned
+                        // without delaying boot.
+                        if let Err(err) = cmd!(zpool trim dstack) {
+                            warn!("failed to start initial zpool trim: {err}");
+                        }
+                    }
                     if cmd!(mountpoint -q $mount_point).is_err() {
                         cmd!(zfs mount dstack/data).context("Failed to mount zpool")?;
                     }
                 }
                 FsType::Ext4 => {
-                    Self::mount_e2fs(&fs_dev, mount_point)
+                    Self::mount_e2fs(&fs_dev, mount_point, opts.storage_discard)
                         .context("Failed to mount ext4 filesystem")?;
                 }
             }
@@ -1736,7 +2712,11 @@ impl<'a> Stage0<'a> {
         Ok(())
     }
 
-    fn mount_e2fs(dev: &impl AsRef<Path>, mount_point: &impl AsRef<Path>) -> Result<()> {
+    fn mount_e2fs(
+        dev: &impl AsRef<Path>,
+        mount_point: &impl AsRef<Path>,
+        discard: bool,
+    ) -> Result<()> {
         let dev = dev.as_ref();
         let mount_point = mount_point.as_ref();
         info!("Checking filesystem");
@@ -1764,36 +2744,62 @@ impl<'a> Stage0<'a> {
             }
         }
 
-        cmd! {
-            info "Trying to resize filesystem if needed";
-            resize2fs $dev;
-            info "Mounting filesystem";
-            mount $dev $mount_point;
+        if discard {
+            cmd! {
+                resize2fs $dev;
+                mount -o discard $dev $mount_point;
+            }
+            .context("failed to resize and mount ext4 filesystem with discard")?;
+        } else {
+            cmd! {
+                resize2fs $dev;
+                mount $dev $mount_point;
+            }
+            .context("failed to resize and mount ext4 filesystem")?;
         }
-        .context("Failed to prepare ext4 filesystem")?;
         Ok(())
     }
 
-    fn luks_setup(&self, disk_crypt_key: &str, name: &str) -> Result<()> {
+    fn luks_setup(&self, disk_crypt_key: &str, name: &str, discard: bool) -> Result<()> {
         let root_hd = &self.args.device;
         let sector_offset = PAYLOAD_OFFSET / 512;
-        cmd! {
-            info "Formatting encrypted disk";
-            echo -n $disk_crypt_key |
-                cryptsetup luksFormat
-                    --type luks2
-                    --offset $sector_offset
-                    --cipher aes-xts-plain64
-                    --pbkdf pbkdf2
-                    -d-
-                    $root_hd
-                    $name;
+        info!("Formatting encrypted disk");
+        let sector_offset = sector_offset.to_string();
+        let mut child = Command::new("cryptsetup")
+            .args([
+                "luksFormat",
+                "--type",
+                "luks2",
+                "--offset",
+                &sector_offset,
+                "--cipher",
+                "aes-xts-plain64",
+                "--pbkdf",
+                "pbkdf2",
+                "-d-",
+            ])
+            .arg(root_hd)
+            .arg(name)
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("Failed to start cryptsetup luksFormat")?;
+        child
+            .stdin
+            .take()
+            .context("cryptsetup stdin is unavailable")?
+            .write_all(disk_crypt_key.as_bytes())
+            .context("Failed to send key to cryptsetup luksFormat")?;
+        if !child
+            .wait()
+            .context("Failed to wait for cryptsetup luksFormat")?
+            .success()
+        {
+            bail!("Failed to setup luks volume");
         }
-        .or(Err(anyhow!("Failed to setup luks volume")))?;
-        self.open_encrypted_volume(disk_crypt_key, name)
+        self.open_encrypted_volume(disk_crypt_key, name, discard)
     }
 
-    fn open_encrypted_volume(&self, disk_crypt_key: &str, name: &str) -> Result<()> {
+    fn open_encrypted_volume(&self, disk_crypt_key: &str, name: &str, discard: bool) -> Result<()> {
         let root_hd = &self.args.device;
         let disk_crypt_key = disk_crypt_key.trim();
         // Create a private tmpfs mount to ensure the header stays in-memory.
@@ -1820,11 +2826,34 @@ impl<'a> Stage0<'a> {
         let hdr_file = fs::File::open(&in_mem_hdr).context("Failed to open LUKS2 header")?;
         validate_luks2_headers(hdr_file).context("Failed to validate LUKS2 header")?;
 
-        cmd! {
-            info "Opening the device";
-            echo -n $disk_crypt_key | cryptsetup luksOpen --type luks2 --header $in_mem_hdr -d- $root_hd $name;
+        info!("Opening the device");
+        let mut command = Command::new("cryptsetup");
+        command.args(["luksOpen", "--type", "luks2"]);
+        if discard {
+            command.arg("--allow-discards");
         }
-        .or(Err(anyhow!("Failed to open encrypted data disk")))?;
+        let mut child = command
+            .arg("--header")
+            .arg(&in_mem_hdr)
+            .arg("-d-")
+            .arg(root_hd)
+            .arg(name)
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("Failed to start cryptsetup luksOpen")?;
+        child
+            .stdin
+            .take()
+            .context("cryptsetup stdin is unavailable")?
+            .write_all(disk_crypt_key.as_bytes())
+            .context("Failed to send key to cryptsetup luksOpen")?;
+        if !child
+            .wait()
+            .context("Failed to wait for cryptsetup luksOpen")?
+            .success()
+        {
+            bail!("Failed to open encrypted data disk");
+        }
 
         // Wait for device mapper to create the device
         let dm_path = format!("/dev/mapper/{name}");
@@ -1842,13 +2871,13 @@ impl<'a> Stage0<'a> {
         Ok(())
     }
 
-    fn measure_app_info(&self) -> Result<AppInfo> {
+    async fn measure_app_info(&self) -> Result<AppInfo> {
         let compose_hash = sha256_file(self.shared.dir.app_compose_file())?;
         let truncated_compose_hash = truncate(&compose_hash, 20);
         let key_provider = self.shared.app_compose.key_provider();
         let mut instance_info = self.shared.instance_info.clone();
-        let is_snp = AttestationMode::detect()
-            .map(|mode| mode == AttestationMode::DstackAmdSevSnp)
+        let is_snp = detect_tee_variant()
+            .map(|mode| mode == TeeVariant::DstackAmdSevSnp)
             .unwrap_or(false);
 
         if instance_info.app_id.is_empty() {
@@ -1894,6 +2923,21 @@ impl<'a> Stage0<'a> {
         emit_runtime_event("system-preparing", &[])?;
         emit_runtime_event("app-id", &instance_info.app_id)?;
         emit_runtime_event("compose-hash", &compose_hash)?;
+        let init_script_hashes: Vec<Vec<u8>> = self
+            .shared
+            .app_compose
+            .init_script
+            .iter()
+            .map(|script| sha256(script.as_bytes()).to_vec())
+            .collect();
+        for script_hash in &init_script_hashes {
+            emit_runtime_event("init-script-hash", script_hash)?;
+        }
+        let gpu_policy_hash = self
+            .measure_gpu()
+            .await
+            .context("failed to verify GPU TEE attestation")?;
+
         emit_runtime_event("instance-id", &instance_id)?;
         emit_runtime_event("boot-mr-done", &[])?;
 
@@ -1921,32 +2965,27 @@ impl<'a> Stage0<'a> {
         Ok(AppInfo {
             instance_info,
             compose_hash,
+            gpu_policy_hash,
+            init_script_hashes,
         })
     }
 
     fn verify_app(&self, app_info: &AppInfo, keys: &AppKeys) -> Result<()> {
-        if dstack_attest::attestation::AttestationMode::detect().is_err() {
-            // DEV-ONLY fallback: no TEE hardware present (e.g. a local no_tee
-            // dev CVM). There is no TDX/SEV-SNP quote to read an
-            // mr_config_id from, so skip this check instead of failing boot.
-            // Real TEE hosts always resolve an AttestationMode and take the
-            // unchanged verification path below.
-            warn!("no TEE attestation mode available; skipping mr_config_id verification (no_tee dev mode)");
-        } else {
-            config_id_verifier::verify_mr_config_id(
-                &app_info.compose_hash,
-                &app_info
-                    .instance_info
-                    .app_id
-                    .as_slice()
-                    .try_into()
-                    .ok()
-                    .context("Invalid app id")?,
-                &app_info.instance_info.instance_id,
-                keys.key_provider.kind(),
-                keys.key_provider.id(),
-            )?;
-        }
+        config_id_verifier::verify_mr_config_id(
+            &app_info.compose_hash,
+            &app_info.gpu_policy_hash,
+            &app_info.init_script_hashes,
+            &app_info
+                .instance_info
+                .app_id
+                .as_slice()
+                .try_into()
+                .ok()
+                .context("Invalid app id")?,
+            &app_info.instance_info.instance_id,
+            keys.key_provider.kind(),
+            keys.key_provider.id(),
+        )?;
         self.verify_key_provider_id(keys.key_provider.id())?;
         // TPM uses an empty id: the instance app-root pubkey is not a stable
         // provider identity and must not enter the launch measurement chain.
@@ -1967,6 +3006,7 @@ impl<'a> Stage0<'a> {
     async fn setup_fs(self) -> Result<Stage1<'a>> {
         let app_info = self
             .measure_app_info()
+            .await
             .context("Failed to measure app info")?;
         if self.shared.app_compose.key_provider().is_kms() {
             cmd_show_mrs()?;
@@ -2159,9 +3199,27 @@ impl Stage1<'_> {
         self.vmm
             .notify_q("boot.progress", "setting up dstack-gateway")
             .await;
-        GatewayContext::new(&self.shared, &self.keys)
+        if let Err(error) = GatewayContext::new(&self.shared, &self.keys)
             .setup(true)
-            .await?;
+            .await
+        {
+            warn!(
+                "dstack-gateway registration is unavailable during boot; continuing without a route: {error:#}"
+            );
+            // Boot no longer fails here, so a guest log line would be the only
+            // trace of it: the VM would report a clean boot while having no
+            // ingress at all. Report it to the host so the degraded state is
+            // visible from the VMM. The gateway checker clears this once it
+            // manages to register.
+            self.vmm
+                .notify_q(
+                    "boot.error",
+                    &format!(
+                        "dstack-gateway registration failed, the app has no ingress route: {error:#}"
+                    ),
+                )
+                .await;
+        }
         self.vmm
             .notify_q("boot.progress", "setting up docker")
             .await;
@@ -2192,7 +3250,6 @@ impl Stage1<'_> {
         let config = serde_json::json!({
             "default": {
                 "core": {
-                    "pccs_url": self.shared.sys_config.pccs_url,
                     "data_disks": data_disks,
                 }
             }
@@ -2362,6 +3419,16 @@ fn validate_single_luks2_header(mut reader: impl std::io::Read, hdr_ind: u64) ->
         if area.encryption() != "aes-xts-plain64" {
             bail!("Invalid LUKS keyslot encryption: {}", area.encryption());
         }
+        // Pin where the encrypted key material is read from. The binary area
+        // must sit between the two header copies and the encrypted payload;
+        // otherwise a host with raw disk access could redirect it elsewhere.
+        if area.offset() < 2 * hdr_size || area.offset() + area.size() > PAYLOAD_OFFSET {
+            bail!(
+                "Invalid LUKS keyslot area: offset={} size={}",
+                area.offset(),
+                area.size()
+            );
+        }
         if *key_size != 64 {
             bail!("Invalid LUKS keyslot key size: {key_size}");
         }
@@ -2372,6 +3439,9 @@ fn validate_single_luks2_header(mut reader: impl std::io::Read, hdr_ind: u64) ->
             let LuksKdf::pbkdf2 {
                 hash,
                 iterations: _,
+                // Salts are left unchecked on purpose: the passphrase is
+                // high-entropy and KMS-derived, so an attacker-chosen salt
+                // buys nothing without it (see security report #552).
                 salt: _,
             } = kdf
             else {
@@ -2613,7 +3683,7 @@ fn test_decrypt_env_vars_v1_rejects_bad_manifest() {
     let allowed = test_env_allowed(&["FOO"]);
     let entry = test_env_entry(&[("FOO", "bar")]);
 
-    let ciphertext = test_env_manifest(2, &[entry.clone()]);
+    let ciphertext = test_env_manifest(2, std::slice::from_ref(&entry));
     let err = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &ciphertext, &allowed).unwrap_err();
     assert!(err
         .to_string()
@@ -2631,22 +3701,39 @@ fn test_decrypt_env_vars_v1_rejects_bad_manifest() {
     assert!(err.to_string().contains("Too many encrypted env entries"));
 }
 
+#[test]
+fn test_validate_luks2_header_rejects_out_of_range_keyslot_area() {
+    // Redirect the keyslot binary area below the header region. Same length
+    // so the surrounding header stays intact; "00768" parses to 768, which is
+    // inside the header copies (< 2 * hdr_size) rather than the metadata gap.
+    let mut header = include_bytes!("../tests/fixtures/luks_header_good").to_vec();
+    let needle = br#""offset":"32768""#;
+    let replacement = br#""offset":"00768""#;
+    let mut patched = 0;
+    let mut i = 0;
+    while i + needle.len() <= header.len() {
+        if &header[i..i + needle.len()] == needle {
+            header[i..i + needle.len()].copy_from_slice(replacement);
+            patched += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    assert_eq!(patched, 2, "expected to patch both header copies");
+    let error = validate_luks2_headers(&mut &header[..]).unwrap_err();
+    assert!(error.to_string().contains("Invalid LUKS keyslot area"));
+}
+
 #[cfg(test)]
-fn test_app_compose(
-    manifest_version: serde_json::Value,
-    os_version: Option<&str>,
-    platforms: Option<&[&str]>,
-) -> AppCompose {
+fn test_app_compose(manifest_version: serde_json::Value, platforms: Option<&[&str]>) -> AppCompose {
     let mut value = serde_json::json!({
         "manifest_version": manifest_version,
         "name": "test",
         "runner": "docker-compose"
     });
-    if os_version.is_some() || platforms.is_some() {
+    if platforms.is_some() {
         value["requirements"] = serde_json::json!({});
-    }
-    if let Some(os_version) = os_version {
-        value["requirements"]["os_version"] = serde_json::json!(os_version);
     }
     if let Some(platforms) = platforms {
         value["requirements"]["platforms"] = serde_json::json!(platforms);
@@ -2654,73 +3741,195 @@ fn test_app_compose(
     serde_json::from_value(value).unwrap()
 }
 
+/// The single hop between `requirements.health_check` and
+/// `RegisterCvmRequest.health_check`. Nothing else connects the app's manifest
+/// to the gateway's behaviour, so if this is wrong the feature is inert
+/// fleet-wide and nothing else fails.
+#[test]
+fn health_check_opt_in_reaches_registration() {
+    let opted_in =
+        compose_with_health_check("docker-compose", serde_json::json!({"health_check": true}));
+    assert!(health_check_requested(&opted_in));
+
+    let opted_out =
+        compose_with_health_check("docker-compose", serde_json::json!({"health_check": false}));
+    assert!(!health_check_requested(&opted_out));
+}
+
+/// An app that says nothing must register as "do not poll me", not as an
+/// opt-in by omission.
+#[test]
+fn an_app_that_says_nothing_does_not_ask_to_be_polled() {
+    let no_requirements = test_app_compose(serde_json::json!("3"), None);
+    assert!(!health_check_requested(&no_requirements));
+
+    // Requirements present, but carrying something other than health_check.
+    let other_requirements = test_app_compose(serde_json::json!("3"), Some(&["dstack-tdx"]));
+    assert!(!health_check_requested(&other_requirements));
+}
+
+/// An app that opts into health gating, with `overrides` merged over the
+/// `requirements` object so a case can vary one field without restating it.
+///
+/// The compose file deliberately declares no `healthcheck:`. Whether the
+/// containers can be judged is the runtime's answer, given by the guest agent,
+/// not something read out of the YAML here -- so a fixture without one has to
+/// pass validation.
+#[cfg(test)]
+fn compose_with_health_check(runner: &str, overrides: serde_json::Value) -> AppCompose {
+    let mut requirements = serde_json::json!({"health_check": true});
+    for (key, value) in overrides.as_object().expect("an object of overrides") {
+        requirements[key] = value.clone();
+    }
+    serde_json::from_value(serde_json::json!({
+        "manifest_version": "3",
+        "name": "health-app",
+        "runner": runner,
+        "docker_compose_file": "services:\n  web:\n    image: app:1\n",
+        "requirements": requirements,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn health_check_on_a_container_runner_needs_no_health_status_file() {
+    let compose = compose_with_health_check("docker-compose", serde_json::json!({}));
+    verify_manifest_feature_requirements(&compose).unwrap();
+}
+
+/// The `bash` runner starts no containers, so the container fallback has
+/// nothing to look at and would answer healthy forever. That is exactly the
+/// silent no-op the opt-in exists to avoid.
+#[test]
+fn health_check_without_containers_to_judge_is_rejected() {
+    let compose = compose_with_health_check("bash", serde_json::json!({}));
+    let err = verify_manifest_feature_requirements(&compose).unwrap_err();
+    assert!(
+        err.to_string().contains("needs health_status_file"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn a_bash_runner_with_a_health_status_file_is_accepted() {
+    let compose = compose_with_health_check(
+        "bash",
+        serde_json::json!({"health_status_file": "/dstack/health"}),
+    );
+    verify_manifest_feature_requirements(&compose).unwrap();
+}
+
+/// The agent runs in the guest rootfs, so a relative path resolves against
+/// whatever its working directory happens to be.
+#[test]
+fn a_relative_health_status_file_is_rejected() {
+    let compose = compose_with_health_check(
+        "docker-compose",
+        serde_json::json!({"health_status_file": "health"}),
+    );
+    let err = verify_manifest_feature_requirements(&compose).unwrap_err();
+    assert!(
+        err.to_string().contains("absolute path"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Declared but switched off must not be validated as if it were on: turning
+/// gating off during an incident should not also have to be a config rewrite.
+/// Both of the surviving checks would reject this fixture with the flag on.
+#[test]
+fn a_disabled_health_check_is_not_validated() {
+    let compose = compose_with_health_check(
+        "bash",
+        serde_json::json!({"health_check": false, "health_status_file": "relative"}),
+    );
+    verify_manifest_feature_requirements(&compose).unwrap();
+}
+
+/// `requirements` is `deny_unknown_fields`, so a guest image that predates the
+/// field refuses the deployment instead of ignoring the request.
+#[test]
+fn an_unknown_requirements_field_is_refused() {
+    let parsed = serde_json::from_value::<AppCompose>(serde_json::json!({
+        "manifest_version": "3",
+        "name": "health-app",
+        "runner": "docker-compose",
+        "requirements": { "health_check_v2": { "enabled": true } },
+    }));
+    assert!(
+        parsed.is_err(),
+        "unknown requirements fields must fail closed"
+    );
+}
+
 #[test]
 fn test_manifest_version_policy_rejects_above_guest_max() {
-    let app_compose = test_app_compose(serde_json::json!("4"), None, None);
+    let app_compose = test_app_compose(serde_json::json!("4"), None);
     let err = verify_manifest_version(&app_compose).unwrap_err();
     assert!(err.to_string().contains("Unsupported manifest_version"));
 }
 
 #[test]
-fn test_os_version_requirement_requires_v3_manifest() {
-    let app_compose = test_app_compose(serde_json::json!("2"), Some(">=0.6.1"), None);
+fn test_requirements_require_v3_manifest() {
+    let app_compose = test_app_compose(serde_json::json!("2"), Some(&["dstack-tdx"]));
     let err = verify_manifest_feature_requirements(&app_compose).unwrap_err();
     assert!(err.to_string().contains("requires manifest_version"));
 }
 
 #[test]
-fn test_os_version_requirement_rejects_too_old_os() {
-    let app_compose = test_app_compose(serde_json::json!("3"), Some(">=0.6.1"), None);
-    let err = verify_os_version_requirement(&app_compose, "0.6.0").unwrap_err();
-    assert!(err.to_string().contains("Unsupported dstack OS version"));
-    verify_os_version_requirement(&app_compose, "0.6.1").unwrap();
-    verify_os_version_requirement(&app_compose, "0.6.2").unwrap();
+fn test_nerdctl_compose_requires_v3_manifest() {
+    let mut app_compose = test_app_compose(serde_json::json!(2), None);
+    app_compose.runner = "nerdctl-compose".to_string();
+    let err = verify_manifest_feature_requirements(&app_compose).unwrap_err();
+    assert!(err.to_string().contains("nerdctl-compose requires"));
+
+    app_compose.manifest_version = "3".to_string();
+    verify_manifest_feature_requirements(&app_compose).unwrap();
 }
 
 #[test]
-fn test_os_version_requirement_accepts_semver_requirement_ranges() {
-    let app_compose = test_app_compose(serde_json::json!("3"), Some(">=0.6.0, <0.7.0"), None);
-    verify_os_version_requirement(&app_compose, "0.6.0").unwrap();
-    verify_os_version_requirement(&app_compose, "0.6.9").unwrap();
-    let err = verify_os_version_requirement(&app_compose, "0.7.0").unwrap_err();
-    assert!(err.to_string().contains("Unsupported dstack OS version"));
-}
-
-#[test]
-fn test_os_version_requirement_rejects_invalid_semver_strings() {
-    let app_compose = test_app_compose(serde_json::json!("3"), Some(">=0.6.0.a0"), None);
-    let err = verify_os_version_requirement(&app_compose, "0.6.0").unwrap_err();
-    assert!(err.to_string().contains("Invalid requirements.os_version"));
-
-    let app_compose = test_app_compose(serde_json::json!("3"), Some(">=0.6.0-a0"), None);
-    let err = verify_os_version_requirement(&app_compose, "0.6.0.a0").unwrap_err();
+fn test_multiple_init_scripts_require_v3_manifest() {
+    let mut app_compose = test_app_compose(serde_json::json!(2), None);
+    app_compose.init_script = vec!["echo one".into(), "echo two".into()];
+    let err = verify_manifest_feature_requirements(&app_compose).unwrap_err();
     assert!(err
         .to_string()
-        .contains("Invalid current dstack OS version"));
+        .contains("multiple init scripts require manifest_version"));
+
+    app_compose.manifest_version = "3".into();
+    verify_manifest_feature_requirements(&app_compose).unwrap();
+}
+
+#[test]
+fn test_snapshotter_is_rejected_for_other_runners() {
+    let mut app_compose = test_app_compose(serde_json::json!("3"), None);
+    app_compose.snapshotter = Some(dstack_types::ContainerSnapshotter::Stargz);
+    let err = verify_manifest_feature_requirements(&app_compose).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("snapshotter is only supported by the nerdctl-compose runner"));
 }
 
 #[test]
 fn test_platform_requirements_accept_matching_platform() {
     let app_compose = test_app_compose(
         serde_json::json!("3"),
-        None,
         Some(&["dstack-gcp-tdx", "dstack-tdx"]),
     );
-    verify_platform_requirements(&app_compose, AttestationMode::DstackGcpTdx).unwrap();
-    verify_platform_requirements(&app_compose, AttestationMode::DstackTdx).unwrap();
+    verify_platform_requirements(&app_compose, TeeVariant::DstackGcpTdx).unwrap();
+    verify_platform_requirements(&app_compose, TeeVariant::DstackTdx).unwrap();
 }
 
 #[test]
 fn test_platform_requirements_reject_non_matching_platform() {
-    let app_compose = test_app_compose(serde_json::json!("3"), None, Some(&["dstack-gcp-tdx"]));
-    let err =
-        verify_platform_requirements(&app_compose, AttestationMode::DstackAmdSevSnp).unwrap_err();
+    let app_compose = test_app_compose(serde_json::json!("3"), Some(&["dstack-gcp-tdx"]));
+    let err = verify_platform_requirements(&app_compose, TeeVariant::DstackAmdSevSnp).unwrap_err();
     assert!(err.to_string().contains("Unsupported attestation platform"));
 }
 
 #[test]
 fn test_platform_requirements_require_v3_manifest() {
-    let app_compose = test_app_compose(serde_json::json!("2"), None, Some(&["dstack-gcp-tdx"]));
+    let app_compose = test_app_compose(serde_json::json!("2"), Some(&["dstack-gcp-tdx"]));
     let err = verify_manifest_feature_requirements(&app_compose).unwrap_err();
     assert!(err.to_string().contains("requires manifest_version"));
 }
@@ -2740,25 +3949,25 @@ fn test_empty_requirements_require_v3_manifest() {
 
 #[test]
 fn test_platform_requirements_omitted_accepts_any_platform() {
-    let app_compose = test_app_compose(serde_json::json!("3"), None, None);
-    verify_platform_requirements(&app_compose, AttestationMode::DstackAmdSevSnp).unwrap();
+    let app_compose = test_app_compose(serde_json::json!("3"), None);
+    verify_platform_requirements(&app_compose, TeeVariant::DstackAmdSevSnp).unwrap();
 }
 
 #[test]
 fn test_platform_requirements_explicit_empty_rejects_all_platforms() {
-    let app_compose = test_app_compose(serde_json::json!("3"), None, Some(&[]));
-    let err = verify_platform_requirements(&app_compose, AttestationMode::DstackTdx).unwrap_err();
+    let app_compose = test_app_compose(serde_json::json!("3"), Some(&[]));
+    let err = verify_platform_requirements(&app_compose, TeeVariant::DstackTdx).unwrap_err();
     assert!(err.to_string().contains("Unsupported attestation platform"));
 
-    let app_compose = test_app_compose(serde_json::json!("2"), None, Some(&[]));
+    let app_compose = test_app_compose(serde_json::json!("2"), Some(&[]));
     let err = verify_manifest_feature_requirements(&app_compose).unwrap_err();
     assert!(err.to_string().contains("requires manifest_version"));
 }
 
 #[test]
 fn test_platform_requirements_reject_invalid_platform_value() {
-    let app_compose = test_app_compose(serde_json::json!("3"), None, Some(&["gcptdx"]));
-    let err = verify_platform_requirements(&app_compose, AttestationMode::DstackTdx).unwrap_err();
+    let app_compose = test_app_compose(serde_json::json!("3"), Some(&["gcptdx"]));
+    let err = verify_platform_requirements(&app_compose, TeeVariant::DstackTdx).unwrap_err();
     assert!(err
         .to_string()
         .contains("Invalid requirements.platforms[0]"));
@@ -2775,12 +3984,12 @@ fn test_tdx_measure_acpi_tables_requirement_matches_vm_config() {
         }
     }))
     .unwrap();
-    verify_tdx_measure_acpi_tables_requirement(&app_compose, r#"{}"#, AttestationMode::DstackTdx)
+    verify_tdx_measure_acpi_tables_requirement(&app_compose, r#"{}"#, TeeVariant::DstackTdx)
         .unwrap();
     let err = verify_tdx_measure_acpi_tables_requirement(
         &app_compose,
         r#"{"tdx_attestation_variant":"lite"}"#,
-        AttestationMode::DstackTdx,
+        TeeVariant::DstackTdx,
     )
     .unwrap_err();
     assert!(err.to_string().contains("tdx_measure_acpi_tables=true"));
@@ -2797,15 +4006,12 @@ fn test_tdx_measure_acpi_tables_requirement_matches_vm_config() {
     verify_tdx_measure_acpi_tables_requirement(
         &app_compose,
         r#"{"tdx_attestation_variant":"lite"}"#,
-        AttestationMode::DstackTdx,
+        TeeVariant::DstackTdx,
     )
     .unwrap();
-    let err = verify_tdx_measure_acpi_tables_requirement(
-        &app_compose,
-        r#"{}"#,
-        AttestationMode::DstackTdx,
-    )
-    .unwrap_err();
+    let err =
+        verify_tdx_measure_acpi_tables_requirement(&app_compose, r#"{}"#, TeeVariant::DstackTdx)
+            .unwrap_err();
     assert!(err.to_string().contains("tdx_measure_acpi_tables=false"));
 }
 
@@ -2823,7 +4029,7 @@ fn test_tdx_measure_acpi_tables_requirement_ignored_on_non_tdx() {
     verify_tdx_measure_acpi_tables_requirement(
         &app_compose,
         r#"{"tdx_attestation_variant":"lite"}"#,
-        AttestationMode::DstackAmdSevSnp,
+        TeeVariant::DstackAmdSevSnp,
     )
     .unwrap();
 }
@@ -2895,30 +4101,389 @@ fn test_launch_token_from_user_config_rejects_missing_or_invalid_token() {
         .contains("failed to parse user_config as JSON"));
 }
 
-#[test]
-fn test_os_release_value_parses_quoted_version_id() {
-    let content = r#"
-NAME="DStack"
-VERSION_ID="0.6.1"
-"#;
-    assert_eq!(
-        os_release_value(content, "VERSION_ID").as_deref(),
-        Some("0.6.1")
-    );
+#[cfg(test)]
+mod kms_provider_inventory_tests {
+    use super::{kms_rpc_url, validate_key_provider_inputs};
+    use dstack_types::KeyProviderKind;
+
+    #[test]
+    fn normalizes_kms_rpc_urls_once() {
+        assert_eq!(kms_rpc_url("https://kms.test"), "https://kms.test/prpc");
+        assert_eq!(kms_rpc_url("https://kms.test/"), "https://kms.test/prpc");
+        assert_eq!(
+            kms_rpc_url("https://kms.test/prpc"),
+            "https://kms.test/prpc"
+        );
+        assert_eq!(
+            kms_rpc_url("https://kms.test/prpc/"),
+            "https://kms.test/prpc"
+        );
+    }
+
+    #[test]
+    fn local_key_providers_do_not_require_kms_inventory() {
+        let no_urls = Vec::new();
+        assert!(validate_key_provider_inputs(KeyProviderKind::Local, &no_urls).is_ok());
+        assert!(validate_key_provider_inputs(KeyProviderKind::Tpm, &no_urls).is_ok());
+        assert!(validate_key_provider_inputs(KeyProviderKind::None, &no_urls).is_ok());
+        let error = validate_key_provider_inputs(KeyProviderKind::Kms, &no_urls).unwrap_err();
+        assert!(error.to_string().contains("No KMS URLs are set"));
+    }
 }
 
-#[test]
-fn test_unquote_os_release_value_handles_quoting_styles() {
-    assert_eq!(unquote_os_release_value("0.6.1"), "0.6.1");
-    assert_eq!(unquote_os_release_value("\"0.6.1\""), "0.6.1");
-    assert_eq!(unquote_os_release_value("'0.6.1'"), "0.6.1");
-    // Double-quoted: backslash escapes the next character.
-    assert_eq!(unquote_os_release_value(r#""a\"b""#), "a\"b");
-    assert_eq!(unquote_os_release_value(r#""a\\b""#), r"a\b");
-    assert_eq!(unquote_os_release_value(r#""a\\\"b""#), r#"a\"b"#);
-    // Single-quoted: no escape sequences.
-    assert_eq!(unquote_os_release_value(r"'a\\b'"), r"a\\b");
-    // Unbalanced/degenerate quotes are returned verbatim.
-    assert_eq!(unquote_os_release_value("\""), "\"");
-    assert_eq!(unquote_os_release_value("\"a"), "\"a");
+#[cfg(test)]
+mod gateway_registration_refresh_tests {
+    use super::{
+        carry_cluster_preference, gateway_rpc_url, order_by_stickiness, record_accepting_url,
+        wireguard_endpoint_hosts, GatewayKeyStore, IssuedClientCerts,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn key_store(cert_not_after: u64) -> GatewayKeyStore {
+        GatewayKeyStore {
+            client_cert: "sentinel-client-cert".into(),
+            client_cert_with_quote: "sentinel-quoted-cert".into(),
+            client_key: "sentinel-client-key".into(),
+            cert_not_after,
+            wg_sk: "sentinel-wg-private".into(),
+            wg_pk: "sentinel-wg-public".into(),
+            last_url: None,
+        }
+    }
+
+    fn urls(list: &[&str]) -> Vec<String> {
+        list.iter().map(|url| url.to_string()).collect()
+    }
+
+    fn ordered(list: &[String], last: Option<&str>) -> Vec<String> {
+        order_by_stickiness(list, last)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// With nothing remembered the configured order stands, which is the
+    /// behaviour every existing deployment already has.
+    #[test]
+    fn without_a_remembered_url_the_configured_order_stands() {
+        let list = urls(&["https://a", "https://b", "https://c"]);
+        assert_eq!(ordered(&list, None), list);
+    }
+
+    /// The point: a CVM that moved to the second gateway during an outage stays
+    /// there instead of snapping back the moment the first recovers. Each move
+    /// rewrites the instance record from a different node's memory.
+    #[test]
+    fn the_last_accepting_url_is_tried_first() {
+        let list = urls(&["https://a", "https://b", "https://c"]);
+        assert_eq!(
+            ordered(&list, Some("https://b")),
+            urls(&["https://b", "https://a", "https://c"])
+        );
+    }
+
+    /// A preference, not a pin: if the remembered one is down it costs one
+    /// failed attempt and the rest follow in configured order.
+    #[test]
+    fn the_remaining_urls_keep_their_configured_order() {
+        let list = urls(&["https://a", "https://b", "https://c", "https://d"]);
+        assert_eq!(
+            ordered(&list, Some("https://c")),
+            urls(&["https://c", "https://a", "https://b", "https://d"])
+        );
+    }
+
+    /// An operator removing a URL from the config must not resurrect it.
+    #[test]
+    fn a_remembered_url_no_longer_configured_is_ignored() {
+        let list = urls(&["https://a", "https://b"]);
+        assert_eq!(ordered(&list, Some("https://gone")), list);
+    }
+
+    #[test]
+    fn every_url_is_tried_exactly_once() {
+        let list = urls(&["https://a", "https://b", "https://c"]);
+        for last in [
+            None,
+            Some("https://a"),
+            Some("https://b"),
+            Some("https://c"),
+        ] {
+            let mut seen = ordered(&list, last);
+            assert_eq!(seen.len(), list.len(), "last={last:?}");
+            seen.sort();
+            let mut expected = list.clone();
+            expected.sort();
+            assert_eq!(seen, expected, "last={last:?}");
+        }
+    }
+
+    /// The cache is what carries the preference across a refresh, so it has to
+    /// survive the round trip -- and an older cache without the field must
+    /// still load.
+    #[test]
+    fn the_remembered_url_round_trips_through_the_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gateway-cache.json");
+        let mut store = key_store(u64::MAX);
+        store.last_url = Some("https://b".into());
+        store.save_to(&path).expect("save");
+        let loaded = GatewayKeyStore::load_from(&path).expect("load");
+        assert_eq!(loaded.last_url.as_deref(), Some("https://b"));
+
+        let legacy = serde_json::to_value(key_store(u64::MAX))
+            .map(|mut value| {
+                value.as_object_mut().unwrap().remove("last_url");
+                value
+            })
+            .expect("serialize");
+        std::fs::write(&path, legacy.to_string()).expect("write");
+        let loaded =
+            GatewayKeyStore::load_from(&path).expect("a cache without the field must load");
+        assert_eq!(loaded.last_url, None);
+    }
+
+    fn issued_certs(cert_not_after: u64) -> IssuedClientCerts {
+        IssuedClientCerts {
+            client_cert: "renewed-cert".into(),
+            client_cert_with_quote: "renewed-cert-with-quote".into(),
+            client_key: "renewed-key".into(),
+            cert_not_after,
+        }
+    }
+
+    /// A certificate renewal rebuilds the store from scratch. It must carry
+    /// the WireGuard identity — the gateway maps this peer by its public
+    /// key — and the registration preference, or every renewal would drift
+    /// the CVM back onto the first configured URL.
+    #[test]
+    fn a_certificate_renewal_carries_the_wireguard_identity_and_the_preference() {
+        let mut cached = key_store(0);
+        cached.last_url = Some("https://b".into());
+        let renewed = GatewayKeyStore::renewed(
+            Some(cached),
+            || panic!("a cached WireGuard identity must be reused, not regenerated"),
+            issued_certs(u64::MAX),
+        )
+        .expect("renew");
+        assert_eq!(renewed.wg_sk, "sentinel-wg-private");
+        assert_eq!(renewed.wg_pk, "sentinel-wg-public");
+        assert_eq!(renewed.last_url.as_deref(), Some("https://b"));
+        assert_eq!(renewed.client_cert, "renewed-cert");
+        assert_eq!(renewed.cert_not_after, u64::MAX);
+    }
+
+    /// A cold start has nothing to carry: fresh WireGuard identity, no
+    /// preference.
+    #[test]
+    fn a_cold_start_generates_a_fresh_wireguard_identity_and_no_preference() {
+        let renewed = GatewayKeyStore::renewed(
+            None,
+            || Ok(("fresh-wg-private".into(), "fresh-wg-public".into())),
+            issued_certs(u64::MAX),
+        )
+        .expect("renew");
+        assert_eq!(renewed.wg_sk, "fresh-wg-private");
+        assert_eq!(renewed.wg_pk, "fresh-wg-public");
+        assert_eq!(renewed.last_url, None);
+    }
+
+    /// The sequence a refresh tick runs for the default cluster when the
+    /// certificate expires: rebuild the store, save it over the cache, then
+    /// read the preference back for the registration round. The rebuilt store
+    /// is what gets written, so it must already carry the preference — this
+    /// is exactly the sequence that used to lose it.
+    #[test]
+    fn the_preference_survives_the_renewal_that_rewrites_the_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gateway-cache.json");
+        let mut cached = key_store(0); // expired certificate forces the rebuild
+        cached.last_url = Some("https://b".into());
+        cached.save_to(&path).expect("save");
+
+        let renewed = GatewayKeyStore::renewed(
+            GatewayKeyStore::load_from(&path),
+            || panic!("a cached WireGuard identity must be reused, not regenerated"),
+            issued_certs(u64::MAX),
+        )
+        .expect("renew");
+        renewed.save_to(&path).expect("save renewed");
+
+        let mut store = renewed;
+        carry_cluster_preference(&mut store, &path, &urls(&["https://a", "https://b"]));
+        assert_eq!(store.last_url.as_deref(), Some("https://b"));
+    }
+
+    /// An additional cluster's store is cloned from the primary's; the
+    /// preference that counts is the one in the cluster's own cache.
+    #[test]
+    fn an_additional_cluster_does_not_inherit_the_primary_preference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gateway-cache-second.json");
+        let mut cluster_cache = key_store(u64::MAX);
+        cluster_cache.last_url = Some("https://b".into());
+        cluster_cache.save_to(&path).expect("save");
+
+        let mut store = key_store(u64::MAX);
+        store.last_url = Some("https://primary".into());
+        carry_cluster_preference(&mut store, &path, &urls(&["https://a", "https://b"]));
+        assert_eq!(store.last_url.as_deref(), Some("https://b"));
+    }
+
+    /// No cache on disk means no preference, whatever the resolved store
+    /// happened to carry.
+    #[test]
+    fn a_missing_cluster_cache_clears_the_carried_preference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("absent.json");
+        let mut store = key_store(u64::MAX);
+        store.last_url = Some("https://primary".into());
+        carry_cluster_preference(&mut store, &path, &urls(&["https://primary"]));
+        assert_eq!(store.last_url, None);
+    }
+
+    /// An operator removing a URL from the config must not see the cache
+    /// resurrect it.
+    #[test]
+    fn the_carry_drops_a_url_removed_from_the_config() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gateway-cache.json");
+        let mut cached = key_store(u64::MAX);
+        cached.last_url = Some("https://gone".into());
+        cached.save_to(&path).expect("save");
+
+        let mut store = key_store(u64::MAX);
+        carry_cluster_preference(&mut store, &path, &urls(&["https://a"]));
+        assert_eq!(store.last_url, None);
+    }
+
+    /// Only an acceptance updates the preference: a round where every URL
+    /// failed says nothing about where the instance record lives, and
+    /// clearing on it would erase the fleet's spread in one bad tick.
+    #[test]
+    fn a_round_where_every_url_failed_keeps_the_preference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gateway-cache.json");
+        let mut store = key_store(u64::MAX);
+        store.last_url = Some("https://b".into());
+        store.save_to(&path).expect("save");
+
+        record_accepting_url("default", &mut store, &path, None);
+        assert_eq!(store.last_url.as_deref(), Some("https://b"));
+        let on_disk = GatewayKeyStore::load_from(&path).expect("load");
+        assert_eq!(on_disk.last_url.as_deref(), Some("https://b"));
+    }
+
+    /// An acceptance by a different node is recorded in memory and on disk.
+    #[test]
+    fn an_acceptance_moves_and_persists_the_preference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gateway-cache.json");
+        let mut store = key_store(u64::MAX);
+        store.last_url = Some("https://a".into());
+
+        record_accepting_url("default", &mut store, &path, Some("https://c".into()));
+        assert_eq!(store.last_url.as_deref(), Some("https://c"));
+        let on_disk = GatewayKeyStore::load_from(&path).expect("load");
+        assert_eq!(on_disk.last_url.as_deref(), Some("https://c"));
+    }
+
+    /// The first acceptance of a boot is recorded too — that is what the
+    /// next refresh's ordering is built from.
+    #[test]
+    fn the_first_acceptance_is_recorded() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gateway-cache.json");
+        let mut store = key_store(u64::MAX);
+
+        record_accepting_url("default", &mut store, &path, Some("https://a".into()));
+        assert_eq!(store.last_url.as_deref(), Some("https://a"));
+        let on_disk = GatewayKeyStore::load_from(&path).expect("load");
+        assert_eq!(on_disk.last_url.as_deref(), Some("https://a"));
+    }
+
+    /// Re-acceptance by the remembered node changes nothing, so nothing is
+    /// written.
+    #[test]
+    fn re_acceptance_by_the_same_url_does_not_rewrite_the_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gateway-cache.json");
+        let mut store = key_store(u64::MAX);
+        store.last_url = Some("https://c".into());
+
+        record_accepting_url("default", &mut store, &path, Some("https://c".into()));
+        assert_eq!(store.last_url.as_deref(), Some("https://c"));
+        assert!(
+            !path.exists(),
+            "an unchanged preference must not be written"
+        );
+    }
+
+    #[test]
+    fn gateway_rpc_urls_are_normalized_once() {
+        assert_eq!(
+            gateway_rpc_url("https://gateway.test"),
+            "https://gateway.test/prpc"
+        );
+        assert_eq!(
+            gateway_rpc_url("https://gateway.test/"),
+            "https://gateway.test/prpc"
+        );
+        assert_eq!(
+            gateway_rpc_url("https://gateway.test/prpc"),
+            "https://gateway.test/prpc"
+        );
+        assert_eq!(
+            gateway_rpc_url("https://gateway.test/prpc/"),
+            "https://gateway.test/prpc"
+        );
+    }
+
+    #[test]
+    fn key_store_round_trip_is_private_and_stable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gateway-cache.json");
+        let original = key_store(10_000);
+        original.save_to(&path).unwrap();
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let loaded = GatewayKeyStore::load_from(&path).unwrap();
+        assert_eq!(loaded.wg_sk, original.wg_sk);
+        assert_eq!(loaded.wg_pk, original.wg_pk);
+        assert_eq!(loaded.client_key, original.client_key);
+    }
+
+    #[test]
+    fn malformed_replacement_does_not_overwrite_working_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gateway-cache.json");
+        let original = key_store(10_000);
+        original.save_to(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let invalid_target = directory.path().join("missing-parent/cache.json");
+        assert!(key_store(20_000).save_to(&invalid_target).is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::write(&path, b"not-json").unwrap();
+        assert!(GatewayKeyStore::load_from(&path).is_none());
+    }
+
+    #[test]
+    fn certificate_refresh_boundary_is_strict_and_overflow_safe() {
+        assert!(key_store(1_601).is_cert_valid_at(1_000));
+        assert!(!key_store(1_600).is_cert_valid_at(1_000));
+        assert!(!key_store(u64::MAX).is_cert_valid_at(u64::MAX));
+    }
+
+    #[test]
+    fn wireguard_endpoint_hosts_support_dns_ipv4_and_ipv6() {
+        let config = r#"
+Endpoint = gateway.example.com:51820
+Endpoint = 192.0.2.1:51821
+Endpoint = [2001:db8::1]:51822
+"#;
+        assert_eq!(
+            wireguard_endpoint_hosts(config).unwrap(),
+            ["gateway.example.com", "192.0.2.1", "2001:db8::1"]
+        );
+        assert!(wireguard_endpoint_hosts("Endpoint = missing-port").is_err());
+    }
 }

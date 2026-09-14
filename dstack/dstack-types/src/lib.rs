@@ -10,6 +10,89 @@ use serde::{Deserialize, Serialize};
 use serde_human_bytes as hex_bytes;
 use size_parser::human_size;
 
+/// Bound event-log growth and MrConfigV3 size while supporting independent
+/// infrastructure-provider initialization stages.
+pub const MAX_INIT_SCRIPTS: usize = 5;
+
+pub mod init_script_hashes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_human_bytes::ByteBuf;
+
+    pub fn serialize<S>(values: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .cloned()
+            .map(ByteBuf::from)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<ByteBuf>::deserialize(deserializer)?;
+        if values.len() > super::MAX_INIT_SCRIPTS {
+            return Err(serde::de::Error::custom(format!(
+                "init_script_hashes supports at most {} hashes",
+                super::MAX_INIT_SCRIPTS
+            )));
+        }
+        if values.iter().any(|value| value.len() != 32) {
+            return Err(serde::de::Error::custom(
+                "each init_script_hash must be 32 bytes",
+            ));
+        }
+        Ok(values.into_iter().map(ByteBuf::into_vec).collect())
+    }
+
+    pub mod option {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+        use serde_human_bytes::ByteBuf;
+
+        pub fn serialize<S>(values: &Option<Vec<Vec<u8>>>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            values
+                .as_ref()
+                .map(|values| {
+                    values
+                        .iter()
+                        .cloned()
+                        .map(ByteBuf::from)
+                        .collect::<Vec<_>>()
+                })
+                .serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<Vec<u8>>>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            Option::<Vec<ByteBuf>>::deserialize(deserializer)?
+                .map(|values| {
+                    if values.len() > super::super::MAX_INIT_SCRIPTS {
+                        return Err(serde::de::Error::custom(format!(
+                            "init_script_hashes supports at most {} hashes",
+                            super::super::MAX_INIT_SCRIPTS
+                        )));
+                    }
+                    if values.iter().any(|value| value.len() != 32) {
+                        return Err(serde::de::Error::custom(
+                            "each init_script_hash must be 32 bytes",
+                        ));
+                    }
+                    Ok(values.into_iter().map(ByteBuf::into_vec).collect())
+                })
+                .transpose()
+        }
+    }
+}
+
 /// Identifies which OVMF flavour the guest image was built with.
 ///
 /// Only the pre-202505 OVMF measurement layout is supported.
@@ -71,6 +154,51 @@ impl TdxAttestationVariant {
     }
 }
 
+/// Event log version controlling the digest format.
+///
+/// Using an enum ensures exhaustive matching — adding a new version
+/// forces all match sites to be updated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EventLogVersion {
+    /// Legacy binary digest: `SHA384(event_type_le || ":" || name || ":" || payload)`
+    #[default]
+    V1,
+    /// JSON canonical digest (JCS RFC 8785), hashed as canonical JSON bytes:
+    /// `SHA384({"name":"...","payload":"hex...","type":134217729})`
+    V2,
+}
+
+impl EventLogVersion {
+    pub fn is_v1(&self) -> bool {
+        matches!(self, Self::V1)
+    }
+
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            1 => Some(EventLogVersion::V1),
+            2 => Some(EventLogVersion::V2),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for EventLogVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            EventLogVersion::V1 => serializer.serialize_u32(1),
+            EventLogVersion::V2 => serializer.serialize_u32(2),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EventLogVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = u32::deserialize(deserializer)?;
+        EventLogVersion::from_u32(v)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown event log version: {v}")))
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct AppCompose {
     #[serde(deserialize_with = "deserialize_manifest_version")]
@@ -80,8 +208,23 @@ pub struct AppCompose {
     #[serde(default)]
     pub features: Vec<String>,
     pub runner: String,
+    /// containerd snapshotter used by the `nerdctl-compose` runner.
+    /// The field is invalid for other runners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshotter: Option<ContainerSnapshotter>,
     #[serde(default)]
     pub docker_compose_file: Option<String>,
+    /// Bash scripts executed before the application runner starts.
+    ///
+    /// A single string is accepted for backward compatibility and is treated
+    /// as a one-element list.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_init_scripts",
+        serialize_with = "serialize_init_scripts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub init_script: Vec<String>,
     #[serde(default)]
     pub public_logs: bool,
     #[serde(default)]
@@ -90,7 +233,11 @@ pub struct AppCompose {
     pub public_tcbinfo: bool,
     #[serde(default)]
     pub kms_enabled: bool,
-    #[serde(deserialize_with = "deserialize_gateway_enabled", flatten)]
+    #[serde(
+        deserialize_with = "deserialize_gateway_enabled",
+        serialize_with = "serialize_gateway_enabled",
+        flatten
+    )]
     pub gateway_enabled: bool,
     #[serde(default)]
     pub local_key_provider_enabled: bool,
@@ -106,8 +253,14 @@ pub struct AppCompose {
     pub secure_time: bool,
     #[serde(default)]
     pub storage_fs: Option<String>,
+    /// Return unused data-disk blocks to the host. Disable this when leaking
+    /// filesystem allocation and deletion patterns is unacceptable.
+    #[serde(default = "default_true")]
+    pub storage_discard: bool,
     #[serde(default, with = "human_size")]
     pub swap_size: u64,
+    #[serde(default, skip_serializing_if = "EventLogVersion::is_v1")]
+    pub event_log_version: EventLogVersion,
     /// Per-port policy consumed by the gateway (PROXY protocol opt-in,
     /// optional port whitelist).
     #[serde(default)]
@@ -119,15 +272,186 @@ pub struct AppCompose {
     /// of silently ignoring the requirements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requirements: Option<Requirements>,
+    /// Read-only, dm-verity-protected volumes pre-seeded into the CVM. Each
+    /// `verity_root` is measured (it is part of these compose bytes), so the
+    /// guest only mounts content matching the attested app. See
+    /// docs/verity-volumes.md.
+    #[serde(default)]
+    pub verity_volumes: Vec<VerityVolume>,
+}
+
+fn deserialize_init_scripts<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum InitScripts {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let scripts = match Option::<InitScripts>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(InitScripts::One(script)) => vec![script],
+        Some(InitScripts::Many(scripts)) => scripts,
+    };
+    if scripts.len() > MAX_INIT_SCRIPTS {
+        return Err(serde::de::Error::custom(format!(
+            "init_script supports at most {MAX_INIT_SCRIPTS} scripts"
+        )));
+    }
+    Ok(scripts)
+}
+
+fn serialize_init_scripts<S>(scripts: &[String], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let [script] = scripts {
+        serializer.serialize_str(script)
+    } else {
+        scripts.serialize(serializer)
+    }
+}
+
+/// A pre-baked, read-only dm-verity volume attached to the CVM.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct VerityVolume {
+    /// Bare image file name resolved by the VMM under `cvm.volumes_dir`.
+    pub source: String,
+    /// dm-verity root hash (hex): the volume's content identity and integrity
+    /// check. The guest matches attached devices against it.
+    #[serde(with = "hex_bytes")]
+    pub verity_root: [u8; 32],
+    /// Absolute path where the volume's filesystem is mounted.
+    #[serde(deserialize_with = "deserialize_absolute_path")]
+    pub target: std::path::PathBuf,
+}
+
+/// Reject ambiguous mount declarations before any disk is attached or
+/// activated. The same root may intentionally be mounted at multiple targets,
+/// but a target can only be owned by one volume.
+pub fn validate_verity_volumes(volumes: &[VerityVolume]) -> Result<(), String> {
+    let mut targets = std::collections::HashSet::new();
+    for volume in volumes {
+        if !targets.insert(&volume.target) {
+            return Err(format!(
+                "duplicate verity volume target {}",
+                volume.target.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_absolute_path<'de, D>(deserializer: D) -> Result<std::path::PathBuf, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let path = std::path::PathBuf::from(&value);
+    if !path.is_absolute() {
+        return Err(serde::de::Error::custom(format!(
+            "volume target must be an absolute path, got '{value}'"
+        )));
+    }
+    Ok(path)
+}
+
+#[cfg(test)]
+mod verity_volume_tests {
+    use super::{validate_verity_volumes, VerityVolume};
+
+    fn volume(root: u8, target: &str) -> VerityVolume {
+        VerityVolume {
+            source: format!("{root}.img"),
+            verity_root: [root; 32],
+            target: target.into(),
+        }
+    }
+
+    #[test]
+    fn allows_duplicate_roots_but_rejects_duplicate_targets() {
+        validate_verity_volumes(&[volume(1, "/a"), volume(1, "/b")]).unwrap();
+        assert!(validate_verity_volumes(&[volume(1, "/a"), volume(2, "/a")])
+            .unwrap_err()
+            .contains("duplicate verity volume target"));
+        validate_verity_volumes(&[volume(1, "/a"), volume(2, "/b")]).unwrap();
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerSnapshotter {
+    Overlayfs,
+    Stargz,
+}
+
+/// Canonical source for the policy used when `requirements.gpu_policy` is
+/// absent. Both typed defaults and measurement are derived from this JSON.
+pub const DEFAULT_GPU_POLICY: &str = "{}";
+
+/// Path containing the complete output of the NVIDIA GPU attestation command.
+pub const GPU_ATTESTATION_OUTPUT: &str = "/run/nvidia-gpu-attestation/attestation.out";
+
+/// Computes the SHA-256 digest of the JCS-canonicalized raw
+/// `requirements.gpu_policy` JSON value. An absent policy is equivalent to
+/// the default empty object.
+pub fn gpu_policy_hash(compose_json: &[u8]) -> Result<[u8; 32], serde_json::Error> {
+    use sha2::{Digest, Sha256};
+
+    let compose: serde_json::Value = serde_json::from_slice(compose_json)?;
+    let default_policy: serde_json::Value = serde_json::from_str(DEFAULT_GPU_POLICY)?;
+    let policy = compose
+        .pointer("/requirements/gpu_policy")
+        .unwrap_or(&default_policy);
+    let canonical = serde_jcs::to_vec(policy)?;
+    Ok(Sha256::digest(canonical).into())
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GpuPolicy {
+    /// Whether an attached GPU must pass local TEE attestation before the
+    /// guest continues booting. Defaults to true.
+    #[serde(default = "default_true")]
+    pub attest_gpu: bool,
+    /// Optional Rego v0 policy evaluated against NVIDIA nvattest's `claims`
+    /// array. It must define the boolean rule `data.policy.nv_match`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rego: Option<String>,
+    /// Permit NVIDIA DevTools mode. This defaults to false because DevTools
+    /// disables the GPU memory-confidentiality guarantees expected in
+    /// production.
+    #[serde(default)]
+    pub allow_devtools: bool,
+    /// Permit claims whose GPU attestation debug status is `enabled`. Defaults
+    /// to false.
+    #[serde(default)]
+    pub allow_debug: bool,
+    /// Permit claims that do not assert GPU secure boot. Defaults to false.
+    #[serde(default)]
+    pub allow_insecure_boot: bool,
+}
+
+impl Default for GpuPolicy {
+    fn default() -> Self {
+        serde_json::from_str(DEFAULT_GPU_POLICY)
+            .or_panic("DEFAULT_GPU_POLICY must be a valid GPU policy")
+    }
+}
+
+impl GpuPolicy {
+    /// Returns true when no application-specific GPU policy setting is set.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Requirements {
-    /// OS-version requirement parsed with Rust semver requirement semantics,
-    /// e.g. `">=0.6.0"` or `">=0.6.0, <0.7.0"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub os_version: Option<String>,
     /// Allowed attestation platforms. Omitted means any supported platform;
     /// an explicit empty list means no platform is allowed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,27 +473,141 @@ pub struct Requirements {
     /// (e.g. 32 random alphanumeric characters).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_token_hash: Option<String>,
-    /// GPU TEE attestation requirement, defaults to `true` when omitted.
+    /// Application GPU policy applied before key provisioning. An omitted
+    /// field is parsed and measured as the default empty policy `{}`.
     ///
-    /// On guests with an NVIDIA GPU attached, `true` means the guest runs
-    /// local GPU attestation (nvattest) during system setup and refuses to
-    /// boot — before key provisioning — if the GPU fails to attest (e.g. a
-    /// non-CC GPU or CC mode disabled by the host). `false` skips attestation
-    /// and sets the GPU ready state directly. Guests without a GPU attached
-    /// are unaffected either way.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attest_gpu: Option<bool>,
+    /// Its original JSON value is JCS-canonicalized and its SHA-256 digest is
+    /// emitted as the `gpu-policy-hash` launch event immediately after
+    /// `compose-hash`. When the field is absent, `{}` is measured. An explicitly
+    /// present default-valued field remains part of the raw measurement.
+    /// Rego receives an empty claims array when no GPU attestation is produced,
+    /// allowing applications to enforce an expected GPU count.
+    #[serde(default, skip_serializing_if = "GpuPolicy::is_default")]
+    pub gpu_policy: GpuPolicy,
+    /// Whether the gateway should gate this app's traffic on its health, i.e.
+    /// hold an instance out of its app's load-balancing rotation until the
+    /// guest agent reports that the app is serving.
+    ///
+    /// Opt-in, and deliberately placed under `requirements` rather than at the
+    /// top level of `app-compose.json`: `Requirements` is `deny_unknown_fields`
+    /// and is itself gated behind `manifest_version >= 3`, so a deployment that
+    /// asks for health gating cannot land on a guest image that would silently
+    /// ignore it. An app that never sets this registers as "do not poll me" and
+    /// is routed to exactly as it was before this feature existed.
+    ///
+    /// Two flat fields rather than one nested object, and not because flat is
+    /// prettier. Every SDK has to reproduce this structure byte for byte to
+    /// compute the compose hash that gets whitelisted on chain, and a nested
+    /// object is where they drift: Go's `HealthCheck` had no passthrough for
+    /// fields it did not know and would have hashed them away silently, while
+    /// Python's `Requirements.from_dict` did not reconstruct the object at all
+    /// and raised on any round trip. Scalars under a `deny_unknown_fields`
+    /// parent have neither failure mode.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub health_check: bool,
+    /// Absolute path to a file the app writes its own verdict into.
+    ///
+    /// Two lines, in order:
+    ///
+    /// ```text
+    /// healthy
+    /// 1771234567
+    /// ```
+    ///
+    /// Line 1 is `healthy` or `unhealthy` (case-insensitive). Line 2 is the
+    /// unix timestamp, in seconds, at which the app wrote the file. The
+    /// timestamp is not decoration: a file older than
+    /// [`HEALTH_FILE_MAX_AGE_SECS`] counts as unhealthy, which is what turns a
+    /// wedged app -- still running, no longer updating anything -- into a
+    /// verdict instead of a stale `healthy` that never expires. Refresh it at
+    /// least twice per that window.
+    ///
+    /// When this is absent the agent falls back to the container runtime:
+    /// every container that declares a Compose `healthcheck` must be running
+    /// and healthy. That default needs nothing from the app, but it can only
+    /// see what the runtime sees; a file gives the app the last word.
+    ///
+    /// `Option`, not `String`. An empty path and an absent one have to stay
+    /// distinguishable, because Go's `omitempty` cannot tell them apart and
+    /// would hash `""` differently from the other SDKs -- on a digest that goes
+    /// on chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_status_file: Option<String>,
 }
 
 impl Requirements {
     pub fn is_empty(&self) -> bool {
-        self.os_version.is_none()
-            && self.platforms.is_none()
+        self.platforms.is_none()
             && self.tdx_measure_acpi_tables.is_none()
             && self.launch_token_hash.is_none()
-            && self.attest_gpu.is_none()
+            && self.gpu_policy.is_default()
+            && !self.health_check
+            && self.health_status_file.is_none()
     }
 }
+
+/// Make a string that came from an untrusted party safe to put in a log line,
+/// and bound its length.
+///
+/// Both ends of the health path need this and neither can rely on the other:
+/// the guest agent sanitizes what an app wrote before reporting it, and the
+/// gateway sanitizes what a guest agent reported before logging it, because a
+/// guest agent is exactly the party the gateway does not trust.
+///
+/// "Unsafe" is wider than [`char::is_control`], which is only Unicode category
+/// Cc. It misses two families that do the same damage:
+///
+/// - `U+2028` LINE SEPARATOR and `U+2029` PARAGRAPH SEPARATOR, which many log
+///   viewers -- and every JavaScript or JSON consumer downstream of one --
+///   treat as a line break. That is the log-forging that stripping `\n` was
+///   meant to prevent.
+/// - The bidirectional formatting characters (`U+202A`..`U+202E`,
+///   `U+2066`..`U+2069`, `U+200E`, `U+200F`) and `U+FEFF`. `U+202E` reverses
+///   the rendering of everything after it, so an attacker controls how the
+///   rest of the line reads in a terminal without controlling its bytes.
+///
+/// Truncation is by bytes, and it says so when it happens: a bound that
+/// silently cuts a reason is worse than a short one, because the reader cannot
+/// tell a complete message from a clipped one.
+pub fn sanitize_for_log(text: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "... (truncated)";
+    let mut cleaned = String::with_capacity(text.len().min(max_bytes));
+    let mut truncated = false;
+    for ch in text.chars() {
+        let ch = if is_unsafe_to_log(ch) { ' ' } else { ch };
+        if cleaned.len() + ch.len_utf8() > max_bytes {
+            truncated = true;
+            break;
+        }
+        cleaned.push(ch);
+    }
+    if truncated {
+        cleaned.push_str(MARKER);
+    }
+    cleaned
+}
+
+/// Whether a character must not survive into a log line. See
+/// [`sanitize_for_log`].
+fn is_unsafe_to_log(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// How old a `health_status_file` may be before it is read as unhealthy.
+///
+/// Fixed rather than configurable: this is a liveness bound, and an app that
+/// wants a longer one is asking for its own failures to take longer to notice.
+pub const HEALTH_FILE_MAX_AGE_SECS: u64 = 60;
 
 /// Domain-separation prefix for [`launch_token_hash`]. It keeps the digest
 /// distinct from a plain `sha256(token)` (as used by the legacy app-layer
@@ -298,6 +736,21 @@ where
     Ok(value.gateway_enabled || value.tproxy_enabled)
 }
 
+fn serialize_gateway_enabled<S>(enabled: &bool, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    #[derive(Serialize)]
+    struct GatewayEnabled {
+        gateway_enabled: bool,
+    }
+
+    GatewayEnabled {
+        gateway_enabled: *enabled,
+    }
+    .serialize(serializer)
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyProviderKind {
@@ -362,24 +815,6 @@ impl AppCompose {
             }
         }
     }
-
-    /// Whether an attached GPU must pass local TEE attestation before the
-    /// guest continues booting. Defaults to `true` when
-    /// `requirements.attest_gpu` is omitted.
-    ///
-    /// `requirements` are only valid on manifest_version >= 3 (guests reject
-    /// older manifests carrying them); the opt-out is additionally ignored on
-    /// legacy manifests here so a caller that skipped that validation still
-    /// fails closed.
-    pub fn attest_gpu(&self) -> bool {
-        if !matches!(self.manifest_version_u32(), Some(v) if v >= 3) {
-            return true;
-        }
-        self.requirements
-            .as_ref()
-            .and_then(|r| r.attest_gpu)
-            .unwrap_or(true)
-    }
 }
 
 #[cfg(test)]
@@ -395,10 +830,130 @@ mod app_compose_tests {
     }
 
     #[test]
+    fn storage_discard_defaults_on_and_can_be_disabled() {
+        assert!(parse_compose(serde_json::json!(2)).unwrap().storage_discard);
+
+        let compose: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": 2,
+            "name": "test",
+            "runner": "docker-compose",
+            "storage_discard": false
+        }))
+        .unwrap();
+        assert!(!compose.storage_discard);
+    }
+
+    #[test]
+    fn init_script_accepts_string_array_and_null() {
+        assert!(parse_compose(serde_json::json!(2))
+            .unwrap()
+            .init_script
+            .is_empty());
+
+        let single: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": 2,
+            "name": "test",
+            "runner": "docker-compose",
+            "init_script": "echo one"
+        }))
+        .unwrap();
+        assert_eq!(single.init_script, ["echo one"]);
+        assert_eq!(
+            serde_json::to_value(&single).unwrap()["init_script"],
+            "echo one"
+        );
+
+        let multiple: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": 2,
+            "name": "test",
+            "runner": "docker-compose",
+            "init_script": ["echo one", "echo two"]
+        }))
+        .unwrap();
+        assert_eq!(multiple.init_script, ["echo one", "echo two"]);
+        assert_eq!(
+            serde_json::to_value(&multiple).unwrap()["init_script"],
+            serde_json::json!(["echo one", "echo two"])
+        );
+
+        let null: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": 2,
+            "name": "test",
+            "runner": "docker-compose",
+            "init_script": null
+        }))
+        .unwrap();
+        assert!(null.init_script.is_empty());
+        assert!(serde_json::to_value(&null)
+            .unwrap()
+            .get("init_script")
+            .is_none());
+
+        assert!(serde_json::from_value::<AppCompose>(serde_json::json!({
+            "manifest_version": 2,
+            "name": "test",
+            "runner": "docker-compose",
+            "init_script": ["echo one", 2]
+        }))
+        .is_err());
+
+        assert!(serde_json::from_value::<AppCompose>(serde_json::json!({
+            "manifest_version": 2,
+            "name": "test",
+            "runner": "docker-compose",
+            "init_script": ["1", "2", "3", "4", "5", "6"]
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains("at most 5"));
+    }
+
+    #[test]
     fn manifest_version_accepts_string_versions() {
         let compose = parse_compose(serde_json::json!("3")).unwrap();
         assert_eq!(compose.manifest_version, "3");
         assert_eq!(compose.manifest_version_u32(), Some(3));
+    }
+
+    #[test]
+    fn event_log_v1_is_omitted_but_v2_is_serialized() {
+        #[derive(Serialize)]
+        struct VersionField {
+            #[serde(skip_serializing_if = "EventLogVersion::is_v1")]
+            event_log_version: EventLogVersion,
+        }
+
+        let v1 = serde_json::to_value(VersionField {
+            event_log_version: EventLogVersion::V1,
+        })
+        .unwrap();
+        assert!(v1.get("event_log_version").is_none());
+
+        let v2 = serde_json::to_value(VersionField {
+            event_log_version: EventLogVersion::V2,
+        })
+        .unwrap();
+        assert_eq!(v2["event_log_version"], 2);
+    }
+
+    #[test]
+    fn parses_supported_container_snapshotters() {
+        let compose: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": "3",
+            "name": "test",
+            "runner": "nerdctl-compose",
+            "snapshotter": "stargz"
+        }))
+        .unwrap();
+        assert_eq!(compose.snapshotter, Some(ContainerSnapshotter::Stargz));
+
+        let invalid = serde_json::from_value::<AppCompose>(serde_json::json!({
+            "manifest_version": "3",
+            "name": "test",
+            "runner": "nerdctl-compose",
+            "snapshotter": "unknown"
+        }));
+        assert!(invalid.is_err());
     }
 
     #[test]
@@ -446,21 +1001,25 @@ mod app_compose_tests {
     }
 
     #[test]
-    fn requirements_support_os_version_and_platforms() {
+    fn requirements_support_platforms_and_policies() {
         let compose: AppCompose = serde_json::from_value(serde_json::json!({
             "manifest_version": "3",
             "name": "test",
             "runner": "docker-compose",
             "requirements": {
-                "os_version": ">=0.6.1",
                 "platforms": ["dstack-gcp-tdx", "dstack-tdx"],
                 "tdx_measure_acpi_tables": true,
-                "launch_token_hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                "launch_token_hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "gpu_policy": {
+                    "rego": "package policy\n\ndefault nv_match = false\n",
+                    "allow_devtools": true,
+                    "allow_debug": true,
+                    "allow_insecure_boot": true
+                }
             }
         }))
         .unwrap();
         let requirements = compose.requirements.as_ref().unwrap();
-        assert_eq!(requirements.os_version.as_deref(), Some(">=0.6.1"));
         assert_eq!(
             requirements.platforms,
             Some(vec!["dstack-gcp-tdx".to_string(), "dstack-tdx".to_string()])
@@ -470,13 +1029,22 @@ mod app_compose_tests {
             requirements.launch_token_hash.as_deref(),
             Some("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
         );
+        let gpu_policy = &requirements.gpu_policy;
+        assert!(gpu_policy.attest_gpu);
+        assert_eq!(
+            gpu_policy.rego.as_deref(),
+            Some("package policy\n\ndefault nv_match = false\n")
+        );
+        assert!(gpu_policy.allow_devtools);
+        assert!(gpu_policy.allow_debug);
+        assert!(gpu_policy.allow_insecure_boot);
 
         let err = serde_json::from_value::<AppCompose>(serde_json::json!({
             "manifest_version": "3",
             "name": "test",
             "runner": "docker-compose",
             "requirements": {
-                "os_version_policy": ">=0.6.1"
+                "os_version": ">=0.6.1"
             }
         }))
         .unwrap_err();
@@ -494,7 +1062,10 @@ mod app_compose_tests {
         .unwrap();
         let requirements = omitted.requirements.as_ref().unwrap();
         assert_eq!(requirements.platforms, None);
+        assert!(requirements.gpu_policy.is_default());
         assert!(requirements.is_empty());
+        let serialized = serde_json::to_value(requirements).unwrap();
+        assert!(serialized.get("gpu_policy").is_none());
 
         let explicit_empty: AppCompose = serde_json::from_value(serde_json::json!({
             "manifest_version": "3",
@@ -534,17 +1105,45 @@ mod app_compose_tests {
         let requirements = launch_token.requirements.as_ref().unwrap();
         assert!(requirements.launch_token_hash.is_some());
         assert!(!requirements.is_empty());
+
+        let gpu_policy: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": "3",
+            "name": "test",
+            "runner": "docker-compose",
+            "requirements": {
+                "gpu_policy": {
+                    "rego": "package policy\n\ndefault nv_match = false\n"
+                }
+            }
+        }))
+        .unwrap();
+        let requirements = gpu_policy.requirements.as_ref().unwrap();
+        let gpu_policy = &requirements.gpu_policy;
+        assert!(gpu_policy.attest_gpu);
+        assert!(gpu_policy.rego.is_some());
+        assert!(!gpu_policy.allow_devtools);
+        assert!(!gpu_policy.allow_debug);
+        assert!(!gpu_policy.allow_insecure_boot);
+        assert!(!requirements.is_empty());
+
+        let err = serde_json::from_value::<AppCompose>(serde_json::json!({
+            "manifest_version": "3",
+            "name": "test",
+            "runner": "docker-compose",
+            "requirements": {
+                "gpu_policy": {
+                    "rego": "package policy",
+                    "allow_debugger": true
+                }
+            }
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
     fn attest_gpu_defaults_to_true() {
-        let no_requirements: AppCompose = serde_json::from_value(serde_json::json!({
-            "manifest_version": 2,
-            "name": "test",
-            "runner": "docker-compose"
-        }))
-        .unwrap();
-        assert!(no_requirements.attest_gpu());
+        assert!(GpuPolicy::default().attest_gpu);
 
         let omitted: AppCompose = serde_json::from_value(serde_json::json!({
             "manifest_version": "3",
@@ -553,10 +1152,40 @@ mod app_compose_tests {
             "requirements": {}
         }))
         .unwrap();
-        assert!(omitted.attest_gpu());
-        assert!(omitted.requirements.as_ref().unwrap().is_empty());
+        let requirements = omitted.requirements.as_ref().unwrap();
+        assert!(requirements.gpu_policy.attest_gpu);
+        assert!(requirements.is_empty());
+
+        let explicit_empty: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": "3",
+            "name": "test",
+            "runner": "docker-compose",
+            "requirements": {
+                "gpu_policy": {}
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            explicit_empty.requirements.unwrap().gpu_policy,
+            requirements.gpu_policy
+        );
 
         let disabled: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": "3",
+            "name": "test",
+            "runner": "docker-compose",
+            "requirements": {
+                "gpu_policy": {
+                    "attest_gpu": false
+                }
+            }
+        }))
+        .unwrap();
+        let requirements = disabled.requirements.as_ref().unwrap();
+        assert!(!requirements.gpu_policy.attest_gpu);
+        assert!(!requirements.is_empty());
+
+        let old_location = serde_json::from_value::<AppCompose>(serde_json::json!({
             "manifest_version": "3",
             "name": "test",
             "runner": "docker-compose",
@@ -564,24 +1193,8 @@ mod app_compose_tests {
                 "attest_gpu": false
             }
         }))
-        .unwrap();
-        assert!(!disabled.attest_gpu());
-        let requirements = disabled.requirements.as_ref().unwrap();
-        assert_eq!(requirements.attest_gpu, Some(false));
-        assert!(!requirements.is_empty());
-
-        // The opt-out is ignored on legacy manifests (requirements are only
-        // valid on manifest_version >= 3; guests reject such composes anyway).
-        let legacy_optout: AppCompose = serde_json::from_value(serde_json::json!({
-            "manifest_version": 2,
-            "name": "test",
-            "runner": "docker-compose",
-            "requirements": {
-                "attest_gpu": false
-            }
-        }))
-        .unwrap();
-        assert!(legacy_optout.attest_gpu());
+        .unwrap_err();
+        assert!(old_location.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -605,7 +1218,22 @@ pub struct SysConfig {
     pub kms_urls: Vec<String>,
     #[serde(default, alias = "tproxy_urls")]
     pub gateway_urls: Vec<String>,
-    pub pccs_url: Option<String>,
+    /// Independently operated gateway clusters. URLs within one entry are
+    /// failover endpoints for the same cluster. When empty, `gateway_urls` is
+    /// treated as one legacy cluster.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateway_clusters: Vec<GatewayClusterConfig>,
+    /// Backward-compatible input for sys-config files produced by older hosts.
+    #[serde(default, rename = "pccs_url", skip_serializing)]
+    legacy_pccs_url: Option<String>,
+    /// Attestation collateral service endpoints. Platform defaults are used
+    /// for fields that are absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collateral_urls: Option<CollateralUrls>,
+    /// Optional NVIDIA attestation collateral proxy. When present, nvattest
+    /// fetches both OCSP responses and RIM documents through this endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvidia_attestation_proxy_url: Option<String>,
     pub docker_registry: Option<String>,
     pub host_api_url: Option<String>,
     /// MrConfigV3 document string for platform app/config binding.
@@ -617,6 +1245,141 @@ pub struct SysConfig {
     pub mr_config: Option<String>,
     // JSON serialized VmConfig
     pub vm_config: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayClusterConfig {
+    /// Stable local name used for the per-cluster key cache.
+    pub name: String,
+    /// Failover RPC endpoints belonging to this cluster.
+    pub urls: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollateralUrls {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pccs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amd_kds: Option<String>,
+}
+
+impl SysConfig {
+    pub fn collateral_urls(&self) -> CollateralUrls {
+        let mut urls = self.collateral_urls.clone().unwrap_or_default();
+        if urls.pccs.is_none() {
+            urls.pccs.clone_from(&self.legacy_pccs_url);
+        }
+        urls
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct TeeSimulatorConfig {
+    /// Platform ABI exposed by dstack-tee-simulator. Defaults to `dstack-tdx`.
+    #[serde(default)]
+    pub platform: TeeVariant,
+    /// Hex-encoded 32-byte development PKI seed. The host collateral service
+    /// and guest simulator must receive the same seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mock_attestation_seed: Option<String>,
+    /// Base URL used in mock collateral certificates (AIA/CRL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collateral_base_url: Option<String>,
+    /// MrConfigV3 document used to generate mock platform evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mr_config: Option<String>,
+    /// JSON serialized VmConfig used to generate mock platform evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_config: Option<String>,
+    /// Ordered SHA-384 PCR extensions used to reproduce the AWS boot state in
+    /// the development NitroTPM simulator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_pcr_replay: Option<AwsPcrReplay>,
+    /// Image-specific GCP TPM event log replayed by the development simulator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gcp_tpm_replay: Option<GcpTpmReplay>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct GcpTpmReplay {
+    #[serde(with = "serde_human_bytes::base64")]
+    pub event_log: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AwsPcrReplay {
+    pub version: u32,
+    pub events: Vec<AwsPcrReplayEvent>,
+    #[serde(with = "hex_bytes")]
+    pub pcr4: Vec<u8>,
+    #[serde(with = "hex_bytes")]
+    pub pcr7: Vec<u8>,
+    #[serde(with = "hex_bytes")]
+    pub pcr12: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AwsPcrReplayEvent {
+    pub pcr: u16,
+    pub event_type: String,
+    #[serde(with = "hex_bytes")]
+    pub digest: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
+pub enum TeeVariant {
+    #[default]
+    #[serde(rename = "dstack-tdx")]
+    DstackTdx,
+    #[serde(rename = "dstack-gcp-tdx")]
+    DstackGcpTdx,
+    #[serde(rename = "dstack-nitro-enclave")]
+    DstackNitroEnclave,
+    #[serde(rename = "dstack-amd-sev-snp")]
+    DstackAmdSevSnp,
+    #[serde(rename = "dstack-aws-nitro-tpm")]
+    DstackAwsNitroTpm,
+}
+
+impl TeeVariant {
+    pub fn has_tdx(self) -> bool {
+        matches!(self, Self::DstackTdx | Self::DstackGcpTdx)
+    }
+
+    pub fn tpm_event_pcr_and_bank(self) -> Option<(u32, &'static str)> {
+        match self {
+            Self::DstackGcpTdx => Some((14, "sha256")),
+            Self::DstackAwsNitroTpm => Some((14, "sha384")),
+            Self::DstackTdx | Self::DstackAmdSevSnp | Self::DstackNitroEnclave => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DstackTdx => "dstack-tdx",
+            Self::DstackGcpTdx => "dstack-gcp-tdx",
+            Self::DstackAmdSevSnp => "dstack-amd-sev-snp",
+            Self::DstackNitroEnclave => "dstack-nitro-enclave",
+            Self::DstackAwsNitroTpm => "dstack-aws-nitro-tpm",
+        }
+    }
+}
+
+impl std::str::FromStr for TeeVariant {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "dstack-tdx" => Ok(Self::DstackTdx),
+            "dstack-gcp-tdx" => Ok(Self::DstackGcpTdx),
+            "dstack-amd-sev-snp" => Ok(Self::DstackAmdSevSnp),
+            "dstack-nitro-enclave" => Ok(Self::DstackNitroEnclave),
+            "dstack-aws-nitro-tpm" => Ok(Self::DstackAwsNitroTpm),
+            _ => Err(format!("unsupported TEE variant: {value}")),
+        }
+    }
 }
 
 impl SysConfig {
@@ -652,6 +1415,14 @@ fn is_default_num_nics(n: &u32) -> bool {
     *n == default_num_nics()
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct VmConfig {
     #[serde(with = "hex_bytes", default)]
@@ -685,6 +1456,15 @@ pub struct VmConfig {
         skip_serializing_if = "is_default_num_nics"
     )]
     pub num_nics: u32,
+    /// Number of read-only verity volume devices attached to the guest. Each
+    /// volume adds a virtio-blk PCI device before the NICs and therefore
+    /// changes the measured ACPI/DSDT layout.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub num_verity_volumes: u32,
+    /// Whether QEMU attaches a software TPM device. The TPM changes the ACPI
+    /// table layout and must therefore be included in TDX measurement inputs.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub swtpm: bool,
     #[serde(default)]
     pub hotplug_off: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -704,10 +1484,14 @@ pub struct VmConfig {
     #[serde(default, skip_serializing_if = "TdxAttestationVariant::is_legacy")]
     pub tdx_attestation_variant: TdxAttestationVariant,
     /// TDX-only no-image-download measurement material. Attached whenever
-    /// the OS image provides it, regardless of `tdx_attestation_variant`, so
-    /// a verifier can choose lite verification even for a boot that resolved
-    /// to `Legacy`. Omitted only when the image predates this measurement
-    /// material.
+    /// the OS image provides it, regardless of `tdx_attestation_variant`, and
+    /// omitted only when the image predates this measurement material.
+    ///
+    /// Its presence does not select lite verification: `tdx_attestation_variant`
+    /// alone does. A `Legacy` boot is verified through the image download even
+    /// when this document is attached, because the two paths disagree on what
+    /// `os_image_hash` means and honoring the document would move a boot the
+    /// app pinned to `Legacy` onto the weaker image-identity check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tdx_measurement: Option<TdxOsImageMeasurementDocument>,
     /// GCP TDX no-image-download measurement material. Present for GCP
@@ -1231,20 +2015,37 @@ impl SevOsImageMeasurementDocument {
 pub struct TdxOsImageMeasurement {
     pub image: TdxImageMeasurement,
     pub tdvf: TdxTdvfMeasurement,
+    /// Whether this image's OVMF normalizes the Linux setup header before
+    /// measuring the kernel, which decides what
+    /// [`TdxImageMeasurement::kernel_authenticode`] covers.
+    ///
+    /// Omitted from the CBOR when false, so a document from before the
+    /// normalization existed re-encodes byte for byte and keeps its
+    /// `os_image_hash`.
+    #[serde(default)]
+    pub kernel_header_normalized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TdxImageMeasurement {
-    /// SHA-384 of the exact kernel command line event measured into RTMR[2].
+    /// The image-provided kernel command line, without OVMF's `initrd=initrd`
+    /// suffix.
     ///
-    /// The measured value is the image-provided command line plus OVMF/QEMU's
-    /// `initrd=initrd` suffix, encoded as UTF-16LE with a trailing NUL.
-    #[serde(with = "hex_bytes")]
-    pub kernel_cmdline_sha384: Vec<u8>,
-    /// Authenticode SHA-384 digest of the QEMU-patched kernel image when the
-    /// guest memory is at or above QEMU's high-memory TDX initrd placement
-    /// threshold. Below that threshold the patched kernel header depends on the
-    /// exact guest memory size, so the no-image-download verifier rejects it.
+    /// The RTMR[2] command-line event is derived from this, so the document is
+    /// self-describing: a verifier that never downloads the image can still
+    /// report the effective command line and check what it pins, notably
+    /// `dstack.rootfs_hash`. This supersedes the `kernel_cmdline_sha384` digest
+    /// carried by version 3, which could not be turned back into a string.
+    pub base_cmdline: String,
+    /// Authenticode SHA-384 digest of the kernel image OVMF measures into
+    /// RTMR[1]. Which bytes that covers is
+    /// [`TdxOsImageMeasurement::kernel_header_normalized`].
+    ///
+    /// When the header is not normalized it is QEMU's rewritten copy, computed
+    /// at or above QEMU's high-memory TDX initrd placement threshold; below
+    /// that threshold the rewritten header depends on the exact guest memory
+    /// size, so the no-image-download verifier rejects those sizes. When it is
+    /// normalized it is the kernel file as shipped, with no such restriction.
     #[serde(with = "hex_bytes")]
     pub kernel_authenticode: Vec<u8>,
     /// SHA-384 of the initrd file bytes. This is the second RTMR[2] event.
@@ -1274,12 +2075,20 @@ pub struct TdxMrtdCandidates {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CborTdxImageMeasurement {
-    /// Measured kernel cmdline SHA-384.
-    #[serde(rename = "cmdline_sha384", with = "hex_bytes")]
-    kernel_cmdline_sha384: Vec<u8>,
-    /// QEMU-patched kernel Authenticode SHA-384.
+    /// Image-provided kernel cmdline, without OVMF's `initrd=initrd` suffix.
+    /// Named to match `CborSevOsImageMeasurement`, which already carries the
+    /// equivalent string under the same key.
+    #[serde(rename = "cmdline")]
+    base_cmdline: String,
+    /// Kernel Authenticode SHA-384. Covers QEMU's rewritten copy, or the
+    /// kernel file as shipped when `kernel_header_normalized` is set.
     #[serde(with = "hex_bytes")]
     kernel_authenticode: Vec<u8>,
+    /// Whether the image's OVMF normalizes the Linux setup header before
+    /// measuring. Omitted when false, so documents from before this existed
+    /// encode and decode unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    kernel_header_normalized: bool,
     /// Initrd SHA-384.
     #[serde(with = "hex_bytes")]
     initrd_sha384: Vec<u8>,
@@ -1314,8 +2123,9 @@ impl From<&TdxOsImageMeasurement> for CborTdxOsImageMeasurement {
         Self {
             version: TdxOsImageMeasurement::VERSION,
             image: CborTdxImageMeasurement {
-                kernel_cmdline_sha384: measurement.image.kernel_cmdline_sha384.clone(),
+                base_cmdline: measurement.image.base_cmdline.clone(),
                 kernel_authenticode: measurement.image.kernel_authenticode.clone(),
+                kernel_header_normalized: measurement.kernel_header_normalized,
                 initrd_sha384: measurement.image.initrd_sha384.clone(),
             },
             tdvf: CborTdxTdvfMeasurement {
@@ -1333,8 +2143,9 @@ impl From<&TdxOsImageMeasurement> for CborTdxOsImageMeasurement {
 impl From<CborTdxOsImageMeasurement> for TdxOsImageMeasurement {
     fn from(measurement: CborTdxOsImageMeasurement) -> Self {
         Self {
+            kernel_header_normalized: measurement.image.kernel_header_normalized,
             image: TdxImageMeasurement {
-                kernel_cmdline_sha384: measurement.image.kernel_cmdline_sha384,
+                base_cmdline: measurement.image.base_cmdline,
                 kernel_authenticode: measurement.image.kernel_authenticode,
                 initrd_sha384: measurement.image.initrd_sha384,
             },
@@ -1362,9 +2173,25 @@ pub struct TdxOsImageMeasurementDocument {
 }
 
 impl TdxOsImageMeasurement {
-    pub const VERSION: u32 = 3;
+    /// Version 4 replaced the `cmdline_sha384` digest with the `cmdline`
+    /// string. Version 3 only ever shipped in v0.6.0 release candidates, so it
+    /// is rejected rather than carried forward.
+    pub const VERSION: u32 = 4;
+
+    /// `COMMAND_LINE_SIZE` on x86_64. A longer string cannot be the command
+    /// line any TDX guest booted with, so a document carrying one is malformed
+    /// rather than merely wrong.
+    ///
+    /// This is a contract check, not a resource guard: the document already
+    /// arrives inside an attestation bounded well below anything worth
+    /// defending against. What it buys is the error. Without it an oversized
+    /// string is measured like any other and rejected as an `RTMR2 mismatch`,
+    /// which points at the quote instead of at the document. It also restores
+    /// the length check the version 3 digest field carried.
+    const MAX_CMDLINE_LEN: usize = 2048;
 
     /// CBOR representation stored as `measurement.tdx.cbor`.
+    ///
     pub fn to_cbor_vec(&self) -> Vec<u8> {
         cbor_to_vec(
             &CborTdxOsImageMeasurement::from(self),
@@ -1376,9 +2203,20 @@ impl TdxOsImageMeasurement {
         let cbor = cbor_from_slice::<CborTdxOsImageMeasurement>(bytes, "TdxOsImageMeasurement")?;
         if cbor.version != Self::VERSION {
             return Err(format!(
-                "TdxOsImageMeasurement: unsupported version {}, expected {}",
+                "TdxOsImageMeasurement: unsupported version {}, expected {}. \
+                 rebuild the image so measurement.tdx.cbor carries the kernel \
+                 command line, then re-register its os_image_hash.",
                 cbor.version,
                 Self::VERSION
+            ));
+        }
+        let cmdline_len = cbor.image.base_cmdline.len();
+        if cmdline_len > Self::MAX_CMDLINE_LEN {
+            return Err(format!(
+                "TdxOsImageMeasurement: kernel command line is {} bytes, over the {} \
+                 byte x86_64 COMMAND_LINE_SIZE",
+                cmdline_len,
+                Self::MAX_CMDLINE_LEN
             ));
         }
         Ok(cbor.into())
@@ -1578,6 +2416,11 @@ pub struct ImageInfo {
     /// fall back to version-based heuristics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ovmf_variant: Option<OvmfVariant>,
+    /// Whether this image's OVMF normalizes the Linux setup header before
+    /// measuring the kernel, which decides what RTMR[1] covers. Absent on
+    /// every image built before that landed, and `false` is their behavior.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub kernel_header_normalized: bool,
 }
 
 pub mod mr_config;
@@ -1620,6 +2463,7 @@ impl Platform {
         match product_name.map(str::trim) {
             Some("dstack" | "qemu") => return Some(Self::Dstack),
             Some("Google Compute Engine") => return Some(Self::Gcp),
+            Some("Nitro Enclave") => return Some(Self::NitroEnclave),
             _ => {}
         }
 
@@ -1631,11 +2475,12 @@ impl Platform {
 
     /// Detect platform from system DMI information
     pub fn detect() -> Option<Self> {
-        // Nitro Enclave: NSM device exists only inside enclave
+        // `/dev/nsm` is the authoritative Nitro Enclave ABI. Check it before
+        // DMI because an enclave may inherit EC2-identifying DMI strings from
+        // its parent host, while a regular EC2 instance does not expose NSM.
         if Path::new("/dev/nsm").exists() {
             return Some(Self::NitroEnclave);
         }
-
         let product_name = std::fs::read_to_string("/sys/class/dmi/id/product_name").ok();
         let sys_vendor = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor").ok();
         Self::detect_from_dmi(product_name.as_deref(), sys_vendor.as_deref())
@@ -1676,10 +2521,18 @@ mod platform_tests {
             Some(Platform::Gcp)
         );
     }
+
+    #[test]
+    fn detects_nitro_enclave_from_simulated_dmi() {
+        assert_eq!(
+            Platform::detect_from_dmi(Some("Nitro Enclave"), Some("AWS Nitro Enclaves")),
+            Some(Platform::NitroEnclave)
+        );
+    }
 }
 
 #[cfg(test)]
-mod vm_config_num_nics_tests {
+mod vm_config_device_count_tests {
     use super::VmConfig;
 
     fn legacy_json() -> serde_json::Value {
@@ -1695,6 +2548,7 @@ mod vm_config_num_nics_tests {
     fn legacy_config_without_num_nics_defaults_to_one() {
         let cfg: VmConfig = serde_json::from_value(legacy_json()).unwrap();
         assert_eq!(cfg.num_nics, 1);
+        assert_eq!(cfg.num_verity_volumes, 0);
     }
 
     #[test]
@@ -1716,5 +2570,309 @@ mod vm_config_num_nics_tests {
         cfg.num_nics = 2;
         let serialized = serde_json::to_value(&cfg).unwrap();
         assert_eq!(serialized.get("num_nics").and_then(|v| v.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn verity_volume_count_is_serialized_only_when_nonzero() {
+        let mut cfg: VmConfig = serde_json::from_value(legacy_json()).unwrap();
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        assert!(serialized.get("num_verity_volumes").is_none());
+
+        cfg.num_verity_volumes = 2;
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            serialized
+                .get("num_verity_volumes")
+                .and_then(|v| v.as_u64()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn swtpm_is_serialized_only_when_enabled() {
+        let mut cfg: VmConfig = serde_json::from_value(legacy_json()).unwrap();
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        assert!(serialized.get("swtpm").is_none());
+
+        cfg.swtpm = true;
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            serialized.get("swtpm").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_sanitize_tests {
+    use super::sanitize_for_log;
+
+    #[test]
+    fn strips_the_characters_that_forge_a_log_line() {
+        let forged = sanitize_for_log("web\nJan 01 INFO all good", 512);
+        assert!(!forged.contains('\n'), "{forged:?}");
+        let escaped = sanitize_for_log("\u{1b}[2Jcleared", 512);
+        assert!(!escaped.contains('\u{1b}'), "{escaped:?}");
+    }
+
+    /// `char::is_control` is category Cc only, so these get through it -- and a
+    /// log viewer, or anything JSON downstream of one, treats them as breaks.
+    #[test]
+    fn strips_the_unicode_line_separators() {
+        for separator in ['\u{2028}', '\u{2029}', '\u{85}'] {
+            let out = sanitize_for_log(&format!("web{separator}forged"), 512);
+            assert!(!out.contains(separator), "{separator:?} survived: {out:?}");
+        }
+    }
+
+    /// U+202E reverses how everything after it renders, so an attacker decides
+    /// what a reader sees without controlling the bytes.
+    #[test]
+    fn strips_bidi_overrides() {
+        for bidi in ['\u{202E}', '\u{202A}', '\u{2066}', '\u{200F}', '\u{FEFF}'] {
+            let out = sanitize_for_log(&format!("web{bidi}txet"), 512);
+            assert!(!out.contains(bidi), "{bidi:?} survived: {out:?}");
+        }
+    }
+
+    /// Bounded in bytes, not characters. Counting characters lets a multi-byte
+    /// string reach four times the intended size.
+    #[test]
+    fn bounds_bytes_not_characters() {
+        let wide = "\u{1d54f}".repeat(400);
+        assert_eq!(wide.chars().count(), 400);
+        assert_eq!(wide.len(), 1600);
+        let out = sanitize_for_log(&wide, 512);
+        assert!(out.len() <= 512 + "... (truncated)".len(), "{}", out.len());
+    }
+
+    /// A bound that silently clips is worse than a short one: the reader cannot
+    /// tell a complete reason from a cut one.
+    #[test]
+    fn says_when_it_truncated() {
+        let wide = "\u{1d54f}".repeat(400);
+        assert!(sanitize_for_log(&wide, 512).ends_with("(truncated)"));
+        assert!(!sanitize_for_log("web is starting", 512).ends_with("(truncated)"));
+    }
+
+    #[test]
+    fn never_splits_a_character() {
+        // 512 is not a multiple of 4, so a naive byte cut would split one.
+        let wide = "\u{1d54f}".repeat(400);
+        let out = sanitize_for_log(&wide, 512);
+        let body = out.trim_end_matches("... (truncated)");
+        assert!(body.is_char_boundary(body.len()));
+        assert_eq!(body.len() % 4, 0);
+    }
+
+    #[test]
+    fn ordinary_text_is_left_alone() {
+        assert_eq!(sanitize_for_log("web is starting", 512), "web is starting");
+    }
+}
+
+#[cfg(test)]
+mod appcompose_sdk_parity {
+    use super::*;
+
+    /// Every field `AppCompose` serializes, in sorted order.
+    ///
+    /// This exists to break when someone adds a field, so that the SDKs get
+    /// updated in the same change. What the SDKs compute is a compose hash that
+    /// gets whitelisted on chain, so a field they drop means the digest
+    /// describes an app-compose that is not the one being deployed -- and
+    /// nothing anywhere notices.
+    ///
+    /// All four are now *correct* without help: Go and Python keep unrecognised
+    /// keys in a catch-all, and JS's interface has an index signature and is
+    /// hashed from the object at runtime. So a missed field costs ergonomics
+    /// rather than correctness -- a user cannot name it with a type. That is
+    /// still worth fixing, in the same change, which is what this test is for.
+    ///
+    /// If it fails: add the field to `sdk/go/dstack/compose_hash.go`,
+    /// `sdk/js/src/get-compose-hash.ts` and
+    /// `sdk/python/src/dstack_sdk/get_compose_hash.py`, then update the list.
+    #[test]
+    fn every_serialized_field_is_accounted_for() {
+        let expected = [
+            "allowed_envs",
+            "event_log_version",
+            "features",
+            "gateway_enabled",
+            "init_script",
+            "key_provider",
+            "key_provider_id",
+            "kms_enabled",
+            "local_key_provider_enabled",
+            "manifest_version",
+            "name",
+            "no_instance_id",
+            "port_policy",
+            "public_logs",
+            "public_sysinfo",
+            "public_tcbinfo",
+            "requirements",
+            "runner",
+            "secure_time",
+            "storage_discard",
+            "storage_fs",
+            "swap_size",
+            "verity_volumes",
+        ];
+
+        // Every optional field populated, so nothing is skipped by
+        // `skip_serializing_if`.
+        let populated: AppCompose = serde_json::from_value(serde_json::json!({
+            "manifest_version": "3",
+            "name": "demo",
+            "runner": "docker-compose",
+            "docker_compose_file": "services: {}\n",
+            "init_script": ["a.sh"],
+            "storage_fs": "ext4",
+            "storage_discard": false,
+            "swap_size": "2G",
+            "event_log_version": 2,
+            "port_policy": {"ports": [{"port": 8080, "pp": true}], "restrict_mode": true},
+            "verity_volumes": [{
+                "source": "v.img",
+                "verity_root": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                "target": "/mnt/v",
+            }],
+            "requirements": {"platforms": ["dstack-tdx"]},
+            "snapshotter": "overlayfs",
+        }))
+        .expect("the fixture must stay parseable");
+
+        let serde_json::Value::Object(map) = serde_json::to_value(&populated).expect("serialize")
+        else {
+            panic!("AppCompose must serialize as an object");
+        };
+        let mut actual = map.keys().cloned().collect::<Vec<_>>();
+        actual.sort();
+        // Fields whose presence depends on the fixture rather than on the type.
+        actual.retain(|key| !matches!(key.as_str(), "docker_compose_file" | "snapshotter"));
+
+        assert_eq!(
+            actual, expected,
+            "AppCompose gained or lost a field. The Go and JS SDKs declare this \
+             type as a closed struct, so a field they do not know is silently \
+             dropped from the compose hash they compute -- and that hash is what \
+             gets whitelisted on chain. Update sdk/go and sdk/js, then this list."
+        );
+    }
+}
+
+#[cfg(test)]
+mod image_info_tests {
+    use super::*;
+
+    /// The image-download verification path reads this out of metadata.json to
+    /// decide which kernel bytes RTMR[1] covers. If the field goes missing here
+    /// the parse still succeeds and every normalized image is measured the old
+    /// way, which is a silent attestation failure.
+    #[test]
+    fn metadata_declares_whether_the_kernel_header_is_normalized() {
+        let base = r#"{"cmdline":"c","kernel":"bzImage","initrd":"i","bios":"b""#;
+        let normalized: ImageInfo =
+            serde_json::from_str(&format!("{base},\"kernel_header_normalized\":true}}")).unwrap();
+        assert!(normalized.kernel_header_normalized);
+
+        // Every image built before the field existed omits it.
+        let legacy: ImageInfo = serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert!(!legacy.kernel_header_normalized);
+    }
+}
+
+#[cfg(test)]
+mod tdx_measurement_cbor_tests {
+    use super::*;
+
+    fn measurement(kernel_header_normalized: bool) -> TdxOsImageMeasurement {
+        TdxOsImageMeasurement {
+            kernel_header_normalized,
+            image: TdxImageMeasurement {
+                base_cmdline: "console=ttyS0 dstack.rootfs_hash=11".to_string(),
+                kernel_authenticode: vec![0x22; 48],
+                initrd_sha384: vec![0x33; 48],
+            },
+            tdvf: TdxTdvfMeasurement {
+                ovmf_variant: OvmfVariant::default(),
+                mrtd: TdxMrtdCandidates {
+                    single_pass: vec![0x44; 48],
+                    two_pass: vec![0x55; 48],
+                },
+                td_hob_witness: vec![0x01, 0x02, 0x03],
+            },
+        }
+    }
+
+    /// A command line longer than the kernel could ever have been handed is a
+    /// malformed document, and saying so beats measuring it and reporting an
+    /// RTMR[2] mismatch that points at the quote instead.
+    #[test]
+    fn an_oversized_command_line_is_rejected_by_name() {
+        let mut oversized = measurement(true);
+        oversized.image.base_cmdline = "a".repeat(TdxOsImageMeasurement::MAX_CMDLINE_LEN + 1);
+        let err = TdxOsImageMeasurement::from_cbor_slice(&oversized.to_cbor_vec())
+            .expect_err("an oversized command line must not decode");
+        assert!(err.contains("COMMAND_LINE_SIZE"), "{err}");
+
+        // The bound itself still decodes, so it rejects nothing a guest could
+        // actually have booted with.
+        let mut at_limit = measurement(true);
+        at_limit.image.base_cmdline = "a".repeat(TdxOsImageMeasurement::MAX_CMDLINE_LEN);
+        TdxOsImageMeasurement::from_cbor_slice(&at_limit.to_cbor_vec())
+            .expect("the limit itself is valid");
+    }
+
+    /// Which kernel bytes the digest covers has to survive a round trip in
+    /// both directions.
+    #[test]
+    fn the_kernel_header_flag_round_trips() {
+        for normalized in [false, true] {
+            let original = measurement(normalized);
+            let decoded = TdxOsImageMeasurement::from_cbor_slice(&original.to_cbor_vec()).unwrap();
+            assert_eq!(decoded, original);
+            assert_eq!(decoded.kernel_header_normalized, normalized);
+        }
+    }
+
+    /// The flag is omitted when false, so a document from before the
+    /// normalization existed encodes to the same bytes it always did. Those
+    /// bytes are what `sha256sum.txt` -- and therefore `os_image_hash` --
+    /// commits to, and the document shape did not change, so the version does
+    /// not move either.
+    #[test]
+    fn a_pre_normalization_document_does_not_drift() {
+        let cbor = measurement(false).to_cbor_vec();
+        assert!(
+            !cbor.windows(24).any(|w| w == b"kernel_header_normalized"),
+            "the flag must not appear in a pre-normalization document"
+        );
+        let value = TdxOsImageMeasurement::cbor_json_value_from_slice(&cbor).unwrap();
+        assert_eq!(
+            value["version"],
+            serde_json::json!(TdxOsImageMeasurement::VERSION)
+        );
+        let twice = TdxOsImageMeasurement::from_cbor_slice(&cbor)
+            .unwrap()
+            .to_cbor_vec();
+        assert_eq!(cbor, twice);
+    }
+
+    #[test]
+    fn unknown_versions_are_rejected() {
+        // CBOR stores the version as the single unsigned byte following the
+        // "version" key, so rewriting it forges another version.
+        let key = [0x67, b'v', b'e', b'r', b's', b'i', b'o', b'n'];
+        let mut cbor = measurement(true).to_cbor_vec();
+        let at = cbor
+            .windows(key.len())
+            .position(|window| window == key)
+            .expect("encoded document contains a version key");
+        cbor[at + key.len()] = 2;
+
+        let err = TdxOsImageMeasurement::from_cbor_slice(&cbor).unwrap_err();
+        assert!(err.contains("unsupported version 2"), "unexpected: {err}");
     }
 }

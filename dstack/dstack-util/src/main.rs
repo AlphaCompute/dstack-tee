@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use dstack_attest::emit_runtime_event;
 use dstack_types::{KeyProvider, KeyProviderKind};
 use fs_err as fs;
+use gateway_checker::{cmd_gateway_checker, GatewayCheckerArgs};
 use getrandom::fill as getrandom;
 use host_api::HostApi;
 use k256::schnorr::SigningKey;
@@ -17,6 +18,7 @@ use ra_tls::{
     kdf::{derive_key, derive_p256_key_pair_from_bytes},
     rcgen::KeyPair,
 };
+use safe_write::{safe_write, safe_write_with_mode};
 use scale::Encode;
 use std::path::Path;
 use std::{
@@ -29,7 +31,10 @@ use utils::AppKeys;
 
 mod crypto;
 mod docker_compose;
+mod gateway_checker;
+mod gpu_info;
 mod host_api;
+mod host_shared;
 mod parse_env_file;
 mod system_setup;
 mod utils;
@@ -66,8 +71,12 @@ enum Commands {
     Rand(RandArgs),
     /// Prepare dstack system.
     Setup(SetupArgs),
+    /// Mount or unmount the host-provided shared directory.
+    HostShared(host_shared::HostSharedArgs),
     /// Refresh the dstack gateway configuration
     GatewayRefresh(GatewayRefreshArgs),
+    /// Keep the dstack gateway registration fresh (long-running)
+    GatewayChecker(GatewayCheckerArgs),
     /// Notify the host about the dstack app
     NotifyHost(HostNotifyArgs),
     /// Remove orphaned containers
@@ -89,6 +98,12 @@ enum Commands {
     AttestStrip(AttestStripArgs),
     /// Get app keys from a KMS server
     GetKeys(GetKeysArgs),
+    /// Decrypt data encrypted with the app's environment encryption public key
+    Decrypt(DecryptArgs),
+    /// Encrypt data for an app using its KMS-provided environment encryption key
+    Encrypt(EncryptArgs),
+    /// Sample NVIDIA GPU telemetry through NVML and print it as JSON
+    GpuInfo,
 }
 
 #[derive(Parser)]
@@ -358,6 +373,62 @@ struct GetKeysArgs {
     root_ca: Option<PathBuf>,
 }
 
+#[derive(Parser)]
+/// Decrypt data encrypted with the app's environment encryption public key
+struct DecryptArgs {
+    /// Input file (default: stdin)
+    #[arg(short, long)]
+    input: Option<PathBuf>,
+
+    /// Output file (default: stdout)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// App keys file containing env_crypt_key
+    #[arg(long)]
+    key_file: Option<PathBuf>,
+
+    /// Decode the input as hexadecimal text before decrypting
+    #[arg(long)]
+    hex: bool,
+}
+
+#[derive(Parser)]
+/// Encrypt data for an app using its KMS-provided environment encryption key
+struct EncryptArgs {
+    /// KMS server URL
+    #[arg(short, long)]
+    kms_url: String,
+
+    /// Application ID (20 bytes in hex)
+    #[arg(long)]
+    app_id: String,
+
+    /// Input file (default: stdin)
+    #[arg(short, long)]
+    input: Option<PathBuf>,
+
+    /// Output file (default: stdout)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Plaintext bytes per independently authenticated chunk
+    #[arg(long, default_value_t = crypto::DEFAULT_CHUNK_SIZE)]
+    chunk_size: usize,
+
+    /// Root CA certificate (PEM format) used to verify the KMS TLS certificate
+    #[arg(long)]
+    root_ca: Option<PathBuf>,
+
+    /// Trusted compressed secp256k1 KMS signer public key (hex)
+    #[arg(long)]
+    kms_pubkey: String,
+
+    /// Maximum accepted age of the KMS public-key signature in seconds
+    #[arg(long, default_value_t = 300)]
+    max_signature_age: u64,
+}
+
 fn pad64(data: &[u8]) -> Result<[u8; 64]> {
     if data.len() > 64 {
         anyhow::bail!("report_data must be at most 64 bytes");
@@ -379,7 +450,11 @@ fn cmd_quote_report(args: QuoteReportArgs) -> Result<()> {
         }
         None => [0u8; 64],
     };
-    let attestation = Attestation::quote(&report_data).context("Failed to get attestation")?;
+    if args.debug {
+        eprintln!("debug: quote diagnostics enabled; attestation policy is unchanged");
+    }
+    let attestation = Attestation::quote_with_sys_config(&report_data, &args.sys_config)
+        .context("Failed to get attestation")?;
     let request = VerificationRequestJson {
         attestation: hex::encode(attestation.into_versioned().to_scale()?),
     };
@@ -387,7 +462,7 @@ fn cmd_quote_report(args: QuoteReportArgs) -> Result<()> {
     let json =
         serde_json::to_string_pretty(&request).context("Failed to serialize request JSON")?;
     if let Some(output_path) = args.output {
-        fs::write(&output_path, json).context("Failed to write quote report")?;
+        safe_write::safe_write(&output_path, json).context("Failed to write quote report")?;
     } else {
         println!("{json}");
     }
@@ -422,7 +497,7 @@ fn cmd_attest(args: AttestArgs) -> Result<()> {
     if args.hex {
         let encoded = hex::encode(&attestation);
         if let Some(output) = args.output {
-            fs::write(&output, encoded).context("Failed to write attestation hex")?;
+            safe_write::safe_write(&output, encoded).context("Failed to write attestation hex")?;
         } else {
             println!("{encoded}");
         }
@@ -432,7 +507,7 @@ fn cmd_attest(args: AttestArgs) -> Result<()> {
     let output = args
         .output
         .unwrap_or_else(|| PathBuf::from("attestation.bin"));
-    fs::write(&output, &attestation).context("Failed to write attestation sample")?;
+    safe_write::safe_write(&output, &attestation).context("Failed to write attestation sample")?;
     Ok(())
 }
 
@@ -450,7 +525,7 @@ fn cmd_attest_info(args: AttestInfoArgs) -> Result<()> {
     match attestation {
         VersionedAttestation::V0 { attestation } => {
             println!("version: V0");
-            println!("mode: {:?}", attestation.quote.mode());
+            println!("mode: {:?}", attestation.quote.variant());
             println!("config_bytes: {}", attestation.config.len());
             match attestation.tdx_quote() {
                 Some(tdx) => {
@@ -495,7 +570,7 @@ fn cmd_attest_json(args: AttestJsonArgs) -> Result<()> {
 
     let json = match attestation {
         VersionedAttestation::V0 { attestation } => {
-            let mode = attestation.quote.mode().as_str();
+            let mode = attestation.quote.variant().as_str();
             let tdx_quote = match attestation.tdx_quote() {
                 Some(tdx) => serde_json::json!({
                     "quote": hex::encode(&tdx.quote),
@@ -523,7 +598,7 @@ fn cmd_attest_json(args: AttestJsonArgs) -> Result<()> {
 
     let output = serde_json::to_string_pretty(&json).context("Failed to serialize JSON")?;
     if let Some(path) = args.output {
-        fs::write(&path, output).context("Failed to write JSON output")?;
+        safe_write::safe_write(&path, output).context("Failed to write JSON output")?;
     } else {
         println!("{output}");
     }
@@ -541,7 +616,8 @@ fn cmd_attest_strip(args: AttestStripArgs) -> Result<()> {
     let output = args
         .output
         .unwrap_or_else(|| PathBuf::from("attestation.strip.bin"));
-    fs::write(&output, stripped.to_scale()?).context("Failed to write stripped attestation")?;
+    safe_write::safe_write(&output, stripped.to_scale()?)
+        .context("Failed to write stripped attestation")?;
     Ok(())
 }
 
@@ -549,11 +625,7 @@ async fn cmd_get_keys(args: GetKeysArgs) -> Result<()> {
     use dstack_kms_rpc::kms_client::KmsClient;
     use ra_rpc::client::RaClientConfig;
 
-    let kms_url = if args.kms_url.ends_with("/prpc") {
-        args.kms_url.clone()
-    } else {
-        format!("{}/prpc", args.kms_url.trim_end_matches('/'))
-    };
+    let kms_url = normalize_prpc_url(&args.kms_url);
 
     // Load root CA if provided for TLS pinning
     let root_ca_pem = if let Some(root_ca_path) = &args.root_ca {
@@ -640,7 +712,7 @@ async fn cmd_get_keys(args: GetKeysArgs) -> Result<()> {
     // Step 5: Output result
     let json = serde_json::to_string_pretty(&keys).context("Failed to serialize app keys")?;
     if let Some(output_path) = args.output {
-        fs::write(&output_path, &json).context("Failed to write app keys")?;
+        safe_write_with_mode(&output_path, &json, 0o600).context("Failed to write app keys")?;
         eprintln!("App keys written to: {}", output_path.display());
     } else {
         println!("{json}");
@@ -649,11 +721,239 @@ async fn cmd_get_keys(args: GetKeysArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_decrypt(args: DecryptArgs) -> Result<()> {
+    use dstack_types::shared_filenames::{host_shared_dir, APP_KEYS};
+
+    let key_file = args
+        .key_file
+        .unwrap_or_else(|| host_shared_dir().join(APP_KEYS));
+    let keys: AppKeys = utils::deserialize_json_file(&key_file)
+        .with_context(|| format!("failed to load app keys from {}", key_file.display()))?;
+    let env_crypt_key: [u8; 32] = keys
+        .env_crypt_key
+        .try_into()
+        .map_err(|key: Vec<u8>| anyhow::anyhow!("invalid env crypt key length: {}", key.len()))?;
+
+    if args.hex {
+        let input = read_all_input(args.input.as_deref())?;
+        let input = decode_hex_ciphertext(&input)?;
+        return decrypt_auto(
+            env_crypt_key,
+            input.as_slice(),
+            open_output(args.output.as_deref())?,
+        );
+    }
+
+    let input = open_input(args.input.as_deref())?;
+    decrypt_auto(env_crypt_key, input, open_output(args.output.as_deref())?)
+}
+
+fn decrypt_auto(
+    env_crypt_key: [u8; 32],
+    mut input: impl Read,
+    mut output: impl Write,
+) -> Result<()> {
+    let mut prefix = Vec::with_capacity(crypto::STREAM_MAGIC.len());
+    input
+        .by_ref()
+        .take(crypto::STREAM_MAGIC.len() as u64)
+        .read_to_end(&mut prefix)
+        .context("failed to read ciphertext")?;
+    if prefix == crypto::STREAM_MAGIC {
+        crypto::dh_decrypt_stream(env_crypt_key, input, output)
+            .context("failed to decrypt stream")?;
+    } else {
+        let mut ciphertext = prefix;
+        input
+            .read_to_end(&mut ciphertext)
+            .context("failed to read ciphertext")?;
+        let plaintext = crypto::dh_decrypt(env_crypt_key, &ciphertext)
+            .context("failed to decrypt legacy input")?;
+        output
+            .write_all(&plaintext)
+            .context("failed to write plaintext")?;
+    }
+    Ok(())
+}
+
+async fn cmd_encrypt(args: EncryptArgs) -> Result<()> {
+    use dstack_kms_rpc::kms_client::KmsClient;
+    use ra_rpc::client::RaClientConfig;
+
+    let app_id = decode_app_id(Some(&args.app_id))?.context("app_id is required")?;
+    let kms_url = normalize_prpc_url(&args.kms_url);
+    let root_ca_pem = args
+        .root_ca
+        .as_ref()
+        .map(|path| {
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read root CA from {}", path.display()))
+        })
+        .transpose()?;
+    let client = RaClientConfig::builder()
+        .remote_uri(kms_url)
+        .tls_no_check(false)
+        .tls_built_in_root_certs(root_ca_pem.is_none())
+        .maybe_tls_ca_cert(root_ca_pem)
+        .build()
+        .into_client()
+        .context("failed to create KMS client")?;
+    let response = KmsClient::new(client)
+        .get_app_env_encrypt_pub_key(dstack_kms_rpc::AppId {
+            app_id: app_id.to_vec(),
+        })
+        .await
+        .context("failed to get app environment encryption public key")?;
+    let public_key: [u8; 32] = response
+        .public_key
+        .try_into()
+        .map_err(|key: Vec<u8>| anyhow::anyhow!("invalid public key length: {}", key.len()))?;
+    verify_env_encrypt_public_key(
+        &public_key,
+        &response.signature_v1,
+        &app_id,
+        response.timestamp,
+        &args.kms_pubkey,
+        args.max_signature_age,
+    )?;
+
+    crypto::dh_encrypt_stream(
+        public_key,
+        open_input(args.input.as_deref())?,
+        open_output(args.output.as_deref())?,
+        args.chunk_size,
+    )
+    .context("failed to encrypt stream")
+}
+
+fn normalize_prpc_url(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    if url.ends_with("/prpc") {
+        url.to_string()
+    } else {
+        format!("{url}/prpc")
+    }
+}
+
+fn decode_hex_ciphertext(input: &[u8]) -> Result<Vec<u8>> {
+    hex_decode(
+        std::str::from_utf8(input)
+            .context("hex ciphertext is not valid UTF-8")?
+            .trim(),
+    )
+    .context("failed to decode hex ciphertext")
+}
+
+fn verify_env_encrypt_public_key(
+    public_key: &[u8; 32],
+    signature: &[u8],
+    app_id: &[u8; 20],
+    timestamp: u64,
+    trusted_pubkey: &str,
+    max_age: u64,
+) -> Result<()> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use sha3::{Digest, Keccak256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const FUTURE_SKEW: u64 = 60;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before the Unix epoch")?
+        .as_secs();
+    anyhow::ensure!(
+        timestamp <= now.saturating_add(FUTURE_SKEW),
+        "kms public-key signature timestamp is too far in the future"
+    );
+    anyhow::ensure!(
+        now.saturating_sub(timestamp) <= max_age,
+        "kms public-key signature is too old"
+    );
+    anyhow::ensure!(signature.len() == 65, "invalid KMS signature length");
+
+    let signature_value =
+        Signature::from_slice(&signature[..64]).context("invalid KMS signature")?;
+    let recovery_id = RecoveryId::from_byte(signature[64]).context("invalid KMS recovery ID")?;
+    let digest = Keccak256::new_with_prefix(
+        [
+            b"dstack-env-encrypt-pubkey".as_slice(),
+            b":".as_slice(),
+            app_id.as_slice(),
+            &timestamp.to_be_bytes(),
+            public_key.as_slice(),
+        ]
+        .concat(),
+    );
+    let recovered = VerifyingKey::recover_from_digest(digest, &signature_value, recovery_id)
+        .context("failed to recover KMS signer public key")?;
+
+    let trusted_pubkey = trusted_pubkey.strip_prefix("0x").unwrap_or(trusted_pubkey);
+    let trusted_pubkey =
+        hex_decode(trusted_pubkey).context("invalid trusted KMS public key hex")?;
+    let trusted =
+        VerifyingKey::from_sec1_bytes(&trusted_pubkey).context("invalid trusted KMS public key")?;
+    anyhow::ensure!(
+        recovered == trusted,
+        "kms public-key signature was made by an untrusted signer"
+    );
+    Ok(())
+}
+
+fn read_all_input(path: Option<&Path>) -> Result<Vec<u8>> {
+    let mut input = open_input(path)?;
+    let mut data = Vec::new();
+    input
+        .read_to_end(&mut data)
+        .context("failed to read input")?;
+    Ok(data)
+}
+
+fn open_input(path: Option<&Path>) -> Result<Box<dyn Read>> {
+    match path {
+        Some(path) => {
+            Ok(Box::new(fs::File::open(path).with_context(|| {
+                format!("failed to open input {}", path.display())
+            })?))
+        }
+        None => Ok(Box::new(io::stdin())),
+    }
+}
+
+fn open_output(path: Option<&Path>) -> Result<Box<dyn Write>> {
+    use fs_err::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    match path {
+        Some(path) => {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("failed to open output {}", path.display()))?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+            Ok(Box::new(file))
+        }
+        None => Ok(Box::new(io::stdout())),
+    }
+}
+
 fn cmd_quote() -> Result<()> {
-    let mut report_data = [0; 64];
+    let mut input = Vec::with_capacity(65);
     io::stdin()
-        .read_exact(&mut report_data)
+        .take(65)
+        .read_to_end(&mut input)
         .context("Failed to read report data")?;
+    anyhow::ensure!(
+        input.len() == 64,
+        "report data must be exactly 64 bytes (received {})",
+        input.len()
+    );
+    let report_data: [u8; 64] = input
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid report data length"))?;
     // Platform-adaptive: detect the running TEE and emit its raw hardware quote
     // (the TDX DCAP quote, or the AMD SEV-SNP report). For a verifier-ready,
     // platform-agnostic payload (with event log / mr_config), use `quote-report`.
@@ -695,26 +995,22 @@ fn cmd_rand(rand_args: RandArgs) -> Result<()> {
     if rand_args.hex {
         data = hex::encode(data).into_bytes();
     }
-    io::stdout()
-        .write_all(&data)
-        .context("Failed to write random data")?;
+    if let Some(output) = rand_args.output {
+        // key material: owner-only, and never half-written — a truncated
+        // random file would pass for a valid secret.
+        safe_write::safe_write_with_mode(&output, &data, 0o600)
+            .with_context(|| format!("Failed to write random output {output}"))?;
+    } else {
+        io::stdout()
+            .write_all(&data)
+            .context("Failed to write random data")?;
+    }
     Ok(())
 }
 
 fn cmd_show_mrs() -> Result<()> {
-    let attestation = match ra_tls::attestation::Attestation::local() {
-        Ok(attestation) => attestation,
-        Err(err) => {
-            // DEV-ONLY fallback: no TEE hardware present (e.g. a local no_tee
-            // dev CVM). There are no measurement registers to show, so skip
-            // instead of failing. Real TEE hosts always resolve an
-            // attestation above and print MRs as before.
-            tracing::warn!(
-                "no TEE attestation available ({err:#}); skipping MR display (no_tee dev mode)"
-            );
-            return Ok(());
-        }
-    };
+    let attestation =
+        ra_tls::attestation::Attestation::local().context("Failed to get attestation")?;
     let app_info = attestation
         .into_v1()
         .decode_app_info(false)
@@ -801,8 +1097,9 @@ fn cmd_gen_ra_cert(args: GenRaCertArgs) -> Result<()> {
     let ca_cert = fs::read_to_string(args.ca_cert)?;
     let ca_key = fs::read_to_string(args.ca_key)?;
     let cert_pair = generate_ra_cert(ca_cert, ca_key)?;
-    fs::write(&args.cert_path, cert_pair.cert_pem).context("Failed to write certificate")?;
-    fs::write(&args.key_path, cert_pair.key_pem).context("Failed to write private key")?;
+    safe_write(&args.cert_path, &cert_pair.cert_pem).context("Failed to write certificate")?;
+    safe_write_with_mode(&args.key_path, &cert_pair.key_pem, 0o600)
+        .context("Failed to write private key")?;
     Ok(())
 }
 
@@ -827,8 +1124,9 @@ fn cmd_gen_ca_cert(args: GenCaCertArgs) -> Result<()> {
     let cert = req
         .self_signed()
         .context("Failed to self-sign certificate")?;
-    fs::write(&args.cert, cert.pem()).context("Failed to write certificate")?;
-    fs::write(&args.key, key.serialize_pem()).context("Failed to write private key")?;
+    safe_write(&args.cert, cert.pem()).context("Failed to write certificate")?;
+    safe_write_with_mode(&args.key, key.serialize_pem(), 0o600)
+        .context("Failed to write private key")?;
     Ok(())
 }
 
@@ -843,7 +1141,7 @@ fn cmd_gen_app_keys(args: GenAppKeysArgs) -> Result<()> {
     };
     let app_keys = make_app_keys(&key, &disk_key, &k256_key, args.ca_level, key_provider)?;
     let app_keys = serde_json::to_string(&app_keys).context("Failed to serialize app keys")?;
-    fs::write(&args.output, app_keys).context("Failed to write app keys")?;
+    safe_write_with_mode(&args.output, &app_keys, 0o600).context("Failed to write app keys")?;
     Ok(())
 }
 
@@ -885,26 +1183,12 @@ fn make_app_keys(
     use ra_tls::cert::CertRequest;
     let pubkey = app_key.public_key_der();
     let report_data = QuoteContentType::RaTlsCert.to_report_data(&pubkey);
-    let attestation = match Attestation::quote(&report_data) {
-        Ok(attestation) => Some(attestation.into_versioned()),
-        Err(err) => {
-            // DEV-ONLY fallback: no TEE hardware present (e.g. a local no_tee
-            // dev CVM). Issue a plain self-signed cert with no ra-tls
-            // attestation extension instead of failing app-key generation.
-            // Real TEE hosts always resolve a quote above and take the
-            // unchanged path; the KMS key-provider path never calls this
-            // function locally (KMS keys come from the KMS server), so this
-            // only affects the None/Local key providers used by local,
-            // unattested dev CVMs.
-            tracing::warn!(
-                "no TEE attestation available ({err:#}); issuing app keys without an attestation (no_tee dev mode)"
-            );
-            None
-        }
-    };
+    let attestation = Attestation::quote(&report_data)
+        .context("Failed to get attestation")?
+        .into_versioned();
     let req = CertRequest::builder()
         .subject("App Root Cert")
-        .maybe_attestation(attestation.as_ref())
+        .attestation(&attestation)
         .key(app_key)
         .ca_level(ca_level)
         .build();
@@ -1144,10 +1428,12 @@ fn cmd_vtpm_attest(args: VtpmAttestArgs) -> Result<()> {
             if let Some(error) = &result.error {
                 println!("Error: {}", error);
             }
-            anyhow::bail!("attestation failed");
         }
     }
 
+    if !result.success {
+        anyhow::bail!("attestation failed");
+    }
     Ok(())
 }
 
@@ -1189,7 +1475,8 @@ fn cmd_tpm_quote(args: TpmQuoteArgs) -> Result<()> {
         serde_json::to_string_pretty(&tpm_quote).context("Failed to serialize TPM quote")?;
 
     if let Some(output_path) = args.output {
-        fs::write(&output_path, quote_json).context("Failed to write quote to file")?;
+        safe_write_with_mode(&output_path, &quote_json, 0o600)
+            .context("Failed to write quote to file")?;
         eprintln!("TPM quote written to: {:?}", output_path);
     } else {
         println!("{}", quote_json);
@@ -1213,7 +1500,7 @@ async fn cmd_tpm_verify(args: TpmVerifyArgs) -> Result<()> {
     println!("[Step 1] Fetching quote collateral (certificates + CRLs)...");
     let collateral = tpm_qvl::get_collateral(&tpm_quote, &root_ca_pem)
         .await
-        .context("Failed to get collateral")?;
+        .context("failed to get TPM collateral")?;
     let crl_count = collateral.crls.len()
         + if collateral.root_ca_crl.is_some() {
             1
@@ -1283,13 +1570,19 @@ async fn cmd_tpm_verify(args: TpmVerifyArgs) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     {
         use tracing_subscriber::{fmt, EnvFilter};
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        fmt().with_env_filter(filter).with_ansi(false).init();
+        let builder = fmt().with_env_filter(filter).with_ansi(false);
+        // `gpu-info` writes a machine-readable JSON document to stdout, so its
+        // logs must go to stderr or an NVML warning would corrupt the output.
+        // Every other subcommand keeps the historical stdout behaviour.
+        match cli.command {
+            Commands::GpuInfo => builder.with_writer(std::io::stderr).init(),
+            _ => builder.init(),
+        }
     }
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Quote => cmd_quote()?,
@@ -1316,6 +1609,10 @@ async fn main() -> Result<()> {
         }
         Commands::Setup(args) => {
             cmd_sys_setup(args).await?;
+        }
+        Commands::HostShared(args) => host_shared::cmd_host_shared(args)?,
+        Commands::GatewayChecker(args) => {
+            cmd_gateway_checker(args).await?;
         }
         Commands::GatewayRefresh(args) => {
             cmd_gateway_refresh(args).await?;
@@ -1361,7 +1658,173 @@ async fn main() -> Result<()> {
         Commands::GetKeys(args) => {
             cmd_get_keys(args).await?;
         }
+        Commands::Decrypt(args) => {
+            cmd_decrypt(args)?;
+        }
+        Commands::Encrypt(args) => {
+            cmd_encrypt(args).await?;
+        }
+        Commands::GpuInfo => {
+            gpu_info::cmd_gpu_info()?;
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn rand_args(output: Option<String>, bytes: usize, hex: bool) -> RandArgs {
+        RandArgs { bytes, output, hex }
+    }
+
+    /// `-o` used to be parsed and then ignored, so the file was never created
+    /// and the bytes went to stdout instead.
+    #[test]
+    fn rand_writes_to_the_requested_output_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+
+        cmd_rand(rand_args(Some(path.display().to_string()), 32, false)).unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().len(), 32);
+        // nothing but the target: no temporary file left behind.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// The output is key material, so it must never be readable by anyone else.
+    #[test]
+    fn rand_output_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+
+        cmd_rand(rand_args(Some(path.display().to_string()), 32, false)).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "random output must be 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn rand_hex_output_is_twice_as_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.hex");
+
+        cmd_rand(rand_args(Some(path.display().to_string()), 16, true)).unwrap();
+
+        let body = fs::read(&path).unwrap();
+        assert_eq!(body.len(), 32);
+        assert!(body.iter().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// Re-running must replace the file rather than failing, so a retry after a
+    /// partial or interrupted run cannot wedge the caller.
+    #[test]
+    fn rand_replaces_an_existing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+
+        cmd_rand(rand_args(Some(path.display().to_string()), 8, false)).unwrap();
+        let first = fs::read(&path).unwrap();
+
+        cmd_rand(rand_args(Some(path.display().to_string()), 32, false)).unwrap();
+        let second = fs::read(&path).unwrap();
+
+        assert_eq!(first.len(), 8);
+        assert_eq!(second.len(), 32);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn prpc_url_normalization_handles_trailing_slashes() {
+        assert_eq!(
+            normalize_prpc_url("https://kms.example.com/prpc/"),
+            "https://kms.example.com/prpc"
+        );
+        assert_eq!(
+            normalize_prpc_url("https://kms.example.com/"),
+            "https://kms.example.com/prpc"
+        );
+    }
+
+    #[test]
+    fn decrypt_auto_detects_stream_and_falls_back_to_legacy() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let mut encrypted = Vec::new();
+        crypto::dh_encrypt_stream(
+            PublicKey::from(&secret).to_bytes(),
+            b"stream plaintext".as_slice(),
+            &mut encrypted,
+            4,
+        )
+        .unwrap();
+        let mut decrypted = Vec::new();
+        decrypt_auto(secret.to_bytes(), encrypted.as_slice(), &mut decrypted).unwrap();
+        assert_eq!(decrypted, b"stream plaintext");
+
+        let legacy_secret: [u8; 32] =
+            hex_decode("7c282bf94b35dc47801dc953bfa0896fc2bd313381d3e8eca4e42f6536d2a96f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let legacy_ciphertext = hex_decode("0bd18749612f4c8b9dd583c7d6a646b90abd34e3c731a7708d0caf9039095641e1f0948e775f0b7351788db7f246d51806954626dcccb6a60d64665ca3715c6bef75616cab476d27bba04080361200d6a58cec").unwrap();
+        let mut legacy_plaintext = Vec::new();
+        decrypt_auto(
+            legacy_secret,
+            legacy_ciphertext.as_slice(),
+            &mut legacy_plaintext,
+        )
+        .unwrap();
+        assert_eq!(legacy_plaintext, b"[{\"key\":\"\",\"value\":\"\"}]");
+        assert_eq!(decode_hex_ciphertext(b" 00ff\n").unwrap(), [0, 255]);
+    }
+
+    #[test]
+    fn env_encrypt_public_key_requires_the_trusted_signer() {
+        use k256::ecdsa::SigningKey as EcdsaSigningKey;
+        use sha3::{Digest, Keccak256};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let signer = EcdsaSigningKey::random(&mut rand::thread_rng());
+        let app_id = [0x11; 20];
+        let public_key = [0x22; 32];
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let digest = Keccak256::new_with_prefix(
+            [
+                b"dstack-env-encrypt-pubkey".as_slice(),
+                b":".as_slice(),
+                app_id.as_slice(),
+                &timestamp.to_be_bytes(),
+                public_key.as_slice(),
+            ]
+            .concat(),
+        );
+        let (signature, recovery_id) = signer.sign_digest_recoverable(digest).unwrap();
+        let mut signature = signature.to_vec();
+        signature.push(recovery_id.to_byte());
+        let trusted = hex::encode(signer.verifying_key().to_sec1_bytes());
+
+        verify_env_encrypt_public_key(&public_key, &signature, &app_id, timestamp, &trusted, 300)
+            .unwrap();
+        let untrusted = EcdsaSigningKey::random(&mut rand::thread_rng());
+        assert!(verify_env_encrypt_public_key(
+            &public_key,
+            &signature,
+            &app_id,
+            timestamp,
+            &hex::encode(untrusted.verifying_key().to_sec1_bytes()),
+            300,
+        )
+        .is_err());
+    }
 }

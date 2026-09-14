@@ -1,5 +1,5 @@
 SUMMARY = "NVIDIA GPU attestation CLI"
-DESCRIPTION = "Builds NVIDIA's nvattest CLI. dstack-util setup runs it at boot to gate readiness on local GPU TEE attestation (app-compose requirements.verify_gpu)."
+DESCRIPTION = "Builds NVIDIA's nvattest CLI. dstack-util setup runs it at boot to gate readiness on local GPU TEE attestation and an optional application policy."
 HOMEPAGE = "https://github.com/NVIDIA/attestation-sdk"
 LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=e620fc90e76c4aa0c3efdd1673ca0b3b"
@@ -7,6 +7,8 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=e620fc90e76c4aa0c3efdd1673ca0b3b"
 SRC_URI = " \
     git://github.com/NVIDIA/attestation-sdk.git;protocol=https;branch=main \
     file://10-nvidia-gpu-ordering.conf \
+    file://0001-validate-ocsp-response-freshness.patch \
+    file://regorus-ffi-Cargo.lock \
 "
 SRCREV = "9d12801cea8a198ea0f29640dfaf8a4017c841c5"
 
@@ -73,13 +75,30 @@ do_compile:prepend() {
     export CARGO_HOST_LINKER="${WORKDIR}/wrappers/linker-native-wrapper.sh"
 }
 
+# regorus does not commit bindings/ffi/Cargo.lock.  Without a lockfile Cargo
+# resolves the newest semver-compatible proc-macro dependencies on every clean
+# build (for example syn 3.0.2 vs 3.0.3), which changes the dynamic string table
+# ordering and GNU build IDs of both libnvat and nvattest.  Install a reviewed
+# lockfile after FetchContent has populated regorus and fail if Cargo rewrites it.
+do_configure:append() {
+    install -m 0644 ${UNPACKDIR}/regorus-ffi-Cargo.lock \
+        ${B}/_deps/regorus-src/bindings/ffi/Cargo.lock
+}
+
+do_compile:append() {
+    cmp ${UNPACKDIR}/regorus-ffi-Cargo.lock \
+        ${B}/_deps/regorus-src/bindings/ffi/Cargo.lock || \
+        bbfatal "Cargo changed the pinned regorus FFI lockfile"
+}
+
 # Network is needed at configure/compile time because:
 #  - nv-attestation-cli CMake FetchContent: CLI11, nlohmann-json (+ fmt/spdlog
 #    headers)
 #  - nv-attestation-sdk-cpp CMake FetchContent: Corrosion, regorus, jwt-cpp
 #  - Corrosion runs cargo, which fetches the regorus-ffi crate dependencies
-# All refs are pinned (git tags/commits) upstream. TODO: vendor these via
-# SRC_URI + cargo vendor for a fully offline, reproducible fetch.
+# All refs are pinned (git tags/commits) upstream, and the regorus FFI Cargo
+# graph is pinned by the lockfile above. TODO: vendor these via SRC_URI + cargo
+# vendor to make the already reproducible fetch fully offline as well.
 do_configure[network] = "1"
 do_compile[network] = "1"
 
@@ -100,10 +119,19 @@ do_install() {
     install -d ${D}${systemd_system_unitdir}/dstack-prepare.service.d
     install -m 0644 ${UNPACKDIR}/10-nvidia-gpu-ordering.conf \
         ${D}${systemd_system_unitdir}/dstack-prepare.service.d/10-nvidia-gpu-ordering.conf
+
+    # Cached OCSP responses cannot echo each verifier request's nonce. NVIDIA
+    # ships this policy for its Trust Outpost cache: it omits only the OCSP
+    # nonce claim while retaining certificate, signature and measurement
+    # appraisal. dstack-util selects it only when sys-config enables a proxy.
+    install -d ${D}${datadir}/nvattest/policies
+    install -m 0644 ${S}/relying_party_policy_examples/allow_trust_outpost_ocsp.rego \
+        ${D}${datadir}/nvattest/policies/allow_trust_outpost_ocsp.rego
 }
 
 FILES:${PN} += " \
     ${systemd_system_unitdir}/dstack-prepare.service.d/10-nvidia-gpu-ordering.conf \
+    ${datadir}/nvattest/policies/allow_trust_outpost_ocsp.rego \
     ${libdir}/lib*.so \
     ${libdir}/lib*.so.* \
 "

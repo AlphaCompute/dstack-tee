@@ -12,12 +12,13 @@ pub const TDX_QUOTE_REPORT_DATA_RANGE: std::ops::Range<usize> = 568..632;
 use std::{borrow::Cow, time::SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
-use cc_eventlog::{RuntimeEvent, TdxEvent};
+use cc_eventlog::{EventLogVersion, RuntimeEvent, TdxEvent};
 use dcap_qvl::{
     collateral::CollateralClient,
     quote::{EnclaveReport, Quote, Report, TDReport10, TDReport15},
     verify::VerifiedReport as TdxVerifiedReport,
 };
+pub use dstack_types::CollateralUrls;
 #[cfg(feature = "quote")]
 use dstack_types::SysConfig;
 use dstack_types::{mr_config::MrConfigV3, KeyProviderInfo, Platform, VmConfig};
@@ -29,29 +30,213 @@ use serde_human_bytes as hex_bytes;
 use sha2::Digest as _;
 use tpm_qvl::verify::VerifiedReport as TpmVerifiedReport;
 
+/// File paths for attestation trust anchors. Empty fields retain the vendor
+/// production roots. Paths are read by the verifier, never by the attester.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootCaPaths {
+    pub tdx: Option<std::path::PathBuf>,
+    pub gcp_tpm: Option<std::path::PathBuf>,
+    pub aws_nitro_enclave: Option<std::path::PathBuf>,
+    pub aws_nitro_tpm: Option<std::path::PathBuf>,
+    pub sev_snp_milan: Option<std::path::PathBuf>,
+    pub sev_snp_genoa: Option<std::path::PathBuf>,
+    pub sev_snp_turin: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationVerifierConfig {
+    #[serde(default)]
+    pub insecure_allow_external_trust_anchors: bool,
+    #[serde(default)]
+    pub urls: CollateralUrls,
+    #[serde(default)]
+    pub root_ca: RootCaPaths,
+}
+
+pub struct AttestationVerifier {
+    tdx: dcap_qvl::verify::QuoteVerifier,
+    tdx_collateral: CollateralClient,
+    gcp_tpm: tpm_qvl::QuoteVerifier,
+    aws_nitro_enclave: nsm_qvl::QuoteVerifier,
+    aws_nitro_tpm: nsm_qvl::QuoteVerifier,
+    sev_snp: sev_snp_qvl::QuoteVerifier,
+    amd_kds: AmdKdsClient,
+}
+
+impl AttestationVerifier {
+    pub fn load(config: &AttestationVerifierConfig) -> Result<Self> {
+        let roots = &config.root_ca;
+        let RootCaPaths {
+            tdx,
+            gcp_tpm,
+            aws_nitro_enclave,
+            aws_nitro_tpm,
+            sev_snp_milan,
+            sev_snp_genoa,
+            sev_snp_turin,
+        } = roots;
+        let external_requested = [
+            tdx,
+            gcp_tpm,
+            aws_nitro_enclave,
+            aws_nitro_tpm,
+            sev_snp_milan,
+            sev_snp_genoa,
+            sev_snp_turin,
+        ]
+        .into_iter()
+        .any(Option::is_some);
+        anyhow::ensure!(
+            !external_requested || config.insecure_allow_external_trust_anchors,
+            "external attestation trust anchors are configured but \
+             insecure_allow_external_trust_anchors is false"
+        );
+        let tdx = match read_root_file(tdx.as_deref(), "TDX")? {
+            Some(root) => dcap_qvl::verify::QuoteVerifier::new(tdx_root_der(root)?),
+            None => dcap_qvl::verify::QuoteVerifier::new_prod(),
+        };
+        let gcp_tpm = match read_root_file(gcp_tpm.as_deref(), "GCP TPM")? {
+            Some(root) => tpm_qvl::QuoteVerifier::new(validated_pem_string(root, "GCP TPM")?),
+            None => tpm_qvl::QuoteVerifier::new_prod(Platform::Gcp)?,
+        };
+        let nsm = |path, name| -> Result<nsm_qvl::QuoteVerifier> {
+            Ok(match read_root_file(path, name)? {
+                Some(root) => nsm_qvl::QuoteVerifier::new(validated_pem_string(root, name)?),
+                None => nsm_qvl::QuoteVerifier::new_prod(),
+            })
+        };
+        let mut sev_snp = sev_snp_qvl::QuoteVerifier::new_prod();
+        for (path, name, product) in [
+            (
+                sev_snp_milan.as_deref(),
+                "SEV-SNP Milan",
+                sev_snp_qvl::AmdSnpProduct::Milan,
+            ),
+            (
+                sev_snp_genoa.as_deref(),
+                "SEV-SNP Genoa",
+                sev_snp_qvl::AmdSnpProduct::Genoa,
+            ),
+            (
+                sev_snp_turin.as_deref(),
+                "SEV-SNP Turin",
+                sev_snp_qvl::AmdSnpProduct::Turin,
+            ),
+        ] {
+            if let Some(root) = read_root_file(path, name)? {
+                validate_x509_certificate(&root, name)?;
+                sev_snp = sev_snp.with_root(product, root);
+            }
+        }
+        let pccs = config
+            .urls
+            .pccs
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(dcap_qvl::collateral::PHALA_PCCS_URL);
+        let amd_kds = config
+            .urls
+            .amd_kds
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(sev_snp_qvl::AMD_KDS_DEFAULT_BASE_URL);
+        Ok(Self {
+            tdx,
+            tdx_collateral: CollateralClient::with_default_http(pccs)?,
+            gcp_tpm,
+            aws_nitro_enclave: nsm(aws_nitro_enclave.as_deref(), "AWS Nitro Enclave")?,
+            aws_nitro_tpm: nsm(aws_nitro_tpm.as_deref(), "AWS NitroTPM")?,
+            sev_snp,
+            amd_kds: AmdKdsClient::with_base_url(amd_kds)?,
+        })
+    }
+
+    pub fn new_prod(collateral_urls: Option<&CollateralUrls>) -> Result<Self> {
+        let collateral_urls = collateral_urls.cloned().unwrap_or_default();
+        Ok(Self {
+            tdx: dcap_qvl::verify::QuoteVerifier::new_prod(),
+            tdx_collateral: CollateralClient::with_default_http(
+                collateral_urls
+                    .pccs
+                    .as_deref()
+                    .filter(|url| !url.trim().is_empty())
+                    .unwrap_or(dcap_qvl::collateral::PHALA_PCCS_URL),
+            )?,
+            gcp_tpm: tpm_qvl::QuoteVerifier::new_prod(Platform::Gcp)?,
+            aws_nitro_enclave: nsm_qvl::QuoteVerifier::new_prod(),
+            aws_nitro_tpm: nsm_qvl::QuoteVerifier::new_prod(),
+            sev_snp: sev_snp_qvl::QuoteVerifier::new_prod(),
+            amd_kds: AmdKdsClient::with_base_url(
+                collateral_urls
+                    .amd_kds
+                    .as_deref()
+                    .filter(|url| !url.trim().is_empty())
+                    .unwrap_or(sev_snp_qvl::AMD_KDS_DEFAULT_BASE_URL),
+            )?,
+        })
+    }
+
+    async fn verify_tdx_quote(&self, quote: &[u8]) -> Result<TdxVerifiedReport> {
+        let collateral = self.tdx_collateral.fetch(quote).await?;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .context("system clock is before UNIX epoch")?
+            .as_secs();
+        self.tdx.verify(quote, &collateral, now)
+    }
+}
+
+fn read_root_file(path: Option<&std::path::Path>, platform: &str) -> Result<Option<Vec<u8>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    fs_err::read(path)
+        .with_context(|| format!("failed to read {platform} root CA from {}", path.display()))
+        .map(Some)
+}
+
+fn validated_pem_string(root: Vec<u8>, platform: &str) -> Result<String> {
+    validate_x509_certificate(&root, platform)?;
+    String::from_utf8(root).with_context(|| format!("{platform} root CA is not UTF-8 PEM"))
+}
+
+fn validate_x509_certificate(root: &[u8], platform: &str) -> Result<()> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let der = if root.starts_with(b"-----BEGIN") {
+        pem::parse(root)
+            .with_context(|| format!("failed to parse {platform} root CA PEM"))?
+            .into_contents()
+    } else {
+        root.to_vec()
+    };
+    let (remaining, certificate) = X509Certificate::from_der(&der)
+        .with_context(|| format!("failed to parse {platform} root CA certificate"))?;
+    anyhow::ensure!(remaining.is_empty(), "trailing data in {platform} root CA");
+    anyhow::ensure!(
+        certificate.is_ca(),
+        "{platform} root certificate is not a CA"
+    );
+    Ok(())
+}
+
+fn tdx_root_der(root: Vec<u8>) -> Result<Vec<u8>> {
+    validate_x509_certificate(&root, "TDX")?;
+    if root.starts_with(b"-----BEGIN") {
+        return Ok(pem::parse(root)?.into_contents());
+    }
+    Ok(root)
+}
+
 // Re-export TpmQuote from tpm-types
 pub use tpm_types::TpmQuote;
 
 use crate::amd_sev_snp::{AmdKdsClient, VerifiedAmdSnpReport};
-use crate::v1::{
-    is_tdx_acpi_data_event, strip_tdx_event_log_for_config, strip_tdx_runtime_event_log,
-};
+use crate::v1::{strip_tdx_event_log_for_config, strip_tdx_runtime_event_log};
 pub use crate::v1::{Attestation as AttestationV1, PlatformEvidence, StackEvidence};
 
 pub const SNP_REPORT_DATA_RANGE: std::ops::Range<usize> = 0x50..0x90;
-
-const DSTACK_TDX: &str = "dstack-tdx";
-const DSTACK_AMD_SEV_SNP: &str = "dstack-amd-sev-snp";
-const DSTACK_GCP_TDX: &str = "dstack-gcp-tdx";
-const DSTACK_NITRO_ENCLAVE: &str = "dstack-nitro-enclave";
-const DSTACK_AWS_NITRO_TPM: &str = "dstack-aws-nitro-tpm";
-
-fn dcap_collateral_client(pccs_url: Option<&str>) -> Result<CollateralClient> {
-    match pccs_url.map(str::trim).filter(|url| !url.is_empty()) {
-        Some(pccs_url) => CollateralClient::with_default_http(pccs_url),
-        None => CollateralClient::from_env(),
-    }
-}
 
 /// Path to sys-config.json in the host-shared dir.
 ///
@@ -69,8 +254,9 @@ static QUOTE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Read vm_config from sys-config.json
 #[cfg(feature = "quote")]
-fn read_vm_config() -> Result<String> {
-    let content = match fs_err::read_to_string(sys_config_path()) {
+fn read_vm_config(path: Option<&std::path::Path>) -> Result<String> {
+    let path = path.map_or_else(sys_config_path, std::path::Path::to_path_buf);
+    let content = match fs_err::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(err) => return Err(err).context("Failed to read sys-config"),
@@ -86,8 +272,9 @@ fn read_vm_config() -> Result<String> {
 /// where `mr_config` lives (top-level field, falling back to the one embedded
 /// in `vm_config`).
 #[cfg(feature = "quote")]
-fn read_mr_config_document() -> Result<Option<String>> {
-    let content = match fs_err::read_to_string(sys_config_path()) {
+fn read_mr_config_document(path: Option<&std::path::Path>) -> Result<Option<String>> {
+    let path = path.map_or_else(sys_config_path, std::path::Path::to_path_buf);
+    let content = match fs_err::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).context("Failed to read sys-config"),
@@ -207,6 +394,19 @@ fn find_event_payload(runtime_events: &[RuntimeEvent], event: &str) -> Result<Ve
     find_event(runtime_events, event).map(|event| event.payload)
 }
 
+/// Returns ordered payloads for matching boot-time events.
+///
+/// Events after `system-ready` are application-controlled and intentionally
+/// excluded from system measurements exposed through decoded app info.
+fn find_event_payloads(runtime_events: &[RuntimeEvent], name: &str) -> Vec<Vec<u8>> {
+    runtime_events
+        .iter()
+        .take_while(|event| event.event != "system-ready")
+        .filter(|event| event.event == name)
+        .map(|event| event.payload.clone())
+        .collect()
+}
+
 fn decode_vm_config_with_fallback(config: &str, fallback_config: &str) -> Result<VmConfig> {
     let config = if config.is_empty() {
         fallback_config
@@ -253,27 +453,7 @@ fn mr_config_document_from_config(config: &str) -> Result<Option<String>> {
     mr_config_document_from_value(&vm_config)
 }
 
-/// Attestation mode
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
-pub enum AttestationMode {
-    /// Intel TDX with DCAP quote only
-    #[default]
-    #[serde(rename = "dstack-tdx")]
-    DstackTdx,
-    /// GCP TDX with DCAP quote only
-    #[serde(rename = "dstack-gcp-tdx")]
-    DstackGcpTdx,
-    /// Dstack attestation SDK in AWS Nitro Enclave
-    #[serde(rename = "dstack-nitro-enclave")]
-    DstackNitroEnclave,
-    /// AMD SEV-SNP report generated by the dstack attestation SDK.
-    #[serde(rename = "dstack-amd-sev-snp")]
-    DstackAmdSevSnp,
-    /// AWS EC2 NitroTPM attestation document generated by the dstack attestation SDK.
-    /// Keep this last to preserve SCALE discriminants for existing variants.
-    #[serde(rename = "dstack-aws-nitro-tpm")]
-    DstackAwsNitroTpm,
-}
+pub use dstack_types::TeeVariant;
 
 #[cfg(feature = "quote")]
 fn has_sev_snp_tsm_provider() -> bool {
@@ -285,77 +465,40 @@ fn has_sev_snp_tsm_provider() -> bool {
     false
 }
 
-fn choose_dstack_attestation_mode(has_tdx: bool, has_sev_snp: bool) -> Result<AttestationMode> {
+fn choose_dstack_tee_variant(has_tdx: bool, has_sev_snp: bool) -> Result<TeeVariant> {
     if has_tdx {
-        return Ok(AttestationMode::DstackTdx);
+        return Ok(TeeVariant::DstackTdx);
     }
     if has_sev_snp {
-        return Ok(AttestationMode::DstackAmdSevSnp);
+        return Ok(TeeVariant::DstackAmdSevSnp);
     }
     bail!("Unsupported platform: Dstack(-tdx/-amd-sev-snp)");
 }
 
-impl AttestationMode {
-    /// Detect attestation mode from system
-    pub fn detect() -> Result<Self> {
-        let has_tdx = tdx_attest::is_tdx_available();
-        let has_sev_snp =
-            std::path::Path::new("/dev/sev-guest").exists() || has_sev_snp_tsm_provider();
+/// Detect the attestation variant exposed by the current guest environment.
+pub fn detect_tee_variant() -> Result<TeeVariant> {
+    let has_tdx = tdx_attest::is_tdx_available();
+    let has_sev_snp = std::path::Path::new("/dev/sev-guest").exists() || has_sev_snp_tsm_provider();
 
-        // First, try to detect platform from DMI product name
-        let platform = Platform::detect_or_dstack();
-        match platform {
-            Platform::Dstack => choose_dstack_attestation_mode(has_tdx, has_sev_snp),
-            Platform::Gcp => {
-                // GCP platform: TDX + TPM dual mode
-                if has_tdx {
-                    return Ok(Self::DstackGcpTdx);
-                }
-                bail!("Unsupported platform: GCP(-tdx)");
+    // First, try to detect platform from DMI product name
+    let platform = Platform::detect_or_dstack();
+    match platform {
+        Platform::Dstack => choose_dstack_tee_variant(has_tdx, has_sev_snp),
+        Platform::Gcp => {
+            // GCP platform: TDX + TPM dual mode
+            if has_tdx {
+                return Ok(TeeVariant::DstackGcpTdx);
             }
-            Platform::NitroEnclave => Ok(Self::DstackNitroEnclave),
-            Platform::AwsEc2 => {
-                if std::path::Path::new("/dev/tpmrm0").exists()
-                    || std::path::Path::new("/dev/tpm0").exists()
-                {
-                    return Ok(Self::DstackAwsNitroTpm);
-                }
-                bail!("unsupported platform: AWS EC2 without NitroTPM");
+            bail!("Unsupported platform: GCP(-tdx)");
+        }
+        Platform::NitroEnclave => Ok(TeeVariant::DstackNitroEnclave),
+        Platform::AwsEc2 => {
+            if std::path::Path::new("/dev/tpmrm0").exists()
+                || std::path::Path::new("/dev/tpm0").exists()
+            {
+                return Ok(TeeVariant::DstackAwsNitroTpm);
             }
-        }
-    }
-
-    /// Check if TDX quote should be included
-    pub fn has_tdx(&self) -> bool {
-        match self {
-            Self::DstackTdx => true,
-            Self::DstackAmdSevSnp => false,
-            Self::DstackGcpTdx => true,
-            Self::DstackNitroEnclave => false,
-            Self::DstackAwsNitroTpm => false,
-        }
-    }
-
-    /// Single TPM PCR used for all dstack measured events (TDX RTMR3 analogue).
-    ///
-    /// AWS NitroTPM uses non-resettable SHA384 PCR14. GCP uses SHA256 PCR14.
-    /// There is no separate runtime PCR (PCR23 is not used).
-    pub fn tpm_event_pcr_and_bank(&self) -> Option<(u32, &'static str)> {
-        match self {
-            Self::DstackGcpTdx => Some((14, "sha256")),
-            Self::DstackAwsNitroTpm => Some((u32::from(AWS_NITRO_TPM_EVENT_PCR), "sha384")),
-            Self::DstackTdx | Self::DstackAmdSevSnp | Self::DstackNitroEnclave => None,
-        }
-    }
-
-    /// As string for debug
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::DstackTdx => DSTACK_TDX,
-            Self::DstackAmdSevSnp => DSTACK_AMD_SEV_SNP,
-            Self::DstackGcpTdx => DSTACK_GCP_TDX,
-            Self::DstackNitroEnclave => DSTACK_NITRO_ENCLAVE,
-            Self::DstackAwsNitroTpm => DSTACK_AWS_NITRO_TPM,
+            bail!("unsupported platform: AWS EC2 without NitroTPM");
         }
     }
 }
@@ -608,8 +751,15 @@ impl VersionedAttestation {
             bail!("Empty attestation bytes");
         };
         if first == 0x00 {
-            let legacy = LegacyVersionedAttestation::decode(&mut &bytes[..])
+            let mut input = bytes;
+            let legacy = LegacyVersionedAttestation::decode(&mut input)
                 .context("Failed to decode legacy VersionedAttestation")?;
+            if !input.is_empty() {
+                bail!(
+                    "Trailing bytes after legacy VersionedAttestation: {}",
+                    input.len()
+                );
+            }
             return match legacy {
                 LegacyVersionedAttestation::V0 { attestation } => Ok(Self::V0 { attestation }),
             };
@@ -689,8 +839,11 @@ pub trait TdxAttestationExt {
 
     /// Returns the TDX event log serialized as JSON.
     fn tdx_event_log_string(&self) -> Option<String> {
-        self.tdx_event_log()
-            .map(|event_log| serde_json::to_string(event_log).unwrap_or_default())
+        self.tdx_event_log().map(|event_log| {
+            let mut events: Vec<TdxEvent> = event_log.to_vec();
+            cc_eventlog::tdx::fill_v2_preimages(&mut events);
+            serde_json::to_string(&events).unwrap_or_default()
+        })
     }
 
     /// Returns the parsed TD10 report from the embedded TDX quote.
@@ -715,6 +868,40 @@ impl TdxAttestationExt for AttestationV1 {
 }
 
 impl AttestationV1 {
+    /// Convert a V1 dstack attestation back to the legacy SCALE schema.
+    ///
+    /// This is only lossless for the original dstack stack with V1 runtime
+    /// events. Pod payloads and newer event encodings must remain on the V1
+    /// msgpack wire format.
+    pub fn try_into_legacy(self) -> Result<Attestation> {
+        let Self {
+            platform, stack, ..
+        } = self;
+        let StackEvidence::Dstack {
+            report_data,
+            runtime_events,
+            config,
+        } = stack
+        else {
+            bail!("dstack-pod attestation cannot be represented by the legacy schema");
+        };
+        if runtime_events
+            .iter()
+            .any(|event| !matches!(event.version, EventLogVersion::V1))
+        {
+            bail!("non-V1 runtime events cannot be represented by the legacy schema");
+        }
+        Ok(Attestation {
+            quote: platform_into_legacy_quote(platform),
+            runtime_events,
+            report_data: report_data
+                .try_into()
+                .map_err(|_| anyhow!("stack.report_data must be 64 bytes"))?,
+            config,
+            report: (),
+        })
+    }
+
     /// Decode the VM config from the external or embedded config.
     pub fn decode_vm_config<'a>(&'a self, config: &'a str) -> Result<VmConfig> {
         decode_vm_config_with_fallback(config, self.stack.config())
@@ -761,6 +948,7 @@ impl AttestationV1 {
                 key_provider_info,
                 os_image_hash,
                 compose_hash,
+                init_script_hashes: Some(find_event_payloads(runtime_events, "init-script-hash")),
             }
         };
 
@@ -836,31 +1024,14 @@ impl AttestationV1 {
         }
     }
 
-    /// Verify the quote with optional custom time (testing hook).
+    pub async fn verify(self, verifier: &AttestationVerifier) -> Result<VerifiedAttestation> {
+        self.verify_with_time(verifier, None).await
+    }
+
     pub async fn verify_with_time(
         self,
-        pccs_url: Option<&str>,
+        verifier: &AttestationVerifier,
         now: Option<SystemTime>,
-    ) -> Result<VerifiedAttestation> {
-        self.verify_with_time_with_amd_kds_client(pccs_url, now, None)
-            .await
-    }
-
-    /// Verify the quote with a caller-owned AMD KDS client.
-    pub async fn verify_with_amd_kds_client(
-        self,
-        pccs_url: Option<&str>,
-        amd_kds_client: &AmdKdsClient,
-    ) -> Result<VerifiedAttestation> {
-        self.verify_with_time_with_amd_kds_client(pccs_url, None, Some(amd_kds_client))
-            .await
-    }
-
-    async fn verify_with_time_with_amd_kds_client(
-        self,
-        pccs_url: Option<&str>,
-        now: Option<SystemTime>,
-        amd_kds_client: Option<&AmdKdsClient>,
     ) -> Result<VerifiedAttestation> {
         let AttestationV1 {
             version: _,
@@ -898,16 +1069,18 @@ impl AttestationV1 {
         };
         let report = match &platform {
             PlatformEvidence::Tdx { quote, .. } => DstackVerifiedReport::DstackTdx(
-                verify_tdx_quote_with_events(pccs_url, quote, &runtime_events, &report_data)
+                verify_tdx_quote_with_events(verifier, quote, &runtime_events, &report_data)
                     .await?,
             ),
             PlatformEvidence::GcpTdx {
                 quote, tpm_quote, ..
             } => {
                 let tdx_report =
-                    verify_tdx_quote_with_events(pccs_url, quote, &runtime_events, &report_data)
+                    verify_tdx_quote_with_events(verifier, quote, &runtime_events, &report_data)
                         .await?;
-                let tpm_report = tpm_qvl::get_collateral_and_verify(tpm_quote)
+                let tpm_report = verifier
+                    .gcp_tpm
+                    .fetch_and_verify(tpm_quote)
                     .await
                     .context("failed to verify TPM quote")?;
                 let qualifying_data = sha256(quote);
@@ -935,13 +1108,10 @@ impl AttestationV1 {
                 let nsm = DstackNitroQuote {
                     nsm_quote: nsm_quote.clone(),
                 };
-                let verified_report = nsm_qvl::verify_attestation(
-                    &nsm.nsm_quote,
-                    nsm_qvl::AWS_NITRO_ENCLAVES_ROOT_G1,
-                    None,
-                    now,
-                )
-                .context("NSM attestation verification failed")?;
+                let verified_report = verifier
+                    .aws_nitro_enclave
+                    .verify(&nsm.nsm_quote, None, now)
+                    .context("NSM attestation verification failed")?;
                 let Some(user_data) = verified_report.user_data.clone() else {
                     bail!("NSM attestation document does not contain user_data");
                 };
@@ -962,6 +1132,7 @@ impl AttestationV1 {
             }
             PlatformEvidence::AwsNitroTpm { attestation_doc } => {
                 let verified_report = verify_aws_nitro_tpm_attestation_doc(
+                    verifier,
                     attestation_doc,
                     &runtime_events,
                     &report_data,
@@ -975,21 +1146,23 @@ impl AttestationV1 {
                 cert_chain,
                 mr_config,
             } => {
-                let owned_kds_client;
-                let kds_client = match amd_kds_client {
-                    Some(client) => client,
-                    None => {
-                        owned_kds_client = AmdKdsClient::new()?;
-                        &owned_kds_client
-                    }
-                };
-                let verified = kds_client
-                    .verify_evidence_with_kds_fallback(report, cert_chain, &report_data)
+                let verified = verifier
+                    .sev_snp
+                    .fetch_and_verify(&verifier.amd_kds, report, cert_chain, &report_data)
                     .await?;
                 verify_snp_mr_config_host_data(mr_config, &verified.host_data)?;
                 DstackVerifiedReport::DstackAmdSevSnp(verified)
             }
         };
+
+        match &platform {
+            PlatformEvidence::Tdx { event_log, .. }
+            | PlatformEvidence::GcpTdx { event_log, .. } => {
+                cc_eventlog::tdx::validate_v2_preimages(event_log)
+                    .context("Failed to validate TDX V2 event digest preimages")?;
+            }
+            _ => {}
+        }
 
         Ok(VerifiedAttestation {
             quote: platform_into_legacy_quote(platform),
@@ -1004,18 +1177,13 @@ impl AttestationV1 {
     pub async fn verify_with_ra_pubkey(
         self,
         ra_pubkey_der: &[u8],
-        pccs_url: Option<&str>,
+        verifier: &AttestationVerifier,
     ) -> Result<VerifiedAttestation> {
         let expected_report_data = QuoteContentType::RaTlsCert.to_report_data(ra_pubkey_der);
         if self.report_data()? != expected_report_data {
             bail!("report data mismatch");
         }
-        self.verify(pccs_url).await
-    }
-
-    /// Verify the quote.
-    pub async fn verify(self, pccs_url: Option<&str>) -> Result<VerifiedAttestation> {
-        self.verify_with_time(pccs_url, None).await
+        self.verify(verifier).await
     }
 }
 
@@ -1187,13 +1355,13 @@ pub enum AttestationQuote {
 }
 
 impl AttestationQuote {
-    pub fn mode(&self) -> AttestationMode {
+    pub fn variant(&self) -> TeeVariant {
         match self {
-            AttestationQuote::DstackTdx(_) => AttestationMode::DstackTdx,
-            AttestationQuote::DstackAmdSevSnp(_) => AttestationMode::DstackAmdSevSnp,
-            AttestationQuote::DstackGcpTdx(_) => AttestationMode::DstackGcpTdx,
-            AttestationQuote::DstackNitroEnclave(_) => AttestationMode::DstackNitroEnclave,
-            AttestationQuote::DstackAwsNitroTpm(_) => AttestationMode::DstackAwsNitroTpm,
+            AttestationQuote::DstackTdx(_) => TeeVariant::DstackTdx,
+            AttestationQuote::DstackAmdSevSnp(_) => TeeVariant::DstackAmdSevSnp,
+            AttestationQuote::DstackGcpTdx(_) => TeeVariant::DstackGcpTdx,
+            AttestationQuote::DstackNitroEnclave(_) => TeeVariant::DstackNitroEnclave,
+            AttestationQuote::DstackAwsNitroTpm(_) => TeeVariant::DstackAwsNitroTpm,
         }
     }
 }
@@ -1204,26 +1372,26 @@ mod compatibility_tests {
     use scale::Encode;
 
     #[test]
-    fn attestation_mode_scale_discriminants_preserve_existing_wire_values() {
-        assert_eq!(AttestationMode::DstackTdx.encode(), vec![0]);
-        assert_eq!(AttestationMode::DstackGcpTdx.encode(), vec![1]);
-        assert_eq!(AttestationMode::DstackNitroEnclave.encode(), vec![2]);
-        assert_eq!(AttestationMode::DstackAmdSevSnp.encode(), vec![3]);
-        assert_eq!(AttestationMode::DstackAwsNitroTpm.encode(), vec![4]);
+    fn tee_variant_scale_discriminants_preserve_existing_wire_values() {
+        assert_eq!(TeeVariant::DstackTdx.encode(), vec![0]);
+        assert_eq!(TeeVariant::DstackGcpTdx.encode(), vec![1]);
+        assert_eq!(TeeVariant::DstackNitroEnclave.encode(), vec![2]);
+        assert_eq!(TeeVariant::DstackAmdSevSnp.encode(), vec![3]);
+        assert_eq!(TeeVariant::DstackAwsNitroTpm.encode(), vec![4]);
     }
 
     #[test]
-    fn attestation_mode_deserializes_canonical_names() {
-        let parse = |value| serde_json::from_str::<AttestationMode>(value).unwrap();
-        assert_eq!(parse(r#""dstack-tdx""#), AttestationMode::DstackTdx);
-        assert_eq!(parse(r#""dstack-gcp-tdx""#), AttestationMode::DstackGcpTdx);
+    fn tee_variant_deserializes_canonical_names() {
+        let parse = |value| serde_json::from_str::<TeeVariant>(value).unwrap();
+        assert_eq!(parse(r#""dstack-tdx""#), TeeVariant::DstackTdx);
+        assert_eq!(parse(r#""dstack-gcp-tdx""#), TeeVariant::DstackGcpTdx);
         assert_eq!(
             parse(r#""dstack-amd-sev-snp""#),
-            AttestationMode::DstackAmdSevSnp
+            TeeVariant::DstackAmdSevSnp
         );
         assert_eq!(
             parse(r#""dstack-nitro-enclave""#),
-            AttestationMode::DstackNitroEnclave
+            TeeVariant::DstackNitroEnclave
         );
     }
 
@@ -1261,18 +1429,18 @@ mod compatibility_tests {
     }
 
     #[test]
-    fn dstack_attestation_mode_prefers_tdx_when_both_tdx_and_tsm_exist() {
+    fn dstack_tee_variant_prefers_tdx_when_both_tdx_and_tsm_exist() {
         assert_eq!(
-            choose_dstack_attestation_mode(true, true).unwrap(),
-            AttestationMode::DstackTdx
+            choose_dstack_tee_variant(true, true).unwrap(),
+            TeeVariant::DstackTdx
         );
     }
 
     #[test]
-    fn dstack_attestation_mode_uses_snp_when_only_snp_exists() {
+    fn dstack_tee_variant_uses_snp_when_only_snp_exists() {
         assert_eq!(
-            choose_dstack_attestation_mode(false, true).unwrap(),
-            AttestationMode::DstackAmdSevSnp
+            choose_dstack_tee_variant(false, true).unwrap(),
+            TeeVariant::DstackAmdSevSnp
         );
     }
 }
@@ -1339,6 +1507,16 @@ impl<T> Attestation<T> {
         self.tdx_quote().map(|q| q.quote.clone())
     }
 
+    /// Populate `preimage` on every V2 runtime event in the TDX event log.
+    ///
+    /// Useful before serializing an attestation so relying parties get the
+    /// digest pre-images alongside events.
+    pub fn fill_event_preimages(&mut self) {
+        if let Some(q) = self.tdx_quote_mut() {
+            cc_eventlog::tdx::fill_v2_preimages(&mut q.event_log);
+        }
+    }
+
     /// Get TDX event log bytes
     pub fn get_tdx_event_log_bytes(&self) -> Option<Vec<u8>> {
         self.tdx_quote()
@@ -1347,35 +1525,23 @@ impl<T> Attestation<T> {
 
     /// Get TDX event log string with RTMR[0-2] payloads stripped to reduce size.
     /// Only digests are kept for boot-time events; runtime events (RTMR3) retain full payload.
+    ///
     pub fn get_tdx_event_log_string(&self) -> Option<String> {
-        self.get_tdx_event_log_string_for_config("")
-    }
-
-    /// Get TDX event log string for a vm_config.
-    ///
-    /// Always keeps the `ACPI DATA` marker payloads on the three RTMR0 ACPI
-    /// digest events, regardless of the vm_config's `tdx_attestation_variant`,
-    /// so callers that consume the top-level `event_log` can semantically
-    /// identify the ACPI table digest events without consulting the
-    /// versioned attestation field, and a verifier can choose lite
-    /// verification for any TDX boot rather than only ones resolved to lite
-    /// at launch.
-    ///
-    /// `config` is accepted for API stability but no longer changes the
-    /// result.
-    pub fn get_tdx_event_log_string_for_config(&self, _config: &str) -> Option<String> {
         self.tdx_quote().map(|q| {
-            let stripped: Vec<_> = q
+            let mut stripped: Vec<_> = q
                 .event_log
                 .iter()
-                .map(|e| {
-                    let mut stripped = e.stripped();
-                    if is_tdx_acpi_data_event(e) {
-                        stripped.event_payload = e.event_payload.clone();
+                .map(|event| {
+                    let mut stripped = event.stripped();
+                    // Keep the marker used by TDX-lite verification to identify
+                    // the three RTMR0 ACPI digest events.
+                    if cc_eventlog::tdx::is_tdx_acpi_data_event(event) {
+                        stripped.event_payload = event.event_payload.clone();
                     }
                     stripped
                 })
                 .collect();
+            cc_eventlog::tdx::fill_v2_preimages(&mut stripped);
             serde_json::to_string(&stripped).unwrap_or_default()
         })
     }
@@ -1449,7 +1615,7 @@ struct Mrs {
 fn key_provider_info_from_mr_config(mr_config: &MrConfigV3) -> Result<Vec<u8>> {
     serde_json::to_vec(&KeyProviderInfo::new(
         mr_config.key_provider_name().to_string(),
-        hex::encode(&mr_config.key_provider_id),
+        hex::encode(mr_config.key_provider_id.as_deref().unwrap_or_default()),
     ))
     .context("Failed to serialize key provider info")
 }
@@ -1509,14 +1675,15 @@ fn decode_app_info_sev_snp(
     let mrs = decode_mr_sev_snp(&parsed.measurement, &parsed.host_data);
 
     Ok(AppInfo {
-        app_id: mr_config.app_id,
-        instance_id: mr_config.instance_id,
+        app_id: mr_config.app_id.unwrap_or_default(),
+        instance_id: mr_config.instance_id.unwrap_or_default(),
         device_id: sha256(parsed.chip_id).to_vec(),
         mr_system: mrs.mr_system,
         mr_aggregated: mrs.mr_aggregated,
         key_provider_info,
         os_image_hash,
         compose_hash: mr_config.compose_hash,
+        init_script_hashes: mr_config.init_script_hashes,
     })
 }
 
@@ -1626,15 +1793,15 @@ fn decode_mr_tdx_from_quote(
 }
 
 async fn verify_tdx_quote_with_events(
-    pccs_url: Option<&str>,
+    verifier: &AttestationVerifier,
     quote: &[u8],
     runtime_events: &[RuntimeEvent],
     report_data: &[u8; 64],
 ) -> Result<TdxVerifiedReport> {
-    let tdx_report = dcap_collateral_client(pccs_url)?
-        .fetch_and_verify(quote)
+    let tdx_report = verifier
+        .verify_tdx_quote(quote)
         .await
-        .context("Failed to get collateral")?;
+        .context("failed to verify TDX quote")?;
     validate_tcb(&tdx_report)?;
 
     let td_report = tdx_report.report.as_td10().context("no td report")?;
@@ -1654,18 +1821,16 @@ async fn verify_tdx_quote_with_events(
 }
 
 fn verify_aws_nitro_tpm_attestation_doc(
+    verifier: &AttestationVerifier,
     attestation_doc: &[u8],
     runtime_events: &[RuntimeEvent],
     report_data: &[u8; 64],
     now: Option<SystemTime>,
 ) -> Result<AwsNitroTpmVerifiedReport> {
-    let verified_report = nsm_qvl::verify_attestation(
-        attestation_doc,
-        nsm_qvl::AWS_NITRO_ENCLAVES_ROOT_G1,
-        None,
-        now,
-    )
-    .context("COSE attestation document verification failed")?;
+    let verified_report = verifier
+        .aws_nitro_tpm
+        .verify(attestation_doc, None, now)
+        .context("COSE attestation document verification failed")?;
 
     let Some(user_data) = verified_report.user_data.clone() else {
         bail!("NitroTPM attestation document does not contain user_data");
@@ -1841,6 +2006,10 @@ impl<T: GetDeviceId> Attestation<T> {
                 key_provider_info,
                 os_image_hash,
                 compose_hash,
+                init_script_hashes: Some(find_event_payloads(
+                    &self.runtime_events,
+                    "init-script-hash",
+                )),
             }
         };
 
@@ -1931,6 +2100,12 @@ impl<T> Attestation<T> {
         self.find_event(event).map(|event| event.payload)
     }
 
+    /// SHA-256 payloads of all measured init scripts, in execution order.
+    /// Application-emitted events after `system-ready` are excluded.
+    pub fn decode_init_script_hashes(&self) -> Vec<Vec<u8>> {
+        find_event_payloads(&self.runtime_events, "init-script-hash")
+    }
+
     fn find_event_hex_payload(&self, event: &str) -> Result<String> {
         self.find_event(event)
             .map(|event| hex::encode(&event.payload))
@@ -1997,50 +2172,68 @@ impl Attestation {
     }
 
     pub fn quote_with_app_id(report_data: &[u8; 64], app_id: Option<[u8; 20]>) -> Result<Self> {
+        Self::quote_with_app_id_and_sys_config(report_data, app_id, None)
+    }
+
+    /// Create an attestation using an explicit sys-config path.
+    pub fn quote_with_sys_config(
+        report_data: &[u8; 64],
+        sys_config: &std::path::Path,
+    ) -> Result<Self> {
+        Self::quote_with_app_id_and_sys_config(report_data, None, Some(sys_config))
+    }
+
+    fn quote_with_app_id_and_sys_config(
+        report_data: &[u8; 64],
+        app_id: Option<[u8; 20]>,
+        sys_config: Option<&std::path::Path>,
+    ) -> Result<Self> {
         // Lock to prevent concurrent quote generation (TDX driver doesn't support it)
         let _guard = QUOTE_LOCK
             .lock()
             .map_err(|_| anyhow!("Quote lock poisoned"))?;
 
-        let mode = AttestationMode::detect()?;
+        let mode = detect_tee_variant()?;
         let config = match mode {
-            AttestationMode::DstackAmdSevSnp
-            | AttestationMode::DstackTdx
-            | AttestationMode::DstackGcpTdx
-            // AWS: prefer host-shared sys-config vm_config (carries
-            // aws_measurement + unified os_image_hash); validated below.
-            | AttestationMode::DstackAwsNitroTpm => {
-                read_vm_config().context("Failed to read vm config")?
+            TeeVariant::DstackAmdSevSnp
+            | TeeVariant::DstackTdx
+            | TeeVariant::DstackGcpTdx
+            // AWS prefers host-shared vm_config because it carries the
+            // aws_measurement and unified os_image_hash validated below.
+            | TeeVariant::DstackAwsNitroTpm => {
+                read_vm_config(sys_config).context("Failed to read vm config")?
             }
-            // NitroEnclave derives config from the quote's image hash below.
-            AttestationMode::DstackNitroEnclave => String::new(),
+            // NitroEnclave derives config from the signed image hash below.
+            TeeVariant::DstackNitroEnclave => String::new(),
         };
         let runtime_events = match mode {
-            AttestationMode::DstackTdx
-            | AttestationMode::DstackGcpTdx
-            | AttestationMode::DstackAwsNitroTpm => {
+            TeeVariant::DstackTdx | TeeVariant::DstackGcpTdx | TeeVariant::DstackAwsNitroTpm => {
                 RuntimeEvent::read_all().context("Failed to read runtime events")?
             }
-            AttestationMode::DstackAmdSevSnp => vec![],
-            AttestationMode::DstackNitroEnclave => match app_id {
-                Some(app_id) => vec![RuntimeEvent::new("app-id".to_string(), app_id.to_vec())],
+            TeeVariant::DstackAmdSevSnp => vec![],
+            TeeVariant::DstackNitroEnclave => match app_id {
+                Some(app_id) => vec![RuntimeEvent::new(
+                    "app-id".to_string(),
+                    app_id.to_vec(),
+                    EventLogVersion::V1,
+                )],
                 None => vec![],
             },
         };
 
         let mut quote = match mode {
-            AttestationMode::DstackTdx => {
+            TeeVariant::DstackTdx => {
                 let quote = tdx_attest::get_quote(report_data).context("Failed to get quote")?;
                 let event_log =
                     cc_eventlog::tdx::read_event_log().context("Failed to read event log")?;
                 AttestationQuote::DstackTdx(TdxQuote { quote, event_log })
             }
-            AttestationMode::DstackAmdSevSnp => {
+            TeeVariant::DstackAmdSevSnp => {
                 let quote = crate::sev_snp::get_report(*report_data)
                     .context("Failed to get SEV-SNP report")?;
                 AttestationQuote::DstackAmdSevSnp(quote)
             }
-            AttestationMode::DstackGcpTdx => {
+            TeeVariant::DstackGcpTdx => {
                 let quote = tdx_attest::get_quote(report_data).context("Failed to get quote")?;
                 let event_log =
                     cc_eventlog::tdx::read_event_log().context("Failed to read event log")?;
@@ -2056,12 +2249,12 @@ impl Attestation {
                     tpm_quote,
                 })
             }
-            AttestationMode::DstackNitroEnclave => {
+            TeeVariant::DstackNitroEnclave => {
                 let nsm_quote = nsm_attest::get_attestation(report_data)
                     .context("Failed to get NSM attestation")?;
                 AttestationQuote::DstackNitroEnclave(DstackNitroQuote { nsm_quote })
             }
-            AttestationMode::DstackAwsNitroTpm => {
+            TeeVariant::DstackAwsNitroTpm => {
                 // Challenge binding is report_data → NitroTPM user_data only
                 // (same role as TDX/GCP report_data; no separate nonce/public_key).
                 let attestation_doc = crate::aws_nitro_tpm::attestation_document(report_data)
@@ -2118,7 +2311,7 @@ impl Attestation {
         };
         if let AttestationQuote::DstackAmdSevSnp(quote) = &mut quote {
             quote.mr_config =
-                read_mr_config_document()?.context("amd sev-snp mr_config is missing")?;
+                read_mr_config_document(sys_config)?.context("amd sev-snp mr_config is missing")?;
         }
 
         Ok(Self {
@@ -2136,56 +2329,37 @@ impl Attestation {
         self.into()
     }
 
-    /// Verify the quote with optional custom time (testing hook)
+    pub async fn verify(self, verifier: &AttestationVerifier) -> Result<VerifiedAttestation> {
+        self.verify_with_time(verifier, None).await
+    }
+
     pub async fn verify_with_time(
         self,
-        pccs_url: Option<&str>,
+        verifier: &AttestationVerifier,
         now: Option<SystemTime>,
-    ) -> Result<VerifiedAttestation> {
-        self.verify_with_time_with_amd_kds_client(pccs_url, now, None)
-            .await
-    }
-
-    /// Verify the quote with a caller-owned AMD KDS client.
-    pub async fn verify_with_amd_kds_client(
-        self,
-        pccs_url: Option<&str>,
-        amd_kds_client: &AmdKdsClient,
-    ) -> Result<VerifiedAttestation> {
-        self.verify_with_time_with_amd_kds_client(pccs_url, None, Some(amd_kds_client))
-            .await
-    }
-
-    async fn verify_with_time_with_amd_kds_client(
-        self,
-        pccs_url: Option<&str>,
-        now: Option<SystemTime>,
-        amd_kds_client: Option<&AmdKdsClient>,
     ) -> Result<VerifiedAttestation> {
         let report = match &self.quote {
             AttestationQuote::DstackTdx(q) => {
-                let report = self.verify_tdx(pccs_url, &q.quote).await?;
+                let report = self.verify_tdx(verifier, &q.quote).await?;
                 DstackVerifiedReport::DstackTdx(report)
             }
             AttestationQuote::DstackAmdSevSnp(q) => {
-                let owned_kds_client;
-                let kds_client = match amd_kds_client {
-                    Some(client) => client,
-                    None => {
-                        owned_kds_client = AmdKdsClient::new()?;
-                        &owned_kds_client
-                    }
-                };
-                let verified = kds_client
-                    .verify_evidence_with_kds_fallback(&q.report, &q.cert_chain, &self.report_data)
+                let verified = verifier
+                    .sev_snp
+                    .fetch_and_verify(
+                        &verifier.amd_kds,
+                        &q.report,
+                        &q.cert_chain,
+                        &self.report_data,
+                    )
                     .await?;
                 verify_snp_mr_config_host_data(&q.mr_config, &verified.host_data)?;
                 DstackVerifiedReport::DstackAmdSevSnp(verified)
             }
             AttestationQuote::DstackGcpTdx(q) => {
-                let tdx_report = self.verify_tdx(pccs_url, &q.tdx_quote.quote).await?;
+                let tdx_report = self.verify_tdx(verifier, &q.tdx_quote.quote).await?;
                 let tpm_report = self
-                    .verify_tpm(&q.tpm_quote, &sha256(&q.tdx_quote.quote))
+                    .verify_tpm(verifier, &q.tpm_quote, &sha256(&q.tdx_quote.quote))
                     .await
                     .context("Failed to verify TPM quote")?;
                 DstackVerifiedReport::DstackGcpTdx {
@@ -2195,13 +2369,14 @@ impl Attestation {
             }
             AttestationQuote::DstackNitroEnclave(quote) => {
                 let report = self
-                    .verify_nitro_enclave_with_time(quote, now)
+                    .verify_nitro_enclave_with_time(verifier, quote, now)
                     .await
                     .context("Failed to verify Nitro Enclave")?;
                 DstackVerifiedReport::DstackNitroEnclave(report)
             }
             AttestationQuote::DstackAwsNitroTpm(quote) => {
                 let report = verify_aws_nitro_tpm_attestation_doc(
+                    verifier,
                     &quote.attestation_doc,
                     &self.runtime_events,
                     &self.report_data,
@@ -2212,6 +2387,18 @@ impl Attestation {
             }
         };
 
+        match &self.quote {
+            AttestationQuote::DstackTdx(q) => {
+                cc_eventlog::tdx::validate_v2_preimages(&q.event_log)
+                    .context("Failed to validate TDX V2 event digest preimages")?;
+            }
+            AttestationQuote::DstackGcpTdx(q) => {
+                cc_eventlog::tdx::validate_v2_preimages(&q.tdx_quote.event_log)
+                    .context("Failed to validate TDX V2 event digest preimages")?;
+            }
+            _ => {}
+        }
+
         Ok(VerifiedAttestation {
             quote: self.quote,
             runtime_events: self.runtime_events,
@@ -2221,27 +2408,41 @@ impl Attestation {
         })
     }
 
-    /// Wrap into a versioned attestation for encoding
-    pub fn into_versioned(self) -> VersionedAttestation {
-        VersionedAttestation::V0 { attestation: self }
+    /// Wrap into a versioned attestation for encoding.
+    ///
+    /// When any runtime event uses a non-V1 event-log version, force the V1
+    /// msgpack wire format so the `version` field is preserved (SCALE
+    /// V0 skips it for legacy binary compat). Otherwise default to V0 for
+    /// backward compat with callers that expect the SCALE format.
+    pub fn into_versioned(mut self) -> VersionedAttestation {
+        // V2 event digests cannot be reconstructed from the serialized event
+        // fields alone. Populate their canonical preimages before the legacy
+        // quote is projected into either wire schema.
+        self.fill_event_preimages();
+        let has_v2 = self
+            .runtime_events
+            .iter()
+            .any(|e| !matches!(e.version, EventLogVersion::V1));
+        if has_v2 {
+            VersionedAttestation::V1 {
+                attestation: self.into(),
+            }
+        } else {
+            VersionedAttestation::V0 { attestation: self }
+        }
     }
 
     /// Verify the quote
     pub async fn verify_with_ra_pubkey(
         self,
         ra_pubkey_der: &[u8],
-        pccs_url: Option<&str>,
+        verifier: &AttestationVerifier,
     ) -> Result<VerifiedAttestation> {
         let expected_report_data = QuoteContentType::RaTlsCert.to_report_data(ra_pubkey_der);
         if self.report_data != expected_report_data {
             bail!("report data mismatch");
         }
-        self.verify(pccs_url).await
-    }
-
-    /// Verify the quote
-    pub async fn verify(self, pccs_url: Option<&str>) -> Result<VerifiedAttestation> {
-        self.verify_with_time(pccs_url, None).await
+        self.verify(verifier).await
     }
 
     /// Verify Nitro Enclave attestation with optional custom time (testing hook)
@@ -2252,18 +2453,16 @@ impl Attestation {
     /// 3. Validates user_data matches expected report_data
     async fn verify_nitro_enclave_with_time(
         &self,
+        verifier: &AttestationVerifier,
         nsm_quote: &DstackNitroQuote,
         now: Option<SystemTime>,
     ) -> Result<NitroVerifiedReport> {
         // Verify COSE signature and certificate chain using nsm-qvl
         // CRL fetch is unreliable (e.g. 403 from S3), so keep it disabled here by default.
-        let verified_report = nsm_qvl::verify_attestation(
-            &nsm_quote.nsm_quote,
-            nsm_qvl::AWS_NITRO_ENCLAVES_ROOT_G1,
-            None,
-            now,
-        )
-        .context("NSM attestation verification failed")?;
+        let verified_report = verifier
+            .aws_nitro_enclave
+            .verify(&nsm_quote.nsm_quote, None, now)
+            .context("NSM attestation verification failed")?;
 
         // Verify user_data matches report_data
         let Some(user_data) = verified_report.user_data.clone() else {
@@ -2288,13 +2487,14 @@ impl Attestation {
 
     async fn verify_tpm(
         &self,
+        verifier: &AttestationVerifier,
         quote: &TpmQuote,
         qualifying_data: &[u8],
     ) -> Result<TpmVerifiedReport> {
-        let report = tpm_qvl::get_collateral_and_verify(quote).await?;
+        let report = verifier.gcp_tpm.fetch_and_verify(quote).await?;
         let pcr_ind = self
             .quote
-            .mode()
+            .variant()
             .tpm_event_pcr_and_bank()
             .map(|(pcr, _)| pcr)
             .context("Failed to get event PCR no")?;
@@ -2315,11 +2515,15 @@ impl Attestation {
         Ok(report)
     }
 
-    async fn verify_tdx(&self, pccs_url: Option<&str>, quote: &[u8]) -> Result<TdxVerifiedReport> {
-        let tdx_report = dcap_collateral_client(pccs_url)?
-            .fetch_and_verify(quote)
+    async fn verify_tdx(
+        &self,
+        verifier: &AttestationVerifier,
+        quote: &[u8],
+    ) -> Result<TdxVerifiedReport> {
+        let tdx_report = verifier
+            .verify_tdx_quote(quote)
             .await
-            .context("Failed to get collateral")?;
+            .context("failed to verify TDX quote")?;
         validate_tcb(&tdx_report)?;
 
         let td_report = tdx_report.report.as_td10().context("no td report")?;
@@ -2398,11 +2602,155 @@ pub struct AppInfo {
     /// Key provider info
     #[serde(with = "hex_bytes")]
     pub key_provider_info: Vec<u8>,
+    /// Optional SHA-256 pins for init scripts, in execution order. `None`
+    /// means the evidence did not bind this field. On SEV-SNP, `Some(vec![])`
+    /// explicitly binds an empty script list. On TDX and Nitro it only means
+    /// that no `init-script-hash` events were measured before `system-ready`;
+    /// pre-0.6.0 images emit no such events even when they run an init script.
+    #[serde(default, with = "dstack_types::init_script_hashes::option")]
+    pub init_script_hashes: Option<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_info_defaults_missing_init_script_hashes() {
+        let app_info: AppInfo = serde_json::from_value(serde_json::json!({
+            "app_id": "",
+            "compose_hash": "",
+            "instance_id": "",
+            "device_id": "",
+            "mr_system": "0000000000000000000000000000000000000000000000000000000000000000",
+            "mr_aggregated": "0000000000000000000000000000000000000000000000000000000000000000",
+            "os_image_hash": "",
+            "key_provider_info": ""
+        }))
+        .unwrap();
+        assert!(app_info.init_script_hashes.is_none());
+    }
+
+    #[test]
+    fn app_info_preserves_explicit_empty_init_script_hashes() {
+        let app_info: AppInfo = serde_json::from_value(serde_json::json!({
+            "app_id": "",
+            "compose_hash": "",
+            "instance_id": "",
+            "device_id": "",
+            "mr_system": "0000000000000000000000000000000000000000000000000000000000000000",
+            "mr_aggregated": "0000000000000000000000000000000000000000000000000000000000000000",
+            "os_image_hash": "",
+            "key_provider_info": "",
+            "init_script_hashes": []
+        }))
+        .unwrap();
+        assert_eq!(app_info.init_script_hashes, Some(Vec::new()));
+    }
+
+    #[test]
+    fn external_trust_anchor_requires_explicit_insecure_opt_in() {
+        let config = AttestationVerifierConfig {
+            root_ca: RootCaPaths {
+                tdx: Some("/tmp/mock-tdx-root.pem".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = AttestationVerifier::load(&config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("insecure_allow_external_trust_anchors is false"));
+    }
+
+    #[test]
+    fn production_attestation_verifier_loads_all_safe_defaults() {
+        AttestationVerifier::load(&AttestationVerifierConfig::default())
+            .expect("production roots and URLs must load");
+    }
+
+    #[test]
+    fn opted_in_external_root_is_read_during_load() {
+        let config = AttestationVerifierConfig {
+            insecure_allow_external_trust_anchors: true,
+            root_ca: RootCaPaths {
+                tdx: Some("/definitely/missing/tdx-root.pem".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = AttestationVerifier::load(&config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("failed to read TDX root CA"));
+    }
+
+    #[test]
+    fn root_file_is_loaded_without_environment_indirection() {
+        let path = std::env::temp_dir().join(format!("dstack-root-ca-test-{}", std::process::id()));
+        fs_err::write(&path, b"test root").unwrap();
+        assert_eq!(
+            read_root_file(Some(&path), "test").unwrap(),
+            Some(b"test root".to_vec())
+        );
+        fs_err::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn every_external_root_is_parsed_during_load() {
+        let path = std::env::temp_dir().join(format!(
+            "dstack-invalid-root-ca-test-{}",
+            std::process::id()
+        ));
+        fs_err::write(&path, b"not a certificate").unwrap();
+        let roots = [
+            RootCaPaths {
+                tdx: Some(path.clone()),
+                ..Default::default()
+            },
+            RootCaPaths {
+                gcp_tpm: Some(path.clone()),
+                ..Default::default()
+            },
+            RootCaPaths {
+                aws_nitro_enclave: Some(path.clone()),
+                ..Default::default()
+            },
+            RootCaPaths {
+                aws_nitro_tpm: Some(path.clone()),
+                ..Default::default()
+            },
+            RootCaPaths {
+                sev_snp_milan: Some(path.clone()),
+                ..Default::default()
+            },
+            RootCaPaths {
+                sev_snp_genoa: Some(path.clone()),
+                ..Default::default()
+            },
+            RootCaPaths {
+                sev_snp_turin: Some(path.clone()),
+                ..Default::default()
+            },
+        ];
+        for root_ca in roots {
+            let config = AttestationVerifierConfig {
+                insecure_allow_external_trust_anchors: true,
+                root_ca,
+                ..Default::default()
+            };
+            let error = AttestationVerifier::load(&config)
+                .err()
+                .expect("invalid external root must fail during load");
+            assert!(
+                format!("{error:#}").contains("root CA"),
+                "unexpected error: {error:#}"
+            );
+        }
+        fs_err::remove_file(path).unwrap();
+    }
 
     fn patch_v1_report_data(attestation: AttestationV1, report_data: [u8; 64]) -> AttestationV1 {
         attestation.with_report_data(report_data)
@@ -2428,42 +2776,63 @@ mod tests {
             digest: vec![event_type as u8; 48],
             event: String::new(),
             event_payload: event_payload.to_vec(),
+            version: EventLogVersion::V1,
+            preimage: None,
         }
     }
 
     #[test]
-    fn tdx_event_log_string_always_keeps_acpi_data_payloads() {
+    fn get_quote_event_log_keeps_acpi_data_payloads() {
         let mut attestation = dummy_tdx_attestation([0u8; 64]);
         let AttestationQuote::DstackTdx(tdx_quote) = &mut attestation.quote else {
             panic!("expected TDX attestation");
         };
         tdx_quote.event_log = vec![
             tdx_event(0, 10, b"ACPI DATA"),
+            tdx_event(0, 10, b"ACPI DATA"),
+            tdx_event(0, 10, b"ACPI DATA"),
             tdx_event(0, 4, b"boot-payload"),
-            tdx_event(3, 8, b"runtime-payload"),
+            tdx_event(
+                3,
+                cc_eventlog::DSTACK_RUNTIME_EVENT_TYPE,
+                b"v1-runtime-payload",
+            ),
+            {
+                let mut event = tdx_event(
+                    3,
+                    cc_eventlog::DSTACK_RUNTIME_EVENT_TYPE,
+                    b"v2-runtime-payload",
+                );
+                event.version = EventLogVersion::V2;
+                event
+            },
         ];
 
         // The ACPI DATA marker payload is retained regardless of the
         // vm_config's tdx_attestation_variant (including no vm_config at
         // all), so a verifier can choose lite verification for any TDX boot.
-        for config in [
-            r#"{"tdx_attestation_variant":"lite"}"#,
-            r#"{"tdx_attestation_variant":"legacy"}"#,
-            "",
-        ] {
-            let events: Vec<TdxEvent> = serde_json::from_str(
-                &attestation
-                    .get_tdx_event_log_string_for_config(config)
-                    .expect("TDX event log"),
-            )
-            .unwrap_or_else(|e| panic!("decode event log for config {config:?}: {e}"));
-            assert_eq!(
-                events[0].event_payload, b"ACPI DATA",
-                "config {config:?} must keep the ACPI DATA marker payload"
-            );
-            assert!(events[1].event_payload.is_empty());
-            assert!(events[2].event_payload.is_empty());
-        }
+        let events: Vec<TdxEvent> = serde_json::from_str(
+            &attestation
+                .get_tdx_event_log_string()
+                .expect("TDX event log"),
+        )
+        .unwrap_or_else(|e| panic!("decode GetQuote event log: {e}"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| cc_eventlog::tdx::is_tdx_acpi_data_event(event))
+                .count(),
+            3,
+            "GetQuote must retain all three TDX-lite ACPI DATA markers"
+        );
+        assert!(events[3].event_payload.is_empty());
+        assert_eq!(events[4].event_payload, b"v1-runtime-payload");
+        assert!(
+            events[4].preimage.is_none(),
+            "V1 output must remain unchanged"
+        );
+        assert_eq!(events[5].event_payload, b"v2-runtime-payload");
+        assert!(events[5].preimage.is_some(), "V2 must include its preimage");
     }
 
     #[test]
@@ -2472,7 +2841,10 @@ mod tests {
         let content = b"test content";
 
         let report_data = content_type.to_report_data(content);
-        assert_eq!(hex::encode(report_data), "7ea0b744ed5e9c0c83ff9f575668e1697652cd349f2027cdf26f918d4c53e8cd50b5ea9b449b4c3d50e20ae00ec29688d5a214e8daff8a10041f5d624dae8a01");
+        assert_eq!(
+            hex::encode(report_data),
+            "7ea0b744ed5e9c0c83ff9f575668e1697652cd349f2027cdf26f918d4c53e8cd50b5ea9b449b4c3d50e20ae00ec29688d5a214e8daff8a10041f5d624dae8a01"
+        );
 
         // Test SHA-256
         let result = content_type
@@ -2553,6 +2925,40 @@ mod tests {
     }
 
     #[test]
+    fn v1_dstack_with_v1_events_converts_losslessly_to_legacy() {
+        let mut legacy = dummy_tdx_attestation([0x5a; 64]);
+        legacy.runtime_events.push(cc_eventlog::RuntimeEvent::new(
+            "legacy-event".into(),
+            vec![1, 2, 3],
+            cc_eventlog::EventLogVersion::V1,
+        ));
+        let converted = legacy.clone().into_v1().try_into_legacy().unwrap();
+        assert_eq!(converted.report_data, legacy.report_data);
+        assert_eq!(converted.runtime_events.len(), 1);
+        assert!(matches!(
+            converted.into_versioned(),
+            VersionedAttestation::V0 { .. }
+        ));
+    }
+
+    #[test]
+    fn v1_conversion_rejects_lossy_legacy_projection() {
+        let pod = dummy_tdx_attestation([0x5b; 64])
+            .into_v1()
+            .into_dstack_pod("payload".into());
+        assert!(pod.try_into_legacy().is_err());
+        let mut v2 = dummy_tdx_attestation([0x5c; 64]).into_v1();
+        if let StackEvidence::Dstack { runtime_events, .. } = &mut v2.stack {
+            runtime_events.push(cc_eventlog::RuntimeEvent::new(
+                "v2-event".into(),
+                vec![4, 5, 6],
+                cc_eventlog::EventLogVersion::V2,
+            ));
+        }
+        assert!(v2.try_into_legacy().is_err());
+    }
+
+    #[test]
     fn versioned_v0_projects_to_v1() {
         let projected = dummy_tdx_attestation([5u8; 64]).into_versioned().into_v1();
         assert!(matches!(projected.platform, PlatformEvidence::Tdx { .. }));
@@ -2568,6 +2974,81 @@ mod tests {
             }
             _ => panic!("expected dstack stack"),
         }
+    }
+
+    #[test]
+    fn into_versioned_uses_v0_when_all_events_are_v1() {
+        let mut att = dummy_tdx_attestation([7u8; 64]);
+        att.runtime_events.push(cc_eventlog::RuntimeEvent::new(
+            "app-id".into(),
+            vec![1, 2, 3],
+            cc_eventlog::EventLogVersion::V1,
+        ));
+        let versioned = att.into_versioned();
+        assert!(
+            matches!(versioned, VersionedAttestation::V0 { .. }),
+            "V1-only events should stay on the V0/SCALE wire format"
+        );
+    }
+
+    #[test]
+    fn into_versioned_upgrades_to_v1_when_any_event_is_v2() {
+        let mut att = dummy_tdx_attestation([8u8; 64]);
+        let AttestationQuote::DstackTdx(tdx_quote) = &mut att.quote else {
+            panic!("expected TDX attestation");
+        };
+        tdx_quote.event_log.push(
+            cc_eventlog::RuntimeEvent::new(
+                "compose-hash".into(),
+                vec![4, 5, 6],
+                cc_eventlog::EventLogVersion::V2,
+            )
+            .into(),
+        );
+        att.runtime_events.push(cc_eventlog::RuntimeEvent::new(
+            "app-id".into(),
+            vec![1, 2, 3],
+            cc_eventlog::EventLogVersion::V1,
+        ));
+        att.runtime_events.push(cc_eventlog::RuntimeEvent::new(
+            "compose-hash".into(),
+            vec![4, 5, 6],
+            cc_eventlog::EventLogVersion::V2,
+        ));
+        // RA-TLS certificates use the stripped representation. Its runtime
+        // events must retain the advertised digest paired with each preimage.
+        let encoded = att.into_versioned().into_stripped().to_bytes().unwrap();
+        let VersionedAttestation::V1 { attestation } =
+            VersionedAttestation::from_bytes(&encoded).unwrap()
+        else {
+            panic!("presence of a V2 event must force the V1 msgpack wire format");
+        };
+        let PlatformEvidence::Tdx { event_log, .. } = attestation.platform else {
+            panic!("expected TDX platform evidence");
+        };
+        assert!(
+            event_log[0].preimage.is_some(),
+            "serialized V2 TDX events must carry their canonical digest preimage"
+        );
+        cc_eventlog::tdx::validate_v2_preimages(&event_log).unwrap();
+    }
+    fn v1_event(event: String, payload: Vec<u8>) -> RuntimeEvent {
+        RuntimeEvent::new(event, payload, EventLogVersion::V1)
+    }
+
+    #[test]
+    fn init_script_hashes_exclude_application_events_after_system_ready() {
+        let events = vec![
+            v1_event("init-script-hash".into(), vec![0x11; 32]),
+            v1_event("init-script-hash".into(), vec![0x22; 32]),
+            v1_event("system-ready".into(), Vec::new()),
+            v1_event("init-script-hash".into(), vec![0xff; 32]),
+        ];
+
+        assert_eq!(
+            find_event_payloads(&events, "init-script-hash"),
+            vec![vec![0x11; 32], vec![0x22; 32]]
+        );
     }
 
     #[test]
@@ -2621,13 +3102,13 @@ mod tests {
 
         let mr_key_provider = sha256(b"aws nitrotpm key provider");
         let events = vec![
-            RuntimeEvent::new("system-preparing".into(), Vec::new()),
-            RuntimeEvent::new("app-id".into(), vec![0x11; 20]),
-            RuntimeEvent::new("compose-hash".into(), vec![0x22; 32]),
-            RuntimeEvent::new("instance-id".into(), vec![0x33; 20]),
-            RuntimeEvent::new("boot-mr-done".into(), Vec::new()),
-            RuntimeEvent::new("key-provider".into(), b"tpm".to_vec()),
-            RuntimeEvent::new("system-ready".into(), Vec::new()),
+            v1_event("system-preparing".into(), Vec::new()),
+            v1_event("app-id".into(), vec![0x11; 20]),
+            v1_event("compose-hash".into(), vec![0x22; 32]),
+            v1_event("instance-id".into(), vec![0x33; 20]),
+            v1_event("boot-mr-done".into(), Vec::new()),
+            v1_event("key-provider".into(), b"tpm".to_vec()),
+            v1_event("system-ready".into(), Vec::new()),
         ];
         let replayed_pcr14 = cc_eventlog::replay_events::<Sha384>(&events, None);
         pcrs.insert(AWS_NITRO_TPM_EVENT_PCR, replayed_pcr14.to_vec());
@@ -2654,7 +3135,7 @@ mod tests {
         );
 
         let mut changed_events = events.clone();
-        changed_events[2] = RuntimeEvent::new("compose-hash".into(), vec![0xee; 32]);
+        changed_events[2] = v1_event("compose-hash".into(), vec![0xee; 32]);
         let changed_pcr14 = cc_eventlog::replay_events::<Sha384>(&changed_events, None);
         let mut changed_pcrs = pcrs.clone();
         changed_pcrs.insert(AWS_NITRO_TPM_EVENT_PCR, changed_pcr14.to_vec());
@@ -2708,14 +3189,14 @@ mod tests {
         // Single PCR14 lane: all events (including after system-ready) are
         // measured and must be replayed for full (non-boottime) decode.
         let events = vec![
-            RuntimeEvent::new("system-preparing".into(), Vec::new()),
-            RuntimeEvent::new("app-id".into(), vec![0x11; 20]),
-            RuntimeEvent::new("compose-hash".into(), vec![0x22; 32]),
-            RuntimeEvent::new("instance-id".into(), vec![0x33; 20]),
-            RuntimeEvent::new("boot-mr-done".into(), Vec::new()),
-            RuntimeEvent::new("storage-fs".into(), b"ext4".to_vec()),
-            RuntimeEvent::new("system-ready".into(), Vec::new()),
-            RuntimeEvent::new("app-runtime".into(), b"ready".to_vec()),
+            v1_event("system-preparing".into(), Vec::new()),
+            v1_event("app-id".into(), vec![0x11; 20]),
+            v1_event("compose-hash".into(), vec![0x22; 32]),
+            v1_event("instance-id".into(), vec![0x33; 20]),
+            v1_event("boot-mr-done".into(), Vec::new()),
+            v1_event("storage-fs".into(), b"ext4".to_vec()),
+            v1_event("system-ready".into(), Vec::new()),
+            v1_event("app-runtime".into(), b"ready".to_vec()),
         ];
 
         let full_pcr = cc_eventlog::replay_events::<Sha384>(&events, None);
@@ -2763,10 +3244,7 @@ mod tests {
             .iter()
             .take_while(|event| event.event != "boot-mr-done")
             .cloned()
-            .chain(std::iter::once(RuntimeEvent::new(
-                "boot-mr-done".into(),
-                Vec::new(),
-            )))
+            .chain(std::iter::once(v1_event("boot-mr-done".into(), Vec::new())))
             .collect();
         let mut early_pcrs = pcrs.clone();
         early_pcrs.insert(AWS_NITRO_TPM_EVENT_PCR, early_pcr.to_vec());
@@ -2782,5 +3260,39 @@ mod tests {
             ])
         );
         Ok(())
+    }
+
+    #[test]
+    fn versioned_wire_formats_reject_malformed_boundaries() {
+        assert!(VersionedAttestation::from_bytes(&[]).is_err());
+        assert!(VersionedAttestation::from_bytes(&[0xff]).is_err());
+        assert!(VersionedAttestation::from_bytes(&vec![0xff; MAX_ATTESTATION_BYTES + 1]).is_err());
+
+        let legacy = dummy_tdx_attestation([0x31; 64]).into_versioned();
+        assert!(matches!(legacy, VersionedAttestation::V0 { .. }));
+        let legacy_bytes = legacy.to_bytes().unwrap();
+        let decoded = VersionedAttestation::from_bytes(&legacy_bytes).unwrap();
+        assert_eq!(decoded.into_v1().report_data().unwrap(), [0x31; 64]);
+        assert!(VersionedAttestation::from_bytes(&legacy_bytes[..legacy_bytes.len() - 1]).is_err());
+        assert!(
+            VersionedAttestation::from_bytes(&[legacy_bytes.as_slice(), &[0xaa]].concat()).is_err()
+        );
+
+        let current = dummy_tdx_attestation([0x32; 64])
+            .into_v1()
+            .into_dstack_pod("versioned-boundary".into());
+        let current = VersionedAttestation::V1 {
+            attestation: current,
+        };
+        let current_bytes = current.to_bytes().unwrap();
+        let decoded = VersionedAttestation::from_bytes(&current_bytes).unwrap();
+        assert_eq!(decoded.into_v1().report_data().unwrap(), [0x32; 64]);
+        assert!(
+            VersionedAttestation::from_bytes(&current_bytes[..current_bytes.len() - 1]).is_err()
+        );
+        assert!(
+            VersionedAttestation::from_bytes(&[current_bytes.as_slice(), &[0xaa]].concat())
+                .is_err()
+        );
     }
 }

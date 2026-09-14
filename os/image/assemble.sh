@@ -16,7 +16,7 @@ DSTACK_EFI_PART_GUID=${DSTACK_EFI_PART_GUID:-d5acc000-0000-4000-8000-00000000000
 
 usage() {
     cat <<EOF
-Usage: ${0##*/} --manifest PATH
+Usage: ${0##*/} --manifest PATH [--validate-only]
 
 Assemble a release image from the backend-neutral OS artifact manifest.
 
@@ -29,15 +29,21 @@ Environment:
   NITRO_TPM_PCR_COMPUTE_BIN  Pinned host nitro-tpm-pcr-compute (required for
                          UKI AWS PCRs; overrides PATH lookup)
   NITRO_TPM_PCR_PK/KEK/DB    Optional Secure Boot ESL paths for PCR7
+  --validate-only          Validate the manifest and referenced artifacts only
 EOF
 }
 
 MANIFEST=
+VALIDATE_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --manifest)
             MANIFEST=$2
             shift 2
+            ;;
+        --validate-only)
+            VALIDATE_ONLY=1
+            shift
             ;;
         -h|--help)
             usage
@@ -75,10 +81,61 @@ with open(manifest_path, encoding="utf-8") as file:
 
 if data.get("schema_version") != 1:
     raise SystemExit("unsupported artifact manifest schema_version")
-if not isinstance(data.get("image", {}).get("is_dev"), bool):
-    raise SystemExit("image.is_dev must be a boolean")
-
 base = os.path.dirname(manifest_path)
+
+def exact_keys(obj, path, required_keys, optional_keys=()):
+    if not isinstance(obj, dict):
+        raise SystemExit(f"manifest field must be an object: {path}")
+    required_keys = set(required_keys)
+    allowed_keys = required_keys | set(optional_keys)
+    missing = sorted(required_keys - set(obj))
+    extra = sorted(set(obj) - allowed_keys)
+    if missing:
+        raise SystemExit(f"missing manifest field: {path}." + missing[0])
+    if extra:
+        raise SystemExit(f"unknown manifest field: {path}." + extra[0])
+
+exact_keys(
+    data,
+    "manifest",
+    ("schema_version", "backend", "image", "source", "boot", "verity", "artifacts"),
+    ("backend_metadata",),
+)
+exact_keys(data["image"], "image", ("name", "version", "flavor", "is_dev"))
+exact_keys(data["source"], "source", ("git_revision",))
+exact_keys(data["boot"], "boot", ("ovmf_variant",))
+exact_keys(data["verity"], "verity", ("root_hash", "data_size"))
+exact_keys(
+    data["artifacts"],
+    "artifacts",
+    ("initramfs", "kernel", "firmware", "rootfs_verity", "firmware_sev", "uki"),
+)
+if "backend_metadata" in data and not isinstance(data["backend_metadata"], dict):
+    raise SystemExit("manifest field must be an object: backend_metadata")
+
+def nonempty_string(value, path):
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"manifest field must be a non-empty string: {path}")
+    return value
+
+for path, value in (
+    ("backend", data["backend"]),
+    ("image.name", data["image"]["name"]),
+    ("image.version", data["image"]["version"]),
+    ("image.flavor", data["image"]["flavor"]),
+    ("source.git_revision", data["source"]["git_revision"]),
+    ("boot.ovmf_variant", data["boot"]["ovmf_variant"]),
+    ("verity.root_hash", data["verity"]["root_hash"]),
+):
+    nonempty_string(value, path)
+if not isinstance(data["image"]["is_dev"], bool):
+    raise SystemExit("image.is_dev must be a boolean")
+data_size = data["verity"]["data_size"]
+if isinstance(data_size, bool) or not (
+    isinstance(data_size, int) and data_size >= 1
+    or isinstance(data_size, str) and data_size.isdigit() and not data_size.startswith("0")
+):
+    raise SystemExit("verity.data_size must be a positive integer")
 
 def required(obj, *keys):
     value = obj
@@ -133,6 +190,10 @@ PYMANIFEST
 if [ "${#MANIFEST_VALUES[@]}" -ne 15 ]; then
     echo "Error: failed to read artifact manifest: $MANIFEST" >&2
     exit 1
+fi
+if [ "$VALIDATE_ONLY" -eq 1 ]; then
+    echo "Artifact manifest is valid: $MANIFEST"
+    exit 0
 fi
 
 BACKEND=${MANIFEST_VALUES[0]}
@@ -306,11 +367,29 @@ build_uki_disk_image() {
         tmp_dir=$(mktemp -d)
         trap 'rm -rf "$tmp_dir"' EXIT
 
-        # Create EFI filesystem with UKI as bootloader
+        # Fix both the FAT volume metadata and directory entry timestamps.
+        # mmd stamps new directories with wall-clock time, so populate the
+        # filesystem recursively from a normalized host-side tree instead.
         local efi_img=${tmp_dir}/efi.img
-        mkfs.vfat -F 32 -n DSTACKEFI -C "$efi_img" $((efi_size_aligned / 1024)) >/dev/null
-        mmd -i "$efi_img" ::EFI ::EFI/BOOT
-        mcopy -i "$efi_img" "$uki_file" ::EFI/BOOT/BOOTX64.EFI
+        local efi_tree=${tmp_dir}/tree
+        mkdir -p "$efi_tree/EFI/BOOT"
+        cp "$uki_file" "$efi_tree/EFI/BOOT/BOOTX64.EFI"
+        # FAT stores local time and mtools converts using TZ, so the image
+        # would otherwise differ between builders in different time zones.
+        export TZ=UTC
+        # FAT timestamps start at 1980-01-01, so a Unix epoch of 0 does not
+        # round-trip: it wraps and every directory entry is dated 2107. No
+        # backend entrypoint exports SOURCE_DATE_EPOCH today, so clamp rather
+        # than fall back to 0.
+        local fat_epoch=${SOURCE_DATE_EPOCH:-0}
+        if [ "$fat_epoch" -lt 315532800 ]; then
+            fat_epoch=315532800
+        fi
+        find "$efi_tree" -print0 | xargs -0r touch --no-dereference \
+          --date="@${fat_epoch}"
+        mkfs.vfat --invariant -F 32 -n DSTACKEFI -C "$efi_img" \
+          $((efi_size_aligned / 1024)) >/dev/null
+        mcopy -smp -i "$efi_img" "$efi_tree/EFI" ::
 
         dd if="$efi_img" of="$disk_img" bs=$align seek=$((efi_start / align)) conv=notrunc status=none
         dd if="$rootfs_img" of="$disk_img" bs=$align seek=$((rootfs_start / align)) conv=notrunc status=none
@@ -332,6 +411,20 @@ verbose rm -rf "${OUTPUT_DIR}/"
 verbose mkdir -p "${OUTPUT_DIR}/"
 verbose cp "$INITRAMFS_IMAGE" "${OUTPUT_DIR}/initramfs.cpio.gz"
 verbose cp "$KERNEL_IMAGE" "${OUTPUT_DIR}/bzImage"
+# QEMU acts as the boot loader for -kernel and fills in the setup-header fields
+# the Linux boot protocol expects a boot loader to supply; OVMF measures the
+# result into RTMR[1]. QEMU >= 10.2 stopped doing that for confidential guests,
+# so leaving the header as built would make the same image measure differently
+# per QEMU version. Normalizing here, and again in OVMF before it measures,
+# makes RTMR[1] the plain Authenticode hash of this file. Runs before
+# tdx-measurement-cbor and sha256sum.txt below, so both cover the normalized
+# kernel. The matching half is in OVMF: metadata.json declares
+# kernel_header_normalized below, and what makes that declaration true is
+# 0007-OvmfPkg-QemuKernelLoaderFsDxe-normalize-setup-header.patch, which this
+# same build applies -- ovmf-build.sh and the bitbake recipe both fail if it
+# does not apply. See os/image/README.md.
+verbose "$(dirname "${BASH_SOURCE[0]}")/normalize-kernel-header.py" \
+    "${OUTPUT_DIR}/bzImage"
 verbose cp "$OVMF_FIRMWARE" "${OUTPUT_DIR}/ovmf.fd"
 
 # AMD SEV firmware (additive). Shipped alongside the TDX firmware so a SEV-SNP
@@ -361,22 +454,27 @@ create_partitioned_rootfs "$ROOTFS_IMAGE" "${OUTPUT_DIR}/rootfs.img.parted.verit
 
 echo "Generating metadata.json to ${OUTPUT_DIR}/metadata.json (ovmf_variant=$OVMF_VARIANT)"
 
-KARG0="console=ttyS0 init=/init panic=1 net.ifnames=0 biosdevname=0"
-KARG1="mce=off oops=panic pci=noearly pci=nommconf random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock"
-KARG2="dstack.rootfs_hash=$ROOT_HASH dstack.rootfs_size=$DATA_SIZE"
+# shellcheck source=kernel-cmdline.sh
+# The prek hook runs shellcheck without -x, so the path above documents the
+# target but cannot be followed; SC1091 is noise rather than a finding.
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/kernel-cmdline.sh"
+KERNEL_CMDLINE=$(dstack_kernel_cmdline "$ROOT_HASH" "$DATA_SIZE")
 
 cat <<EOF > "${OUTPUT_DIR}/metadata.json"
 {
     "bios": "ovmf.fd",${BIOS_SEV_JSON}
     "kernel": "bzImage",
-    "cmdline": "$KARG0 $KARG1 $KARG2",
+    "cmdline": "$KERNEL_CMDLINE",
     "initrd": "initramfs.cpio.gz",
     "rootfs": "rootfs.img.parted.verity",
     "version": "$DSTACK_VERSION",
     "git_revision": "$GIT_REVISION",
+    "builder": "$BACKEND",
     "shared_ro": true,
     "is_dev": ${IS_DEV},
-    "ovmf_variant": "$OVMF_VARIANT"
+    "ovmf_variant": "$OVMF_VARIANT",
+    "kernel_header_normalized": true
 }
 EOF
 
@@ -399,13 +497,12 @@ if [ "$ENABLE_UKI_IMAGE" = "1" ]; then
         echo "Skipping UKI disk image creation because the backend did not export a UKI" >&2
     elif command -v sgdisk >/dev/null && \
          command -v mkfs.vfat >/dev/null && \
-         command -v mcopy >/dev/null && \
-         command -v mmd >/dev/null; then
+         command -v mcopy >/dev/null; then
         create_uki_artifacts "${OUTPUT_DIR}"
         UKI_CREATED=1
     else
         echo "Error: cannot create UKI disk image because required tools are missing" >&2
-        echo "Missing tools are among: sgdisk (gdisk), mkfs.vfat (dosfstools), mcopy/mmd (mtools)" >&2
+        echo "Missing tools are among: sgdisk (gdisk), mkfs.vfat (dosfstools), mcopy (mtools)" >&2
         echo "Install them (e.g. apt-get install -y gdisk dosfstools mtools) or set ENABLE_UKI_IMAGE=0" >&2
         exit 1
     fi
@@ -419,6 +516,14 @@ if [[ "$UKI_CREATED" = "1" ]]; then
     fi
     echo "Generating measurement.gcp.cbor via ${DSTACK_MR_BIN}"
     "${DSTACK_MR_BIN}" gcp-measurement-cbor "${OUTPUT_DIR}/auth_hash.txt" > "${OUTPUT_DIR}/measurement.gcp.cbor"
+    if [[ "$IS_DEV" = "true" ]]; then
+        gcp_event_log_template="${GCP_TPM_EVENT_LOG_TEMPLATE:-$(dirname "$0")/../../dstack/cc-eventlog/samples/tpm_eventlog.bin}"
+        echo "Generating image-specific GCP TPM event log for the dev image"
+        python3 "$(dirname "$0")/gcp-tpm-eventlog.py" \
+            --template "$gcp_event_log_template" \
+            --uki-hash "${OUTPUT_DIR}/auth_hash.txt" \
+            --output "${OUTPUT_DIR}/measurement.gcp.eventlog.bin"
+    fi
     HAVE_MEASUREMENT_GCP=1
 fi
 
@@ -464,14 +569,18 @@ if [[ "$UKI_CREATED" = "1" ]]; then
         echo "measurement.aws.cbor must be fixed at assemble time for a stable os_image_hash." >&2
         exit 1
     fi
-    echo "Generating AWS PCRs via host ${pcr_compute_bin}"
+    echo "Generating AWS PCRs and replay events via host ${pcr_compute_bin}"
     pcr_args=(--image "$uki_abs")
     # Secure Boot variable stores (optional; affects PCR7)
     [[ -n "${NITRO_TPM_PCR_PK:-}" ]] && pcr_args+=(--PK "$NITRO_TPM_PCR_PK")
     [[ -n "${NITRO_TPM_PCR_KEK:-}" ]] && pcr_args+=(--KEK "$NITRO_TPM_PCR_KEK")
     [[ -n "${NITRO_TPM_PCR_DB:-}" ]] && pcr_args+=(--db "$NITRO_TPM_PCR_DB")
-    pcr_json=$("$pcr_compute_bin" "${pcr_args[@]}") \
+    pcr_trace="${OUTPUT_DIR}/aws-pcr-compute.trace"
+    pcr_json_path="${OUTPUT_DIR}/aws-pcrs.json"
+    pcr_json=$(RUST_LOG=nitro_tpm_pcr_compute=debug \
+        "$pcr_compute_bin" "${pcr_args[@]}" 2>"$pcr_trace") \
         || { echo "Error: nitro-tpm-pcr-compute failed" >&2; exit 1; }
+    printf '%s\n' "$pcr_json" > "$pcr_json_path"
 
     pcr4=$(jq -r '.Measurements.PCR4 // empty' <<<"$pcr_json")
     pcr7=$(jq -r '.Measurements.PCR7 // empty' <<<"$pcr_json")
@@ -484,8 +593,11 @@ if [[ "$UKI_CREATED" = "1" ]]; then
     echo "Generating measurement.aws.cbor via ${DSTACK_MR_BIN}"
     "${DSTACK_MR_BIN}" aws-measurement-cbor "$pcr4" "$pcr7" "$pcr12" \
         > "${OUTPUT_DIR}/measurement.aws.cbor"
-    # Keep a machine-readable side-car for verifier-side PCR comparison.
-    printf '%s\n' "$pcr_json" > "${OUTPUT_DIR}/aws-pcrs.json"
+    python3 "$(dirname "$0")/aws-pcr-replay.py" \
+        --trace "$pcr_trace" \
+        --measurements "$pcr_json_path" \
+        --output "${OUTPUT_DIR}/measurement.aws.replay.json"
+    rm "$pcr_trace"
     HAVE_MEASUREMENT_AWS=1
 fi
 
@@ -498,7 +610,7 @@ if [ "$HAVE_MEASUREMENT_GCP" = "1" ]; then
     CHECKSUM_FILES+=(measurement.gcp.cbor)
 fi
 if [ "$HAVE_MEASUREMENT_AWS" = "1" ]; then
-    CHECKSUM_FILES+=(measurement.aws.cbor)
+    CHECKSUM_FILES+=(measurement.aws.cbor measurement.aws.replay.json)
 fi
 (
     cd "${OUTPUT_DIR}/"
@@ -522,9 +634,12 @@ if [ "$DSTACK_TAR_RELEASE" = "1" ]; then
     fi
     if [ "$HAVE_MEASUREMENT_GCP" = "1" ]; then
         BARE_METAL_FILES+=(measurement.gcp.cbor)
+        if [[ "$IS_DEV" = "true" ]]; then
+            BARE_METAL_FILES+=(measurement.gcp.eventlog.bin)
+        fi
     fi
     if [ "$HAVE_MEASUREMENT_AWS" = "1" ]; then
-        BARE_METAL_FILES+=(measurement.aws.cbor)
+        BARE_METAL_FILES+=(measurement.aws.cbor measurement.aws.replay.json)
     fi
     BARE_METAL_TAR_FILES=()
     for file in "${BARE_METAL_FILES[@]}"; do
@@ -537,7 +652,10 @@ if [ "$DSTACK_TAR_RELEASE" = "1" ]; then
     if [[ "$UKI_CREATED" = "1" ]]; then
         rm -rf "${IMAGE_TAR_UKI}"
         echo "Archiving UKI image to ${IMAGE_TAR_UKI}"
-        UKI_FILES=(disk.raw digest.txt sha256sum.txt measurement.gcp.cbor measurement.aws.cbor)
+        UKI_FILES=(disk.raw digest.txt sha256sum.txt measurement.gcp.cbor measurement.aws.cbor measurement.aws.replay.json)
+        if [[ "$IS_DEV" = "true" ]]; then
+            UKI_FILES+=(measurement.gcp.eventlog.bin)
+        fi
         UKI_TAR_FILES=()
         for file in "${UKI_FILES[@]}"; do
             UKI_TAR_FILES+=("$TAR_DIR_NAME/$file")
