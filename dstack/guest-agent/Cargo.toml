@@ -10,6 +10,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nvattest.workspace = true
 rocket.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -19,14 +20,15 @@ fs-err.workspace = true
 rcgen.workspace = true
 sha2.workspace = true
 clap.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 hex.workspace = true
 serde_json.workspace = true
 bollard.workspace = true
+futures.workspace = true
 chrono.workspace = true
 base64.workspace = true
 rinja.workspace = true
-git-version.workspace = true
+dstack-build-info.workspace = true
 ra-rpc = { workspace = true, features = ["client", "rocket"] }
 dstack-guest-agent-rpc.workspace = true
 ra-tls = { workspace = true, features = ["quote"] }
@@ -55,3 +57,12 @@ rand.workspace = true
 or-panic.workspace = true
 cc-eventlog.workspace = true
 listenfd.workspace = true
+libc.workspace = true
+cached-cell.workspace = true
+lspci.workspace = true
+
+[dev-dependencies]
+# The test-only mock platform builds attestations from a fixture, which needs
+# the synthetic-attestation helpers. Declared here so the production build of
+# this crate does not carry them.
+dstack-attest = { workspace = true, features = ["simulator"] }

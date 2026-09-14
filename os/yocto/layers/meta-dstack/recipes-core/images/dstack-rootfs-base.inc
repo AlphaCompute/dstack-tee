@@ -13,6 +13,9 @@ IMAGE_INSTALL = "\
     nftables \
     docker-moby \
     docker-compose \
+    nerdctl \
+    containerd-cni \
+    stargz-snapshotter \
     dstack-guest \
     wireguard-tools \
     cryptsetup \
@@ -23,7 +26,6 @@ IMAGE_INSTALL = "\
     dstack-zfs \
     dstack-sysbox \
     kernel-module-tun \
-    kernel-module-fuse \
     kernel-module-br-netfilter \
     kernel-module-xt-mark \
     kernel-module-xt-connmark \
@@ -53,6 +55,7 @@ IMAGE_INSTALL = "\
     kernel-module-ip-set-hash-ipport \
     kernel-module-ip-set-hash-ipportip \
     kernel-module-ip-set-hash-ipportnet \
+    kernel-module-ip-set-hash-netport \
     kernel-module-ip-set-hash-netiface \
     kernel-module-ip-set-bitmap-ip \
     kernel-module-ip-set-bitmap-port \
@@ -60,6 +63,14 @@ IMAGE_INSTALL = "\
     kernel-module-xt-set \
     kernel-module-xt-nflog \
     kernel-module-xt-physdev \
+    kernel-module-ebt-arp \
+    kernel-module-ebt-ip \
+    kernel-module-ebt-ip6 \
+    kernel-module-ebt-among \
+    kernel-module-ebt-limit \
+    kernel-module-ebt-vlan \
+    kernel-module-nft-meta-bridge \
+    kernel-module-nft-reject-bridge \
     fuse3 \
     fuse3-utils \
     pigz \
@@ -187,5 +198,6 @@ mkdirs() {
     mkdir -p ${IMAGE_ROOTFS}/etc/wireguard
     mkdir -p ${IMAGE_ROOTFS}/var/lib/docker
     mkdir -p ${IMAGE_ROOTFS}/var/lib/containerd
+    mkdir -p ${IMAGE_ROOTFS}/var/lib/nerdctl
     ln -sf dstack ${IMAGE_ROOTFS}/tapp
 }

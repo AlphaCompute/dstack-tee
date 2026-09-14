@@ -18,24 +18,25 @@ port = 8000
 key = "/etc/kms/certs/rpc.key"
 certs = "/etc/kms/certs/rpc.crt"
 
-[rpc.tls.mutual]
-ca_certs = "/etc/kms/certs/tmp-ca.crt"
-mandatory = false
+# No `[rpc.tls.mutual]`: client certificates are verified by the attestation they
+# carry, not by an issuer CA (see ra-rpc's ratls_client_verifier). Leaving a
+# `mutual` section here is harmless — it is no longer the trust anchor.
 
 [core]
 cert_dir = "/etc/kms/certs"
 subject_postfix = ".dstack"
-admin_token_hash = ""
 site_name = ""
 # Whether trusted RPCs require the KMS to first attest itself to its own
 # auth API. Defaults to true (strict). Set to false ONLY when running KMS
 # outside a TEE (e.g. local dev/testing) where the local guest agent socket
 # is unavailable.
 enforce_self_authorization = true
-# Optional AMD KDS-compatible base URL for SEV-SNP collateral fetches.
-# Leave empty to use the built-in default.
-amd_kds_base_url = ""
-
+# Whether the KMS embeds an attestation in its own RPC certificate. Set false
+# only for local dev/testing where the KMS runs outside a TEE. This narrows what
+# the KMS asserts about itself and relaxes no verification: quotes presented to
+# the KMS are still fully checked, and another KMS refuses to onboard from an
+# unattested one.
+attest_rpc_cert = true
 # AMD SEV-SNP key/cert release remains disabled unless this local KMS gate is
 # explicitly enabled. External auth policy must still allow the verified
 # BootInfo before any sensitive material is returned.
@@ -47,11 +48,47 @@ sev_snp_key_release = false
 # auth policy must still allow the verified BootInfo.
 aws_nitro_tpm_key_release = false
 
+# Optional attestation trust-anchor files. Omitted entries use vendor roots.
+[core.attestation]
+insecure_allow_external_trust_anchors = false
+
+[core.attestation.urls]
+# pccs = "https://pccs.phala.network"
+# amd_kds = "https://kdsintf.amd.com/vcek/v1"
+
+[core.attestation.root_ca]
+# tdx = "/etc/dstack/roots/intel-sgx-root-ca.der"
+# gcp_tpm = "/etc/dstack/roots/gcp-tpm-root-ca.pem"
+# aws_nitro_enclave = "/etc/dstack/roots/aws-nitro-enclave-root-ca.pem"
+# aws_nitro_tpm = "/etc/dstack/roots/aws-nitro-tpm-root-ca.pem"
+# sev_snp_milan = "/etc/dstack/roots/amd-milan-ark.pem"
+# sev_snp_genoa = "/etc/dstack/roots/amd-genoa-ark.pem"
+# sev_snp_turin = "/etc/dstack/roots/amd-turin-ark.pem"
+
 [core.image]
 verify = true
 cache_dir = "/usr/share/dstack/images"
 download_url = "http://localhost:8000/{OS_IMAGE_HASH}.tar.gz"
 download_timeout = "2m"
+
+# Admin API: serves operator RPCs (e.g. ClearImageCache) on a dedicated
+# listener behind the shared HTTP authenticator. Disabled by default; when
+# enabled it fails closed unless auth_token or htpasswd_file is set.
+[core.admin]
+enabled = false
+# Bind address/port for the admin listener (keep it off the public network).
+address = "127.0.0.1"
+port = 8001
+# Shared admin token required by every admin RPC. Can also be supplied via the
+# `DSTACK_KMS_ADMIN_TOKEN` or `ADMIN_API_TOKEN` env vars. Clients send it as
+# `Authorization: Bearer <token>` or the `X-Admin-Token: <token>` header.
+# Required unless insecure_no_auth = true. Generate with: openssl rand -hex 32
+auth_token = ""
+# Optional Apache bcrypt htpasswd file (create with `htpasswd -B -c file admin`).
+htpasswd_file = ""
+# Development/testing escape hatch only. Never enable this on an admin
+# interface that is reachable from the network.
+insecure_no_auth = false
 
 [core.metrics]
 # Expose unauthenticated Prometheus metrics on /metrics.

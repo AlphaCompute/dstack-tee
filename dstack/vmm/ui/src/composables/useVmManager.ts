@@ -28,11 +28,31 @@ type AppCompose = {
   secure_time: boolean;
   requirements?: Requirements;
   storage_fs?: string;
+  storage_discard?: boolean;
   swap_size: number;
   launch_token_hash?: string;
   pre_launch_script?: string;
-  init_script?: string;
+  init_script?: string | string[];
+  event_log_version?: number;
 };
+
+function initScriptList(initScript: string | string[] | undefined): string[] {
+  const scripts = Array.isArray(initScript)
+    ? [...initScript]
+    : initScript
+      ? [initScript]
+      : [];
+  return scripts.length > 0 ? scripts : [''];
+}
+
+function nonEmptyInitScripts(initScripts: string[]): string[] {
+  return initScripts.filter((script) => script.trim());
+}
+
+function compatibleInitScripts(initScripts: string[]): string | string[] | undefined {
+  const scripts = nonEmptyInitScripts(initScripts);
+  return scripts.length === 0 ? undefined : scripts.length === 1 ? scripts[0] : scripts;
+}
 
 type KeyProviderKind = 'none' | 'kms' | 'local' | 'tpm';
 type RequirementPlatform =
@@ -41,7 +61,6 @@ type RequirementPlatform =
   | 'dstack-amd-sev-snp'
   | 'dstack-nitro-enclave';
 type Requirements = {
-  os_version?: string;
   platforms?: RequirementPlatform[];
   tdx_measure_acpi_tables?: boolean;
   launch_token_hash?: string;
@@ -74,6 +93,7 @@ type VmListItem = {
   shutdown_progress?: string;
   image_version?: string;
   interfaces?: VmmTypes.INetworkInterfaceStatus[];
+  running?: boolean;
   configuration?: VmConfiguration;
   appCompose?: AppCompose;
 };
@@ -88,18 +108,36 @@ type PortFormEntry = {
   host_address?: string;
   host_port?: number | null;
   vm_port?: number | null;
+  /**
+   * Which NIC this mapping's traffic enters through. Unset lets the VMM pick.
+   * Carried through edits unchanged: `GetInfo` reports it and this form sends
+   * the whole list back, so dropping it here would silently unpin a mapping
+   * whenever anyone touched an unrelated field.
+   */
+  // `v-model.number` leaves the raw string here when it does not parse, so
+  // an emptied box is `''` rather than `null`. See `normalizePorts`.
+  nic_index?: number | string | null;
 };
 
 type NetworkFormEntry = {
   mode: string;
   bridge_name?: string;
+  /** Pinned at deployment for macvtap NICs; carried through edits unchanged. */
+  parent?: string;
+  /** '' inherits the node default, otherwise 'on' or 'off'. */
+  vhost?: string;
+  /**
+   * '' lets the queue count follow the vCPU count. A `number` once the operator
+   * types into the input: `v-model` casts for `<input type="number">`.
+   */
+  queues?: string | number;
 };
 
 type VmFormState = {
   name: string;
   image: string;
   dockerComposeFile: string;
-  initScript: string;
+  initScripts: string[];
   preLaunchScript: string;
   vcpu: number;
   memory: number;
@@ -114,6 +152,7 @@ type VmFormState = {
   ports: PortFormEntry[];
   encryptedEnvs: EncryptedEnvEntry[];
   storage_fs: string;
+  storage_discard: boolean;
   app_id: string | null;
   key_provider?: KeyProviderKind;
   key_provider_id: string;
@@ -122,6 +161,7 @@ type VmFormState = {
   public_sysinfo: boolean;
   public_tcbinfo: boolean;
   no_tee: boolean;
+  simulated_tee: string;
   pin_numa: boolean;
   hugepages: boolean;
   networks: NetworkFormEntry[];
@@ -129,6 +169,7 @@ type VmFormState = {
   kms_urls: string[];
   gateway_urls: string[];
   stopped: boolean;
+  event_log_version: number;
 };
 
 type UpdateDialogState = {
@@ -136,7 +177,7 @@ type UpdateDialogState = {
   vm: VmListItem | null;
   updateCompose: boolean;
   dockerComposeFile: string;
-  initScript: string;
+  initScripts: string[];
   preLaunchScript: string;
   encryptedEnvs: EncryptedEnvEntry[];
   resetSecrets: boolean;
@@ -175,6 +216,7 @@ type CloneConfigDialogState = {
   hugepages: boolean;
   pin_numa: boolean;
   no_tee: boolean;
+  simulated_tee: string;
   encrypted_env?: Uint8Array;
   app_id?: string;
   stopped: boolean;
@@ -185,7 +227,7 @@ function createVmFormState(preLaunchScript: string): VmFormState {
     name: '',
     image: '',
     dockerComposeFile: '',
-    initScript: '',
+    initScripts: [''],
     preLaunchScript,
     vcpu: 1,
     memory: 2048,
@@ -200,6 +242,7 @@ function createVmFormState(preLaunchScript: string): VmFormState {
     ports: [],
     encryptedEnvs: [],
     storage_fs: '',
+    storage_discard: true,
     app_id: null,
     key_provider: 'kms',
     key_provider_id: '',
@@ -208,6 +251,7 @@ function createVmFormState(preLaunchScript: string): VmFormState {
     public_sysinfo: true,
     public_tcbinfo: true,
     no_tee: false,
+    simulated_tee: '',
     pin_numa: false,
     hugepages: false,
     networks: [],
@@ -215,6 +259,7 @@ function createVmFormState(preLaunchScript: string): VmFormState {
     kms_urls: [],
     gateway_urls: [],
     stopped: false,
+    event_log_version: 1,
   };
 }
 
@@ -224,7 +269,7 @@ function createUpdateDialogState(): UpdateDialogState {
     vm: null,
     updateCompose: false,
     dockerComposeFile: '',
-    initScript: '',
+    initScripts: [''],
     preLaunchScript: '',
     encryptedEnvs: [],
     resetSecrets: false,
@@ -265,6 +310,7 @@ function createCloneConfigDialogState(): CloneConfigDialogState {
     hugepages: false,
     pin_numa: false,
     no_tee: false,
+    simulated_tee: '',
     encrypted_env: undefined,
     app_id: undefined,
     stopped: false,
@@ -327,6 +373,18 @@ fi
     return Array.from(new Set(fallback));
   });
   const defaultBridge = computed(() => config.value.networking?.default_bridge || '');
+  const maxNetQueues = computed(() => config.value.networking?.max_queues || 0);
+  const defaultVhostOn = computed(() => !!config.value.networking?.default_vhost);
+  // Whether the node's own default backend can carry vhost-net and multiqueue.
+  // The RPC accepts the two tuning fields on a mode-less entry regardless --
+  // deliberately, so a NIC that inherits its backend stays tunable across a node
+  // change -- but on a node whose default is user or custom they lie dormant,
+  // and an operator who sets them deserves to be told that rather than discover
+  // it in the interfaces panel afterwards.
+  const defaultModeTunable = computed(() => {
+    const mode = config.value.networking?.default_mode || '';
+    return mode === 'bridge' || mode === 'macvtap';
+  });
   const defaultNetworkingLabel = computed(() => {
     const mode = config.value.networking?.default_mode || '';
     if (mode === 'bridge') {
@@ -389,6 +447,7 @@ fi
       host_address: port.host_address || '127.0.0.1',
       host_port: typeof port.host_port === 'number' ? port.host_port : null,
       vm_port: typeof port.vm_port === 'number' ? port.vm_port : null,
+      nic_index: typeof port.nic_index === 'number' ? port.nic_index : null,
     }));
 
   const normalizePorts = (ports: PortFormEntry[] = []): VmmTypes.IPortMapping[] =>
@@ -399,11 +458,23 @@ fi
           port.host_port === null || port.host_port === undefined ? Number.NaN : Number(port.host_port);
         const vmPort =
           port.vm_port === null || port.vm_port === undefined ? Number.NaN : Number(port.vm_port);
+        // An unpinned mapping must stay unpinned rather than become NIC 0:
+        // the VMM's own default is the first user-mode NIC, not the first NIC.
+        // `v-model.number` hands back the raw string when it does not parse,
+        // so a box the operator cleared arrives as `''`. `Number('')` is 0,
+        // which would pin to NIC 0 the mapping they just unpinned.
+        const nicIndex =
+          port.nic_index === null || port.nic_index === undefined || port.nic_index === ''
+            ? undefined
+            : Number(port.nic_index);
         return {
           protocol,
           host_address: (port.host_address || '127.0.0.1').trim() || '127.0.0.1',
           host_port: hostPort,
           vm_port: vmPort,
+          ...(Number.isInteger(nicIndex) && (nicIndex as number) >= 0
+            ? { nic_index: nicIndex }
+            : {}),
         };
       })
       .filter(
@@ -411,13 +482,7 @@ fi
           port.protocol.length > 0 &&
           Number.isFinite(port.host_port) &&
           Number.isFinite(port.vm_port),
-      )
-      .map((port) => ({
-        protocol: port.protocol,
-        host_address: port.host_address,
-        host_port: port.host_port,
-        vm_port: port.vm_port,
-      }));
+      );
 
   const cloneNetworks = (configuration?: VmConfiguration | null): NetworkFormEntry[] => {
     const configured = configuration?.networks && configuration.networks.length > 0
@@ -426,16 +491,67 @@ fi
     return configured.map((network) => ({
       mode: network.mode || '',
       bridge_name: network.bridge_name || '',
+      parent: network.parent || '',
+      vhost: network.vhost === null || network.vhost === undefined ? '' : (network.vhost ? 'on' : 'off'),
+      queues: network.queues ? String(network.queues) : '',
     }));
   };
 
+  // Queue pairs, whatever shape the model is in.
+  //
+  // Not a string: Vue's `v-model` casts for `<input type="number">`, so this
+  // field is a `string` while it holds a value loaded from `GetInfo` and a
+  // `number` the moment the operator types into it. Assuming either one is how
+  // this threw a `TypeError` out of every deploy that set a queue count.
+  //
+  // The number input already refuses everything but a numeric literal, and the
+  // cast turns `2.7` into `2.7` rather than into `parseInt`'s `2`, so what is
+  // left to check is that the value is a whole number at least one. The node's
+  // cap is deliberately *not* checked here: the server widens it by whatever a
+  // VM already holds, so a client-side copy would refuse an update the server
+  // accepts and leave that VM's networking uneditable.
+  const parseQueueCount = (raw: unknown, label: string): number | undefined => {
+    if (raw === null || raw === undefined || raw === '') {
+      return undefined;
+    }
+    const queues = typeof raw === 'number' ? raw : Number(String(raw).trim());
+    if (!Number.isInteger(queues) || queues < 1) {
+      throw new Error(`${label}: queue pairs must be a whole number of at least 1, or empty to follow the vCPU count; got '${raw}'`);
+    }
+    return queues;
+  };
+
+  // Nothing is filtered out. A mode-less entry is the "keep the node's backend,
+  // change only the data plane" override the RPC accepts, and is what a VM
+  // deployed that way reports back; dropping it would delete a NIC and renumber
+  // the ones after it, which changes their MAC addresses.
+  // A row added here starts with no mode, which the RPC reads as "keep the
+  // node's backend" rather than as a missing field, so the only way to reach an
+  // entry it refuses is to empty a loaded one's bridge or parent, and that
+  // earns an error rather than silence.
   const normalizeNetworks = (networks: NetworkFormEntry[] = []): VmmTypes.INetworkingConfig[] =>
     networks
-      .map((network) => ({
-        mode: (network.mode || '').trim(),
-        bridge_name: network.mode === 'bridge' ? (network.bridge_name || '').trim() : '',
-      }))
-      .filter((network) => network.mode.length > 0);
+      .map((network, index) => {
+        // Leave vhost and queues unset unless the operator picked something, so
+        // the node keeps owning them and can still change them later.
+        const entry: VmmTypes.INetworkingConfig = {
+          mode: (network.mode || '').trim(),
+          bridge_name: network.mode === 'bridge' ? (network.bridge_name || '').trim() : '',
+          parent: network.mode === 'macvtap' ? (network.parent || '').trim() : '',
+        };
+        // The tuning controls are hidden for user mode, so sending values the
+        // operator cannot see would fail the deploy with nothing to fix.
+        if (network.mode !== 'user') {
+          if (network.vhost === 'on' || network.vhost === 'off') {
+            entry.vhost = network.vhost === 'on';
+          }
+          const queues = parseQueueCount(network.queues, `network ${index + 1}`);
+          if (queues !== undefined) {
+            entry.queues = queues;
+          }
+        }
+        return entry;
+      });
 
   function networkModeLabel(mode?: string | null) {
     if (!mode) {
@@ -502,6 +618,7 @@ type CreateVmPayloadSource = {
   hugepages?: boolean;
   pin_numa?: boolean;
   no_tee?: boolean;
+  simulated_tee?: string;
   networks?: NetworkFormEntry[];
     gpus?: VmmTypes.IGpuConfig;
     kms_urls?: string[];
@@ -526,6 +643,7 @@ type CreateVmPayloadSource = {
       hugepages: !!source.hugepages,
       pin_numa: !!source.pin_numa,
       no_tee: source.no_tee ?? false,
+      simulated_tee: source.simulated_tee || undefined,
       networks: normalizedNetworks,
       gpus: source.gpus,
       kms_urls: source.kms_urls?.filter((url) => url && url.trim().length) ?? [],
@@ -718,18 +836,49 @@ type CreateVmPayloadSource = {
     return image?.version;
   };
 
-  const verGE = (versionStr: string, otherVersionStr: string) => {
-    const versionParts = versionStr.split('.').map(Number);
-    const otherParts = otherVersionStr.split('.').map(Number);
-    return (
-      versionParts[0] > otherParts[0] ||
-      (versionParts[0] === otherParts[0] && versionParts[1] > otherParts[1]) ||
-      (versionParts[0] === otherParts[0] && versionParts[1] === otherParts[1] && versionParts[2] >= otherParts[2])
-    );
+  // Mirror of dstack-types::version::Version::parse. The prerelease/build
+  // suffix is stripped at the first '-' or '+', then major.minor[.patch] are
+  // read as decimal integers with patch defaulting to 0. So 0.6.1, 0.6.1-rc1,
+  // 0.6.1.rc1 and 0.6.1+build.5 all parse to the same version: a release
+  // candidate is built from the code of the version it is a candidate for and
+  // must not be feature-gated down to the previous release.
+  //
+  // Returns null when the string is absent or not parseable; verGE then
+  // reports false rather than silently comparing against NaN.
+  const parseVer = (v: string | undefined): [number, number, number] | null => {
+    if (!v) {
+      return null;
+    }
+    // Deliberately not `Number()`: it accepts ' 6', '0x10' and '' where the
+    // Rust parser rejects them, which would let the two sides disagree.
+    const num = (s: string | undefined): number | null =>
+      s !== undefined && /^\d+$/.test(s) ? Number(s) : null;
+    const parts = v.trim().split(/[-+]/)[0].split('.');
+    const major = num(parts[0]);
+    const minor = num(parts[1]);
+    const patch = parts.length > 2 ? num(parts[2]) : 0;
+    if (major === null || minor === null || patch === null) {
+      return null;
+    }
+    return [major, minor, patch];
+  };
+
+  const verGE = (versionStr: string | undefined, otherVersionStr: string) => {
+    const version = parseVer(versionStr);
+    const other = parseVer(otherVersionStr);
+    if (!version || !other) {
+      return false;
+    }
+    for (let i = 0; i < 3; i++) {
+      if (version[i] !== other[i]) {
+        return version[i] > other[i];
+      }
+    }
+    return true;
   };
 
   const appComposeManifestVersion = (versionStr: string | undefined): number | string => {
-    if (versionStr && verGE(versionStr, '0.6.0')) {
+    if (verGE(versionStr, '0.6.0')) {
       return '3';
     }
     return 2;
@@ -742,9 +891,6 @@ type CreateVmPayloadSource = {
       network_info: false,
       compose_version: 1,
     };
-    if (!versionStr) {
-      return features;
-    }
     if (verGE(versionStr, '0.3.3')) {
       features.progress = true;
       features.graceful_shutdown = true;
@@ -804,6 +950,9 @@ type CreateVmPayloadSource = {
 
   async function makeAppComposeFile() {
     const osVersion = imageVersion(vmForm.value.image);
+    if (nonEmptyInitScripts(vmForm.value.initScripts).length > 1 && !verGE(osVersion, '0.6.0')) {
+      throw new Error('Multiple init scripts require a dstack image version 0.6.0 or newer');
+    }
     const appCompose: Record<string, unknown> = {
       manifest_version: appComposeManifestVersion(osVersion),
       name: vmForm.value.name,
@@ -813,10 +962,13 @@ type CreateVmPayloadSource = {
       public_logs: vmForm.value.public_logs,
       public_sysinfo: vmForm.value.public_sysinfo,
       public_tcbinfo: vmForm.value.public_tcbinfo,
-      key_provider_id: vmForm.value.key_provider_id,
+      key_provider_id: vmForm.value.key_provider === 'kms' || vmForm.value.key_provider === 'local'
+        ? vmForm.value.key_provider_id
+        : '',
       allowed_envs: vmForm.value.encryptedEnvs.map((env) => env.key),
       no_instance_id: !vmForm.value.gateway_enabled,
       secure_time: false,
+      storage_discard: vmForm.value.storage_discard,
     };
 
     if (vmForm.value.key_provider !== undefined) {
@@ -835,8 +987,9 @@ type CreateVmPayloadSource = {
       appCompose.storage_fs = vmForm.value.storage_fs;
     }
 
-    if (vmForm.value.initScript?.trim()) {
-      appCompose.init_script = vmForm.value.initScript;
+    const initScripts = compatibleInitScripts(vmForm.value.initScripts);
+    if (initScripts !== undefined) {
+      appCompose.init_script = initScripts;
     }
 
     if (vmForm.value.preLaunchScript?.trim()) {
@@ -846,6 +999,10 @@ type CreateVmPayloadSource = {
     const swapBytes = Math.max(0, Math.round(vmForm.value.swap_size || 0));
     if (swapBytes > 0) {
       appCompose.swap_size = swapBytes;
+    }
+
+    if (vmForm.value.event_log_version && vmForm.value.event_log_version !== 1) {
+      appCompose.event_log_version = vmForm.value.event_log_version;
     }
 
     const launchToken = vmForm.value.encryptedEnvs.find((env) => env.key === 'APP_LAUNCH_TOKEN');
@@ -868,6 +1025,9 @@ type CreateVmPayloadSource = {
       docker_compose_file: updateDialog.value.dockerComposeFile || currentAppCompose.docker_compose_file,
     };
     const targetManifestVersion = appComposeManifestVersion(imageVersion(updateDialog.value.image));
+    if (nonEmptyInitScripts(updateDialog.value.initScripts).length > 1 && targetManifestVersion !== '3') {
+      throw new Error('Multiple init scripts require a dstack image version 0.6.0 or newer');
+    }
     if (targetManifestVersion === '3') {
       appCompose.manifest_version = targetManifestVersion;
     }
@@ -880,7 +1040,7 @@ type CreateVmPayloadSource = {
         appCompose.launch_token_hash = await calcComposeHash(launchToken.value);
       }
     }
-    appCompose.init_script = updateDialog.value.initScript?.trim() || undefined;
+    appCompose.init_script = compatibleInitScripts(updateDialog.value.initScripts);
     appCompose.pre_launch_script = updateDialog.value.preLaunchScript?.trim() || undefined;
 
     const swapBytes = Math.max(0, Math.round(updateDialog.value.swap_size || 0));
@@ -947,6 +1107,11 @@ type CreateVmPayloadSource = {
   function showDeployDialog() {
     showCreateDialog.value = true;
     vmForm.value.encryptedEnvs = [];
+    // A cancelled deploy and "Clone config" both leave their networking behind
+    // in the shared form. Carrying it into the next deploy would silently pin
+    // that VM's backend, bridge, macvtap parent and data plane to another VM's
+    // -- invisibly, since the operator never opened the Networking section.
+    vmForm.value.networks = [];
     vmForm.value.app_id = null;
     vmForm.value.swapValue = 0;
     vmForm.value.swapUnit = 'GB';
@@ -969,7 +1134,7 @@ type CreateVmPayloadSource = {
       vm: detailedVm,
       updateCompose: false,
       dockerComposeFile: detailedVm.appCompose.docker_compose_file || '',
-      initScript: detailedVm.appCompose.init_script || '',
+      initScripts: initScriptList(detailedVm.appCompose.init_script),
       preLaunchScript: detailedVm.appCompose.pre_launch_script || '',
       encryptedEnvs: [],
       resetSecrets: false,
@@ -1080,6 +1245,7 @@ type CreateVmPayloadSource = {
         hugepages: vmForm.value.hugepages,
         pin_numa: vmForm.value.pin_numa,
         no_tee: vmForm.value.no_tee,
+        simulated_tee: vmForm.value.simulated_tee,
         networks: vmForm.value.networks,
         gpus: configGpu(vmForm.value) || undefined,
         kms_urls: vmForm.value.kms_urls,
@@ -1092,7 +1258,7 @@ type CreateVmPayloadSource = {
       loadVMList();
     } catch (error) {
       recordError('Error creating VM', error);
-      alert('Failed to create VM');
+      alert(error instanceof Error ? error.message : 'Failed to create VM');
     }
   }
 
@@ -1178,7 +1344,7 @@ type CreateVmPayloadSource = {
       loadVMList();
     } catch (error) {
       recordError('error upgrading VM', error);
-      alert('failed to upgrade VM');
+      alert(error instanceof Error ? error.message : 'Failed to upgrade VM');
     }
   }
 
@@ -1208,7 +1374,7 @@ type CreateVmPayloadSource = {
       name: `${config.name || vm.name}`,
       image: config.image || '',
       dockerComposeFile: theVm.appCompose?.docker_compose_file || '',
-      initScript: theVm.appCompose?.init_script || '',
+      initScripts: initScriptList(theVm.appCompose?.init_script),
       preLaunchScript: theVm.appCompose?.pre_launch_script || '',
       vcpu: config.vcpu || 1,
       memory: config.memory || 0,
@@ -1223,6 +1389,7 @@ type CreateVmPayloadSource = {
       encryptedEnvs: [], // Clear environment variables
       ports: [], // Clear port mappings
       storage_fs: theVm.appCompose?.storage_fs || 'zfs',
+      storage_discard: theVm.appCompose?.storage_discard ?? true,
       app_id: config.app_id || '',
       kms_urls: config.kms_urls || [],
       key_provider: getKeyProvider(theVm),
@@ -1236,8 +1403,10 @@ type CreateVmPayloadSource = {
       pin_numa: !!config.pin_numa,
       hugepages: !!config.hugepages,
       no_tee: !!config.no_tee,
+      simulated_tee: config.simulated_tee || '',
       user_config: config.user_config || '',
       stopped: !!config.stopped,
+      event_log_version: theVm.appCompose?.event_log_version || 1,
     };
 
     // Show Create VM dialog instead of Clone Config dialog
@@ -1265,6 +1434,7 @@ type CreateVmPayloadSource = {
         hugepages: source.hugepages,
         pin_numa: source.pin_numa,
         no_tee: source.no_tee,
+        simulated_tee: source.simulated_tee,
         networks: source.networks,
         gpus: source.gpus,
         kms_urls: source.kms_urls,
@@ -1358,11 +1528,6 @@ type CreateVmPayloadSource = {
   function openApiDocs() {
     closeSystemMenu();
     window.open('/api-docs/docs', '_blank', 'noopener');
-  }
-
-  function openLegacyUi() {
-    closeSystemMenu();
-    window.open('/v0', '_blank', 'noopener');
   }
 
   function shortUptime(uptime?: string | null) {
@@ -1767,7 +1932,10 @@ type CreateVmPayloadSource = {
     config,
     networkingModes,
     defaultBridge,
+    maxNetQueues,
     defaultNetworkingLabel,
+    defaultModeTunable,
+    defaultVhostOn,
     composeHashPreview,
     updateComposeHashPreview,
     showDeployDialog,
@@ -1807,7 +1975,6 @@ type CreateVmPayloadSource = {
     toggleSystemMenu,
     closeSystemMenu,
     openApiDocs,
-    openLegacyUi,
     reloadVMs,
     devMode,
     toggleDevMode,

@@ -9,14 +9,16 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use fs_err as fs;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::acme_client::{acme_matches, read_pem};
+use crate::acme_client::{acme_matches, read_pem, ChallengeKind, RequiredRecord, ValidationMethod};
+use crate::dns_persist::{resolve_issuer_domain_name, LETS_ENCRYPT_ISSUER_DOMAIN_NAME};
 
 use super::{AcmeClient, Dns01Client};
+use crate::acme_client::advisory_dns_wait;
 
 #[allow(clippy::duplicated_attributes)]
 #[derive(Clone, Debug, bon::Builder)]
@@ -27,6 +29,15 @@ pub struct CertBotConfig {
     auto_set_caa: bool,
     credentials_file: PathBuf,
     auto_create_account: bool,
+    /// ACME challenge used to prove control of the domains.
+    #[builder(default)]
+    challenge: ChallengeKind,
+    /// Issuer Domain Name naming the CA in `dns-persist-01` and CAA records.
+    ///
+    /// Must be one of the `issuer-domain-names` the CA sends in the challenge.
+    #[builder(default = LETS_ENCRYPT_ISSUER_DOMAIN_NAME.to_string())]
+    issuer_domain_name: String,
+    /// Cloudflare API token. Unused, and warned about, under `dns-persist-01`.
     cf_api_token: String,
     cf_api_url: Option<String>,
     cert_file: PathBuf,
@@ -57,17 +68,12 @@ pub struct CertBot {
 
 async fn create_new_account(
     config: &CertBotConfig,
-    dns01_client: Dns01Client,
+    validation: ValidationMethod,
 ) -> Result<AcmeClient> {
     info!("creating new ACME account");
-    let client = AcmeClient::new_account(
-        &config.acme_url,
-        dns01_client,
-        config.max_dns_wait,
-        config.dns_txt_ttl,
-    )
-    .await
-    .context("failed to create new account")?;
+    let client = AcmeClient::new_account(&config.acme_url, validation, dns_wait(config))
+        .await
+        .context("failed to create new account")?;
     let credentials = client
         .dump_credentials()
         .context("failed to dump credentials")?;
@@ -87,39 +93,20 @@ async fn create_new_account(
 impl CertBot {
     /// Build a new `CertBot` from a `CertBotConfig`.
     pub async fn build(config: CertBotConfig) -> Result<Self> {
-        let base_domain = config
-            .cert_subject_alt_names
-            .first()
-            .context("cert_subject_alt_names is empty")?
-            .trim()
-            .trim_start_matches("*.")
-            .trim_end_matches('.')
-            .to_string();
-        let dns01_client = Dns01Client::new_cloudflare(
-            base_domain,
-            config.cf_api_token.clone(),
-            config.cf_api_url.clone(),
-        )
-        .await?;
+        let validation = build_validation_method(&config).await?;
         let acme_client = match fs::read_to_string(&config.credentials_file) {
             Ok(credentials) => {
                 if acme_matches(&credentials, &config.acme_url) {
-                    AcmeClient::load(
-                        dns01_client,
-                        &credentials,
-                        config.max_dns_wait,
-                        config.dns_txt_ttl,
-                    )
-                    .await?
+                    AcmeClient::load(validation, &credentials, dns_wait(&config)).await?
                 } else {
-                    create_new_account(&config, dns01_client).await?
+                    create_new_account(&config, validation).await?
                 }
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 if !config.auto_create_account {
                     return Err(e).context("credentials file not found");
                 }
-                create_new_account(&config, dns01_client).await?
+                create_new_account(&config, validation).await?
             }
             Err(e) => {
                 return Err(e).context("failed to read credentials file");
@@ -149,35 +136,33 @@ impl CertBot {
     /// Run the certbot.
     pub async fn run(&self) {
         loop {
-            match self.renew(false).await {
-                Ok(renewed) => {
-                    if !renewed {
-                        continue;
-                    }
-                    if let Some(hook) = &self.config.renewed_hook {
-                        info!("running renewed hook");
-                        let result = std::process::Command::new("/bin/sh")
-                            .arg("-c")
-                            .arg(hook)
-                            .status();
-                        match result {
-                            Ok(status) => {
-                                if !status.success() {
-                                    error!("renewed hook failed with status: {status}");
-                                }
-                            }
-                            Err(err) => {
-                                error!("failed to run renewed hook: {err:?}");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("failed to run certbot: {e:?}");
-                }
+            if let Err(error) = self.renew_and_run_hook(false).await {
+                error!("failed to run certbot: {error:?}");
             }
             sleep(self.config.renew_interval).await;
         }
+    }
+
+    /// Run one renewal attempt and invoke the configured hook after a commit.
+    pub async fn renew_and_run_hook(&self, force: bool) -> Result<bool> {
+        let renewed = self.renew(force).await?;
+        if !renewed {
+            return Ok(false);
+        }
+        let Some(hook) = &self.config.renewed_hook else {
+            return Ok(true);
+        };
+        info!("running renewed hook");
+        match std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(hook)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => error!("renewed hook failed with status: {status}"),
+            Err(error) => error!("failed to run renewed hook: {error:?}"),
+        }
+        Ok(true)
     }
 
     /// Run the certbot once.
@@ -192,7 +177,8 @@ impl CertBot {
     }
 
     async fn renew_inner(&self, force: bool) -> Result<bool> {
-        let created = self
+        let live_cert_exists = self.config.cert_file.exists() && self.config.key_file.exists();
+        let issued = self
             .acme_client
             .create_cert_if_needed(
                 &self.config.cert_subject_alt_names,
@@ -200,11 +186,30 @@ impl CertBot {
                 &self.config.key_file,
                 &self.config.cert_dir,
             )
-            .await?;
-        if created {
-            info!("created new certificate");
-            return Ok(true);
-        }
+            .await;
+        // A live certificate that does not cover the configured names is
+        // reissued above, and that reissuance keeps failing for as long as the
+        // configuration names something the CA will not validate -- a typo, a
+        // zone the DNS credentials cannot write. Failing the run right here
+        // would take the renewal check below down with it, so one name the
+        // operator got wrong would stop renewing the certificate that is
+        // actually being served, until it expires. The renewal still runs; the
+        // error is reported, and returned below unless the renewal committed
+        // something of its own.
+        let reissue_error = match issued {
+            Ok(true) => {
+                info!("created new certificate");
+                return Ok(true);
+            }
+            Ok(false) => None,
+            // Nothing is being served yet, so there is no renewal to protect
+            // and `auto_renew` has no certificate to read.
+            Err(err) if !live_cert_exists => return Err(err),
+            Err(err) => {
+                error!("failed to issue a certificate for the configured domains: {err:#}");
+                Some(err)
+            }
+        };
         info!("checking if certificate needs to be renewed");
         let renewed = self
             .acme_client
@@ -217,21 +222,25 @@ impl CertBot {
             )
             .await?;
 
-        match renewed {
-            true => {
+        match (renewed, reissue_error) {
+            (true, _) => {
                 info!(
                     "renewed certificate for {}",
                     self.config.cert_file.display()
                 );
+                Ok(true)
             }
-            false => {
+            // The renewal committed nothing, so the reissue failure is the
+            // whole outcome of this run and `renew --once` must report it.
+            (false, Some(err)) => Err(err),
+            (false, None) => {
                 info!(
                     "certificate {} is up to date",
                     self.config.cert_file.display()
                 );
+                Ok(false)
             }
         }
-        Ok(renewed)
     }
 
     /// Set CAA record for the domain.
@@ -239,6 +248,96 @@ impl CertBot {
         self.acme_client
             .set_caa_records(&self.config.cert_subject_alt_names)
             .await
+    }
+
+    /// The DNS records that have to exist for the configured domains.
+    pub fn required_dns_records(&self) -> Vec<RequiredRecord> {
+        self.acme_client
+            .required_dns_records(&self.config.cert_subject_alt_names)
+    }
+}
+
+/// The DNS wait this configuration should actually use.
+///
+/// `renew_timeout` wraps the whole renewal here exactly as it does in the
+/// gateway, and the defaults are skewed the same way -- further, in fact:
+/// `max_dns_wait` defaults to 300s against a 120s renewal budget, so an
+/// unanswered check runs the renewal into its timeout every time instead of
+/// reporting the record it could not see.
+fn dns_wait(config: &CertBotConfig) -> Duration {
+    advisory_dns_wait(config.max_dns_wait, config.renew_timeout)
+}
+
+/// The Issuer Domain Name this configuration names, checked before it is used.
+///
+/// Both challenges read the same setting, so both get the same treatment: empty
+/// means the default, and a value that would not survive being written into a
+/// CAA or validation record is refused here rather than at the point it would
+/// corrupt a zone.
+fn issuer_domain_name(config: &CertBotConfig) -> Result<String> {
+    resolve_issuer_domain_name(&config.issuer_domain_name)
+        .context("invalid issuer_domain_name in the certbot configuration")
+}
+
+/// Resolve the configured challenge into a live validation method.
+///
+/// `dns-01` resolves the Cloudflare zone here, which is an authenticated call,
+/// so a bad credential fails at startup rather than at the first renewal.
+/// `dns-persist-01` talks to no provider at all.
+async fn build_validation_method(config: &CertBotConfig) -> Result<ValidationMethod> {
+    match config.challenge {
+        ChallengeKind::Dns01 => {
+            // Named here rather than left to the provider. `cf_api_token` is
+            // `#[serde(default)]` so a dns-persist-01 config can omit it, which
+            // also means a dns-01 config that forgets it no longer fails
+            // deserialization -- it reaches Cloudflare and comes back as an
+            // "Invalid format for Authorization header", naming the header
+            // instead of the setting the operator has to add.
+            if config.cf_api_token.is_empty() {
+                bail!(
+                    "cf_api_token is required with dns-01, which proves control by writing a \
+                     TXT record through the DNS provider; set it, or switch to \
+                     challenge = \"dns-persist-01\", which needs no provider credential"
+                );
+            }
+            let base_domain = config
+                .cert_subject_alt_names
+                .first()
+                .context("cert_subject_alt_names is empty")?
+                .trim()
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_string();
+            let client = Dns01Client::new_cloudflare(
+                base_domain,
+                config.cf_api_token.clone(),
+                config.cf_api_url.clone(),
+            )
+            .await?;
+            Ok(ValidationMethod::Dns01 {
+                client,
+                txt_ttl: config.dns_txt_ttl,
+                issuer_domain_name: issuer_domain_name(config)?,
+            })
+        }
+        ChallengeKind::DnsPersist01 => {
+            // Refuse rather than silently skip: `auto_set_caa` promises the CAA
+            // records are kept in sync, and without DNS write access nothing here
+            // can keep that promise. `certbot dns-records` prints what to publish.
+            if config.auto_set_caa {
+                bail!(
+                    "auto_set_caa is not supported with dns-persist-01, which has no DNS \
+                     write access; set auto_set_caa = false and publish the records from \
+                     `certbot dns-records` by hand"
+                );
+            }
+            if !config.cf_api_token.is_empty() {
+                warn!("ignoring cf_api_token: dns-persist-01 needs no DNS provider credential");
+            }
+            Ok(ValidationMethod::DnsPersist01 {
+                issuer_domain_name: issuer_domain_name(config)?,
+            })
+        }
     }
 }
 
@@ -259,6 +358,7 @@ pub fn list_certs(workdir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
             certs.push(cert_path);
         }
     }
+    certs.sort();
     Ok(certs)
 }
 
@@ -274,3 +374,37 @@ pub fn list_cert_public_keys(workdir: impl AsRef<Path>) -> Result<BTreeSet<Vec<u
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod listing_tests {
+    use super::list_certs;
+    use fs_err as fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn certificate_directories_are_listed_in_stable_order() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dstack-certbot-list-{}-{nonce}",
+            std::process::id()
+        ));
+        for name in ["0002", "0001"] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("cert.pem"), name).unwrap();
+        }
+
+        let listed = list_certs(&root).unwrap();
+
+        assert_eq!(
+            listed,
+            ["0001", "0002"]
+                .map(|name| root.join(name).join("cert.pem"))
+                .to_vec()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

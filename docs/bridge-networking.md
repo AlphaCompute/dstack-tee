@@ -4,7 +4,7 @@ By default, dstack-vmm uses **user** networking (QEMU's built-in SLIRP stack, no
 
 ## When to use bridge networking
 
-- High connection concurrency (passt becomes CPU-bound at ~25K+ concurrent connections)
+- High connection concurrency (user-mode networking becomes CPU-bound at ~25K+ concurrent connections)
 - Workloads that need full L2 network access
 - Environments where VMs need to be directly reachable on the LAN
 
@@ -21,11 +21,11 @@ bridge = "virbr0"
 ### Per-VM override
 
 Individual VMs can override the global networking mode via:
-- **CLI**: `vmm-cli.py deploy --net bridge` or `--net passt`
+- **CLI**: `vmm-cli.py deploy --net bridge`, `--net user`, or `--net macvtap`
 - **Web UI**: Networking dropdown in the deploy dialog
 - **API**: `networking: { mode: "bridge" }` in `VmConfiguration`
 
-Only the mode is per-VM; the bridge interface name always comes from the global config.
+The bridge interface name comes from the global config unless the node lists it in `cvm.allowed_bridges`. VMs may also override the vhost and queue settings — see [network-data-plane.md](network-data-plane.md).
 
 ## Host setup
 
@@ -90,13 +90,6 @@ sudo sysctl -p /etc/sysctl.d/99-dstack-bridge.conf
 sudo apt install -y dnsmasq
 ```
 
-Install the DHCP notification script (notifies VMM when a VM gets an IP so port forwarding can be established):
-
-```bash
-sudo cp dstack/scripts/dhcp-notify.sh /usr/local/bin/dhcp-notify.sh
-sudo chmod +x /usr/local/bin/dhcp-notify.sh
-```
-
 Create dnsmasq config:
 
 ```ini
@@ -106,10 +99,7 @@ bind-interfaces
 dhcp-range=10.0.100.10,10.0.100.254,255.255.255.0,12h
 dhcp-option=option:router,10.0.100.1
 dhcp-option=option:dns-server,8.8.8.8,1.1.1.1
-dhcp-script=/usr/local/bin/dhcp-notify.sh
 ```
-
-The `dhcp-script` option tells dnsmasq to call the notification script on every lease event. The script sends the MAC and IP to VMM's `ReportDhcpLease` RPC, which triggers automatic port forwarding for the VM.
 
 ```bash
 sudo systemctl restart dnsmasq
@@ -153,29 +143,36 @@ mode = "bridge"
 bridge = "dstack-br0"
 ```
 
-### QEMU bridge helper setup (required for both options)
+### netd is required
 
-The bridge helper allows QEMU to create and attach TAP devices without VMM needing root privileges.
+Bridge networking needs `netd`, the privileged helper that owns every host
+interface a bridge or macvtap NIC uses. It is the same binary:
 
 ```bash
-# Allow QEMU to use the bridge
-sudo mkdir -p /etc/qemu
-echo "allow virbr0" | sudo tee /etc/qemu/bridge.conf
-# Or for manual bridge: echo "allow dstack-br0" | sudo tee /etc/qemu/bridge.conf
-
-# Set setuid on bridge helper
-sudo chmod u+s /usr/lib/qemu/qemu-bridge-helper
+sudo dstack-vmm --config vmm.toml netd
 ```
+
+Nothing else on the node needs `CAP_NET_ADMIN`: the VMM itself still runs
+unprivileged, and `netd` holds the privilege behind a Unix socket whose
+filesystem permissions authorize callers.
+
+This used to be conditional — `netd` built the TAP when libvirt filtering was on
+or when the NIC wanted more than one queue pair, and otherwise QEMU's setuid
+`qemu-bridge-helper` did. Two owners meant two answers to the same questions:
+which netdev QEMU gets, whether vhost is really on, and what a bridge NIC's TAP
+is built with. So a bridge NIC's host interface has one owner now, on every
+node.
+
+`qemu-bridge-helper` is no longer used, and `/etc/qemu/bridge.conf` no longer
+needs an `allow` line for the bridge.
 
 ## How it works
 
-- VMM passes `-netdev bridge,id=net0,br=<bridge>` to QEMU
-- QEMU's bridge helper (setuid) creates a TAP device and attaches it to the bridge
+- `netd` creates a persistent TAP, attaches it to the bridge, binds the nwfilter if the node filters, and the VMM passes `-netdev tap,id=net0,ifname=<tap>,...`
 - Guest MAC address is derived from SHA256 of the VM ID, with an optional configurable prefix (stable across restarts for DHCP IP consistency)
-- The host DHCP server (dnsmasq) assigns an IP and calls `dhcp-notify.sh`, which notifies VMM via the `ReportDhcpLease` RPC
-- VMM matches the MAC address to identify the VM and establishes port forwarding rules
-- When QEMU exits, the TAP device is automatically destroyed
-- VMM does not need root or `CAP_NET_ADMIN`
+- The host DHCP server (dnsmasq) assigns an IP to the VM
+- The TAP outlives QEMU and is deleted when the VMM tears the VM's networking down
+- The VMM process needs neither root nor `CAP_NET_ADMIN`; `netd` holds that privilege in a separate service
 
 ### MAC address prefix
 
@@ -203,15 +200,54 @@ The remaining bytes are derived from the VM ID hash. The prefix applies to all n
 - Docker's nftables chains (`DOCKER-FORWARD`) run before libvirt's but do not block virbr0 traffic
 - Use `setup-bridge.sh check --bridge <name>` to diagnose missing rules
 
-### Mixing networking modes
+### Which NIC a port mapping uses
 
-Bridge and passt VMs can coexist. Set the global default in `vmm.toml` and override per-VM as needed:
+A port mapping says which NIC its traffic enters through:
 
 ```bash
-# Global default is bridge, but deploy this VM with passt
-vmm-cli.py deploy --name my-vm --image dstack-0.5.6 --compose app.yaml --net passt
+vmm-cli.py deploy ... --port udp:0.0.0.0:7483:51820@0 --port tcp:127.0.0.1:7484:8001@0
 ```
 
-### vhost-net and TDX
+Leave `@<nic>` off and the VMM picks the first user-mode NIC — where QEMU's
+`hostfwd=` entries have always gone. If the VM has no user-mode NIC, the mapping
+has no publishing backend and the launch log names it as stranded. A single-NIC
+user-mode VM never needs the suffix.
 
-vhost-net (kernel data plane offload for virtio-net) is **not enabled** for bridge mode. TDX encrypts guest memory, which prevents the host kernel from performing DMA-based packet offload. The default QEMU userspace virtio backend is used instead.
+With several NICs the choice used to be made silently, and not always the way an
+operator would have. A bridge NIC for external traffic beside a user-mode NIC for
+management — the topology multi-NIC was added for — put every published port on
+the *management* NIC: the traffic reached the guest, but over slirp, bypassing
+whatever the bridge NIC's nwfilter was there to enforce and hiding the client's
+address behind the slirp gateway. A second user-mode NIC could never publish
+anything at all, because only the first was ever selected.
+
+A mapping resolves to at most one NIC. The only backend that can carry it is
+QEMU user networking through `hostfwd=`; `netd` builds bridge interfaces but
+does not publish host ports.
+
+### Which ports a bridge NIC can publish
+
+QEMU publishes a port with `hostfwd=` on a user-mode NIC, and that is the only
+mechanism this host has. **The `netd` in this repository builds interfaces; it
+does not forward host ports**, so a bridge NIC cannot carry a port mapping.
+
+`--port …@<nic>` therefore only ever names a user-mode NIC. Pinning to a bridge,
+macvtap or custom NIC is refused at deployment, where the caller is there to be
+told. An unpinned mapping goes to the first user-mode NIC; a VM that has none is
+not refused — it may have been deployed before this — but every mapping it
+strands is named in the launch log.
+
+### Mixing networking modes
+
+Bridge and user-mode VMs can coexist. Set the global default in `vmm.toml` and override per-VM as needed:
+
+```bash
+# Global default is bridge, but deploy this VM with user networking
+vmm-cli.py deploy --name my-vm --image dstack-0.5.6 --compose app.yaml --net user
+```
+
+### vhost-net and multiqueue
+
+Bridge NICs can run on the host kernel's vhost-net data plane and expose several virtio-net queue pairs. Both are off by default and enabled per node or per VM — see [network-data-plane.md](network-data-plane.md) for the knobs, the enablement checklist, the mode support matrix, and how to pick a queue count.
+
+vhost-net works in a TDX guest: the virtio rings and buffers live in shared, unencrypted memory so that a host-side backend can reach them, which is the same mechanism `vhost-vsock-pci` has always relied on.

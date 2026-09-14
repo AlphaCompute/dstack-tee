@@ -7,7 +7,8 @@ use std::{path::Path, time::Duration};
 use anyhow::{anyhow, Context, Result};
 use app::App;
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use config::Config;
+use config::{Config, NetdConfig};
+use dstack_api_auth::{Authenticator, HttpAuthConfig, HttpAuthFairing};
 use guest_api_service::GuestApiHandler;
 use host_api_service::HostApiHandler;
 use main_service::RpcHandler;
@@ -16,7 +17,6 @@ use rocket::{
     fairing::AdHoc,
     figment::{providers::Serialized, Figment},
 };
-use rocket_apitoken::ApiToken;
 use rocket_vsock_listener::VsockListener;
 use supervisor_client::SupervisorClient;
 use tracing::{error, info, warn};
@@ -24,22 +24,22 @@ use tracing::{error, info, warn};
 mod app;
 mod config;
 mod discovery;
+mod gpu_reset;
 mod guest_api_service;
 mod host_api_service;
+mod logrotate;
 mod main_routes;
 mod main_service;
+mod netd;
 mod one_shot;
 mod openapi;
+mod vm_launcher;
 
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
-const GIT_REV: &str = git_version::git_version!(
-    args = ["--abbrev=20", "--always", "--dirty=-modified"],
-    prefix = "git:",
-    fallback = "unknown"
-);
+const GIT_REV: &str = dstack_build_info::git_revision!();
 
 fn app_version() -> String {
-    format!("v{CARGO_PKG_VERSION} ({GIT_REV})")
+    dstack_build_info::app_version!()
 }
 
 #[derive(Parser)]
@@ -48,6 +48,9 @@ struct Args {
     /// Path to the configuration file
     #[arg(short, long)]
     config: Option<String>,
+    /// Override the netd socket used by the VMM (useful without systemd).
+    #[arg(long, global = true)]
+    netd_socket: Option<String>,
     /// Subcommand to run
     #[command(subcommand)]
     command: Option<Command>,
@@ -58,8 +61,22 @@ enum Command {
     /// Start the VMM server (default mode)
     #[default]
     Serve,
+    /// Validate the effective server configuration without starting services.
+    CheckConfig,
     /// One-shot VM execution mode for debugging
     Run(RunArgs),
+    /// Run the privileged TAP and libvirt nwfilter broker.
+    Netd(NetdArgs),
+    /// Internal per-VM QEMU/swtpm launcher.
+    #[command(hide = true)]
+    VmLauncher(VmLauncherArgs),
+}
+
+#[derive(ClapArgs)]
+struct NetdArgs {
+    /// Override the Unix socket configured in [netd].
+    #[arg(long)]
+    socket: Option<String>,
 }
 
 #[derive(ClapArgs)]
@@ -74,20 +91,34 @@ struct RunArgs {
     dry_run: bool,
 }
 
-async fn run_external_api(app: App, figment: Figment, api_auth: ApiToken) -> Result<()> {
+#[derive(ClapArgs)]
+struct VmLauncherArgs {
+    /// Path to the generated VM launch specification.
+    #[arg(long)]
+    spec: String,
+}
+
+async fn run_external_api(app: App, figment: Figment, api_auth: Authenticator) -> Result<()> {
     let version = app_version();
     let openapi_doc = openapi::build_openapi_doc(&version)?;
 
     let external_api = rocket::custom(figment)
         .mount("/", main_routes::routes())
         .mount("/guest", ra_rpc::prpc_routes!(App, GuestApiHandler))
-        .mount("/api", ra_rpc::prpc_routes!(App, HostApiHandler))
         .mount(
             "/prpc",
             ra_rpc::prpc_routes!(App, RpcHandler, trim: "Teepod."),
         )
         .manage(app)
-        .manage(api_auth)
+        .attach(HttpAuthFairing::new(
+            api_auth,
+            HttpAuthConfig {
+                realm: "dstack-vmm API".into(),
+                token_header: Some("X-Admin-Token".into()),
+                allow_get_query_token: true,
+            },
+        ))
+        .mount("/", dstack_api_auth::routes())
         .attach(AdHoc::on_response("Add app rev header", |_req, res| {
             Box::pin(async move {
                 res.set_raw_header("X-App-Version", app_version());
@@ -137,11 +168,27 @@ async fn auto_restart_task(app: App) {
     let mut interval =
         tokio::time::interval(Duration::from_secs(app.config.cvm.auto_restart.interval));
     loop {
+        interval.tick().await;
         info!("Checking for exited VMs");
         if let Err(err) = app.try_restart_exited_vms().await {
             error!("Failed to restart exited VMs: {err:?}");
         }
+    }
+}
+
+async fn log_rotation_task(app: App) {
+    if app.config.cvm.log.max_bytes == 0 {
+        info!("Log rotation is disabled");
+        return;
+    }
+    let mut interval = tokio::time::interval(Duration::from_secs(
+        app.config.cvm.log.check_interval_secs.max(1),
+    ));
+    loop {
         interval.tick().await;
+        if let Err(err) = app.rotate_oversized_logs().await {
+            error!("Failed to rotate logs: {err:?}");
+        }
     }
 }
 
@@ -155,17 +202,75 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let figment = config::load_config_figment(args.config.as_deref());
-    let config = Config::extract_or_default(&figment)?.abs_path()?;
+    // The per-VM launcher must stay minimal: do not load or validate the VMM
+    // server configuration in this mode.
+    if let Some(Command::VmLauncher(launcher_args)) = &args.command {
+        return vm_launcher::run(Path::new(&launcher_args.spec)).await;
+    }
 
-    // Validate host API configuration
+    let figment = config::load_config_figment(args.config.as_deref());
+    if let Some(Command::Netd(netd_args)) = &args.command {
+        let mut netd_config: NetdConfig = figment
+            .extract_inner("netd")
+            .context("failed to load [netd] configuration")?;
+        if let Some(socket) = args.netd_socket.as_deref() {
+            netd_config.socket = socket.into();
+        }
+        if let Some(socket) = netd_args.socket.as_deref() {
+            netd_config.socket = socket.into();
+        }
+        if netd_config.network_filter.is_none() {
+            // netd and the VMM normally share one vmm.toml, so the node has
+            // already stated whether its bridge traffic is filtered and with
+            // what. Reading it here keeps the two from drifting apart, which is
+            // what a second setting to keep in sync would invite.
+            //
+            // A malformed section is an error rather than a default: this is
+            // the daemon's security policy, and `[cvm.network_filter] mode =
+            // "Libvirt"` -- which the VMM itself refuses to start on -- must not
+            // quietly resolve to "filter nothing" here.
+            netd_config.network_filter = Some(
+                figment
+                    .extract_inner("cvm.network_filter")
+                    .context("failed to load [cvm.network_filter] for netd")?,
+            );
+        }
+        return netd::serve(netd_config).await;
+    }
+
+    let mut config = Config::extract_or_default(&figment)?.abs_path()?;
+    config.cvm.instance_id = netd::instance_id(&config.cvm.instance_id, config.run_path.as_path());
+    if let Some(socket) = args.netd_socket.as_deref() {
+        config.netd.socket = socket.into();
+    }
+
+    // Preserve the existing startup validation. The broader static checks are
+    // opt-in through `check-config` until they have seen wider deployment use.
     config
         .host_api
         .validate()
         .context("Invalid host_api configuration")?;
+    config
+        .cvm
+        .auto_restart
+        .validate()
+        .context("Invalid cvm.auto_restart configuration")?;
 
     // Handle commands
     match args.command.unwrap_or_default() {
+        Command::VmLauncher(_) => unreachable!("launcher mode handled before config loading"),
+        Command::CheckConfig => {
+            config.validate()?;
+            let _: rocket::listener::Endpoint = figment
+                .extract_inner("address")
+                .context("Invalid management API address")?;
+            let _: u16 = figment
+                .extract_inner("port")
+                .context("Invalid management API port")?;
+            println!("configuration is valid");
+            return Ok(());
+        }
+        Command::Netd(_) => unreachable!("netd mode handled before server startup"),
         Command::Run(run_args) => {
             // One-shot VM execution mode
             return one_shot::run_one_shot(
@@ -183,6 +288,10 @@ async fn main() -> Result<()> {
 
     // Register this VMM instance for local discovery
     discovery::cleanup_stale_registrations();
+    // whether the management API binds a TCP address reachable beyond the local
+    // host (i.e. not a Unix socket and not a loopback IP). Used to warn when the
+    // surface is exposed without authentication.
+    let mut listen_tcp_public = false;
     let listen_address = {
         // Use Rocket's Endpoint type to parse the address exactly as Rocket would,
         // then override the port with the figment's port value (matching Rocket's behavior).
@@ -191,6 +300,7 @@ async fn main() -> Result<()> {
         match endpoint.tcp() {
             Some(addr) => {
                 let port: u16 = figment.extract_inner("port").unwrap_or(addr.port());
+                listen_tcp_public = !addr.ip().is_loopback();
                 format!("{}:{port}", addr.ip())
             }
             None => endpoint.to_string(),
@@ -211,7 +321,22 @@ async fn main() -> Result<()> {
         }
     };
 
-    let api_auth = ApiToken::new(config.auth.tokens.clone(), config.auth.enabled);
+    let mut api_auth = if config.auth.enabled {
+        Authenticator::from_tokens(config.auth.tokens.clone())
+    } else {
+        Authenticator::disabled()
+    };
+    if config.auth.enabled && !config.auth.htpasswd_file.as_os_str().is_empty() {
+        api_auth = api_auth.with_htpasswd_file(&config.auth.htpasswd_file)?;
+    }
+    if !config.auth.enabled && listen_tcp_public {
+        warn!(
+            "the management API is bound to a non-loopback address ({listen_address}) with \
+             `[auth] enabled = false`: the entire VMM control surface (create/stop VM, UI, \
+             pRPC) is exposed WITHOUT authentication. set `[auth] enabled = true` with a \
+             token, or bind `address` to localhost / a Unix socket."
+        );
+    }
     let supervisor = {
         let cfg = &config.supervisor;
         let abs_exe = Path::new(&cfg.exe).absolutize()?;
@@ -229,6 +354,7 @@ async fn main() -> Result<()> {
     let state = app::App::new(config, supervisor);
     state.reload_vms().await.context("Failed to reload VMs")?;
     tokio::spawn(auto_restart_task(state.clone()));
+    tokio::spawn(log_rotation_task(state.clone()));
 
     tokio::select! {
         result = run_external_api(state.clone(), figment.clone(), api_auth) => {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use dstack_guest_agent_rpc::{AttestResponse, GetQuoteResponse};
+use dstack_guest_agent_rpc::v0::GetQuoteResponse;
 use ra_tls::attestation::Attestation;
 use ra_tls::attestation::{QuoteContentType, VersionedAttestation};
 
@@ -11,7 +11,9 @@ pub trait PlatformBackend: Send + Sync {
     fn attestation_for_info(&self) -> Result<VersionedAttestation>;
     fn certificate_attestation(&self, pubkey: &[u8]) -> Result<VersionedAttestation>;
     fn quote_response(&self, report_data: [u8; 64], vm_config: &str) -> Result<GetQuoteResponse>;
-    fn attest_response(&self, report_data: [u8; 64]) -> Result<AttestResponse>;
+    /// Attest the CVM itself: the attestation `Attest` returns, with digest
+    /// preimages filled in. Encoding it is the RPC layer's job.
+    fn attest_cvm(&self, report_data: [u8; 64]) -> Result<VersionedAttestation>;
 }
 
 #[derive(Debug, Default)]
@@ -33,31 +35,21 @@ impl PlatformBackend for RealPlatform {
 
     fn quote_response(&self, report_data: [u8; 64], vm_config: &str) -> Result<GetQuoteResponse> {
         let attestation = Attestation::quote(&report_data).context("Failed to get quote")?;
-        let tdx_quote = attestation.get_tdx_quote_bytes();
-        let tdx_event_log = attestation.get_tdx_event_log_string_for_config(vm_config);
-        // TDX callers already have quote + event_log. Only non-TDX platforms
-        // need the platform-adaptive versioned attestation payload.
-        let versioned = if tdx_quote.is_some() {
-            Vec::new()
-        } else {
-            attestation
-                .into_versioned()
-                .to_bytes()
-                .context("Failed to encode versioned attestation")?
-        };
+        let quote = attestation
+            .get_tdx_quote_bytes()
+            .context("GetQuote is Intel TDX only, use Attest on this platform")?;
         Ok(GetQuoteResponse {
-            quote: tdx_quote.unwrap_or_default(),
-            event_log: tdx_event_log.unwrap_or_default(),
+            quote,
+            event_log: attestation.get_tdx_event_log_string().unwrap_or_default(),
             report_data: report_data.to_vec(),
             vm_config: vm_config.to_string(),
-            attestation: versioned,
         })
     }
 
-    fn attest_response(&self, report_data: [u8; 64]) -> Result<AttestResponse> {
-        let attestation = Attestation::quote(&report_data).context("Failed to get attestation")?;
-        Ok(AttestResponse {
-            attestation: attestation.into_versioned().to_bytes()?,
-        })
+    fn attest_cvm(&self, report_data: [u8; 64]) -> Result<VersionedAttestation> {
+        let mut attestation =
+            Attestation::quote(&report_data).context("Failed to get attestation")?;
+        attestation.fill_event_preimages();
+        Ok(attestation.into_versioned())
     }
 }

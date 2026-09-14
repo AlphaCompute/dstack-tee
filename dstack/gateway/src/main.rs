@@ -3,21 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
 use config::{Config, TlsConfig};
-use dstack_guest_agent_rpc::{dstack_guest_client::DstackGuestClient, GetTlsKeyArgs};
-use dstack_kms_rpc::SignCertRequest;
+use dstack_guest_agent_rpc::v0::{dstack_guest_client::DstackGuestClient, GetTlsKeyArgs};
 use http_client::prpc::PrpcClient;
-use ra_rpc::{client::RaClient, prpc_routes as prpc, rocket_helper::QuoteVerifier};
-use ra_tls::cert::{CertConfigV2, CertSigningRequestV2, Csr};
-use ra_tls::rcgen::KeyPair;
+use ra_rpc::{prpc_routes as prpc, rocket_helper::QuoteVerifier};
+use ra_tls::attestation::AttestationVerifier;
 use rocket::{
     fairing::AdHoc,
     figment::{providers::Serialized, Figment},
 };
-use serde::{Deserialize, Serialize};
-use tracing::info;
+use std::sync::Arc;
+use tracing::{info, warn};
 
 use admin_service::AdminRpcHandler;
 use main_service::{Proxy, ProxyOptions, RpcHandler};
@@ -32,34 +29,18 @@ mod debug_service;
 mod distributed_certbot;
 mod kv;
 mod main_service;
+mod metrics;
 mod models;
 mod pp;
 mod proxy;
+mod time;
 mod web_routes;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DebugKeyData {
-    /// Private key in PEM format
-    key_pem: String,
-    /// TDX quote in base64 format
-    quote_base64: String,
-    /// Event log in JSON string format
-    event_log: String,
-    /// VM config in JSON string format
-    vm_config: String,
-}
 
 #[global_allocator]
 static ALLOCATOR: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn app_version() -> String {
-    const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
-    const VERSION: &str = git_version::git_version!(
-        args = ["--abbrev=20", "--always", "--dirty=-modified"],
-        prefix = "git:",
-        fallback = "unknown"
-    );
-    format!("v{CARGO_PKG_VERSION} ({VERSION})")
+    dstack_build_info::app_version!()
 }
 
 #[derive(Parser)]
@@ -101,13 +82,10 @@ async fn maybe_gen_certs(config: &Config, tls_config: &TlsConfig) -> Result<()> 
             }
         }
     }
-    match config.debug.insecure_skip_attestation {
-        true => gen_debug_certs(config, tls_config, alt_names).await,
-        false => gen_prod_certs(tls_config, alt_names).await,
-    }
+    gen_certs(tls_config, alt_names).await
 }
 
-async fn gen_prod_certs(tls_config: &TlsConfig, alt_names: Vec<String>) -> Result<()> {
+async fn gen_certs(tls_config: &TlsConfig, alt_names: Vec<String>) -> Result<()> {
     info!("Using dstack guest agent for certificate generation");
     let agent_client = dstack_agent().context("Failed to create dstack client")?;
 
@@ -136,96 +114,9 @@ async fn gen_prod_certs(tls_config: &TlsConfig, alt_names: Vec<String>) -> Resul
     Ok(())
 }
 
-async fn gen_debug_certs(
-    config: &Config,
-    tls_config: &TlsConfig,
-    alt_names: Vec<String>,
-) -> Result<()> {
-    let kms_url = config.kms_url.clone();
-    if kms_url.is_empty() {
-        info!("KMS URL is empty, skipping cert generation");
-        return Ok(());
-    }
-
-    // Check if debug key file is configured
-    if config.debug.key_file.is_empty() {
-        info!("Debug key file not configured, skipping cert generation");
-        return Ok(());
-    }
-
-    // Load pre-generated key pair and quote data from JSON file
-    info!("Loading debug key data from: {}", config.debug.key_file);
-    let ctx = "Failed to read debug key, run `cargo run --bin gen_debug_key -- <simulator_url>` to generate it";
-    let json_content = fs_err::read_to_string(&config.debug.key_file).context(ctx)?;
-    let debug_data: DebugKeyData =
-        serde_json::from_str(&json_content).context("Failed to parse debug key JSON")?;
-
-    let key_pem = debug_data.key_pem;
-    let quote_bin = STANDARD
-        .decode(&debug_data.quote_base64)
-        .context("Failed to decode quote from base64")?;
-    let event_log_json = debug_data.event_log;
-    let vm_config_json = debug_data.vm_config;
-
-    // Parse key pair
-    let key = KeyPair::from_pem(&key_pem).context("Failed to parse debug key")?;
-    let pubkey = key.public_key_der();
-
-    // Build CSR with attestation from debug quote
-    let attestation =
-        ra_tls::attestation::Attestation::from_tdx_quote(quote_bin, event_log_json.as_bytes())
-            .context("Failed to create attestation from debug quote")?
-            .into_versioned();
-
-    let csr = CertSigningRequestV2 {
-        confirm: "please sign cert:".to_string(),
-        pubkey,
-        config: CertConfigV2 {
-            org_name: None,
-            subject: "dstack-gateway".to_string(),
-            subject_alt_names: alt_names,
-            usage_server_auth: true,
-            usage_client_auth: true,
-            ext_quote: true,
-            ext_app_info: true,
-            not_before: None,
-            not_after: None,
-        },
-        attestation,
-    };
-    let signature = csr.signed_by(&key).context("Failed to sign CSR")?;
-
-    // Send CSR to KMS for signing
-    let kms_url = format!("{kms_url}/prpc");
-    info!("Sending CSR to KMS for signing: {kms_url}");
-    let kms_client = RaClient::new(kms_url, true).context("Failed to create kms client")?;
-    let kms_client = dstack_kms_rpc::kms_client::KmsClient::new(kms_client);
-    let sign_response = kms_client
-        .sign_cert(SignCertRequest {
-            api_version: 2,
-            csr: csr.to_vec(),
-            signature,
-            vm_config: vm_config_json.to_string(),
-        })
-        .await
-        .context("Failed to sign certificate via KMS")?;
-
-    let ca_cert = sign_response
-        .certificate_chain
-        .last()
-        .context("Empty certificate chain")?
-        .to_string();
-    let certs = sign_response.certificate_chain.join("\n");
-
-    write_cert(&tls_config.mutual.ca_certs, &ca_cert)?;
-    write_cert(&tls_config.certs, &certs)?;
-    write_cert(&tls_config.key, &key.serialize_pem())?;
-    Ok(())
-}
-
 fn write_cert(path: &str, cert: &str) -> Result<()> {
     info!("Writing cert to file: {path}");
-    safe_write::safe_write(path, cert)?;
+    safe_write::safe_write_with_mode(path, cert, 0o600)?;
     Ok(())
 }
 
@@ -242,12 +133,23 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let figment = config::load_config_figment(args.config.as_deref());
 
-    let config = figment.focus("core").extract::<Config>()?;
-
+    let mut config = figment.focus("core").extract::<Config>()?;
     // Validate node_id
     if config.sync.enabled && config.sync.node_id == 0 {
         anyhow::bail!("node_id must be greater than 0");
     }
+    if config.debug.insecure_localhost_backend {
+        warn!(
+            "core.debug.insecure_localhost_backend = true; the app address \"localhost\" now \
+             resolves to 127.0.0.1 on this host. App addresses also come from the \
+             _dstack-app-address TXT record of arbitrary custom domains, so any DNS zone owner \
+             can reach this host's loopback on a port of their choosing, bypassing port_policy. \
+             Never use this outside local development"
+        );
+    }
+    // Before anything reads `proxy.ktls`: the acceptor built later decides
+    // whether to extract session secrets from it.
+    proxy::disable_ktls_if_unsupported(&mut config.proxy);
 
     config::setup_wireguard(&config.wg)?;
 
@@ -264,18 +166,20 @@ async fn main() -> Result<()> {
         set_max_ulimit()?;
     }
 
-    let my_app_id = if config.debug.insecure_skip_attestation {
-        None
-    } else {
-        let dstack_client = dstack_agent().context("Failed to create dstack client")?;
-        let info = dstack_client
-            .info()
-            .await
-            .context("Failed to get app info")?;
-        Some(info.app_id)
-    };
+    // Required, not best-effort: `my_app_id` is what every peer check compares against,
+    // so a gateway that cannot learn its own identity must not start rather than start
+    // without one. A host with no guest agent fails here.
+    let dstack_client = dstack_agent().context("Failed to create dstack client")?;
+    let my_app_id = dstack_client
+        .info()
+        .await
+        .context("Failed to get app info")?
+        .app_id;
     let proxy_config = config.proxy.clone();
-    let pccs_url = config.pccs_url.clone();
+    let attestation_verifier = Arc::new(
+        AttestationVerifier::load(&config.attestation)
+            .context("failed to load attestation verifier")?,
+    );
     let admin_auth = if config.admin.enabled {
         Some(admin_auth::AdminAuthFairing::from_config(&config.admin)?)
     } else {
@@ -321,7 +225,7 @@ async fn main() -> Result<()> {
             })
         }))
         .manage(state.clone());
-    let verifier = QuoteVerifier::new(pccs_url);
+    let verifier = QuoteVerifier::new(attestation_verifier);
     rocket = rocket.manage(verifier);
     let main_srv = rocket.launch();
     let admin_state = state.clone();
@@ -335,15 +239,19 @@ async fn main() -> Result<()> {
             } else {
                 tracing::info!("admin server authentication enabled");
             }
-            rocket::custom(admin_figment)
+            let admin_rocket = rocket::custom(admin_figment)
                 .attach(auth_fairing)
                 .mount("/", admin_auth::routes())
                 .mount("/", web_routes::routes())
                 .mount("/", prpc!(Proxy, AdminRpcHandler, trim: "Admin."))
                 .mount("/prpc", prpc!(Proxy, AdminRpcHandler, trim: "Admin."))
-                .manage(admin_state)
-                .launch()
-                .await
+                .manage(admin_state.clone())
+                .ignite()
+                .await?;
+            admin_state
+                .lock()
+                .set_admin_shutdown(admin_rocket.shutdown());
+            admin_rocket.launch().await
         } else {
             std::future::pending().await
         }
@@ -372,4 +280,35 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::write_cert;
+    use std::fs;
+
+    #[test]
+    fn gateway_startup_private_file_matrix() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("gateway.key");
+        write_cert(output.to_str().unwrap(), "first").unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"first");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        write_cert(output.to_str().unwrap(), "second").unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"second");
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+    }
 }

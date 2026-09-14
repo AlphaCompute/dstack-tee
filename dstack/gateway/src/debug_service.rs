@@ -36,7 +36,14 @@ impl DebugRpc for DebugRpcHandler {
             &request.instance_id,
             &request.client_public_key,
             "",
-            None,
+            // Reports nothing about itself: no port policy, and no statement
+            // either way about health gating. A brand-new debug-registered
+            // instance is therefore never polled and always counts as healthy,
+            // which keeps this path usable for testing routing without
+            // standing up a guest agent -- and re-registering an id that a real
+            // CVM already claimed leaves that CVM's declaration alone rather
+            // than silently downgrading it out of polling for good.
+            Default::default(),
         )
     }
 
@@ -85,6 +92,7 @@ impl DebugRpc for DebugRpcHandler {
         // Get all instances
         let instances: Vec<InstanceEntry> = kv_store
             .load_all_instances()
+            .decoded
             .into_iter()
             .map(|(instance_id, data)| InstanceEntry {
                 instance_id,
@@ -117,11 +125,7 @@ impl DebugRpc for DebugRpcHandler {
             .instances
             .values()
             .map(|inst| {
-                let reg_time = inst
-                    .reg_time
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let reg_time = crate::time::encode_ts(inst.reg_time);
                 ProxyStateInstance {
                     instance_id: inst.id.clone(),
                     app_id: inst.app_id.clone(),

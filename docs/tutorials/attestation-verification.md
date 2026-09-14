@@ -129,6 +129,7 @@ Verify you have a running CVM:
 
 ```bash
 cd ~/dstack/dstack/vmm
+export DSTACK_VMM_AUTH_USER=admin
 export DSTACK_VMM_AUTH_PASSWORD=$(cat ~/.dstack/secrets/vmm-auth-token)
 ./src/vmm-cli.py --url http://127.0.0.1:9080 lsvm
 ```
@@ -141,6 +142,7 @@ The VMM provides a `/guest/Info` endpoint that proxies into the CVM and retrieve
 
 ```bash
 cd ~/dstack/dstack/vmm
+export DSTACK_VMM_AUTH_USER=admin
 export DSTACK_VMM_AUTH_PASSWORD=$(cat ~/.dstack/secrets/vmm-auth-token)
 
 # Get the VM UUID for hello-world
@@ -244,46 +246,9 @@ To verify attestation, you need to independently calculate what the measurements
 cat /var/lib/dstack/images/dstack-0.5.7/metadata.json | jq .
 ```
 
-### Build dstack-acpi-tables (required dependency)
+### ACPI generation
 
-`dstack-mr` internally runs a tool called `dstack-acpi-tables` to generate ACPI tables for RTMR0 calculation. This is a custom-patched QEMU binary compiled with `-DDUMP_ACPI_TABLES`. You need to build it once:
-
-```bash
-# Install QEMU build dependencies
-sudo apt-get update
-sudo apt-get install -y git libslirp-dev python3-pip ninja-build \
-  pkg-config libglib2.0-dev build-essential flex bison
-
-# Clone the custom QEMU fork
-cd ~/dstack
-git clone https://github.com/kvinwang/qemu-tdx.git --depth 1 \
-  --branch dstack-qemu-9.2.1 --single-branch
-
-# Configure with ACPI table dumping enabled
-cd qemu-tdx
-export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
-export CFLAGS="-DDUMP_ACPI_TABLES -Wno-builtin-macro-redefined -D__DATE__=\"\" -D__TIME__=\"\" -D__TIMESTAMP__=\"\""
-export LDFLAGS="-Wl,--build-id=none"
-mkdir build && cd build
-../configure --target-list=x86_64-softmmu --disable-werror
-
-# Build (this takes several minutes)
-ninja
-
-# Install the binary
-strip qemu-system-x86_64
-sudo install -m 755 qemu-system-x86_64 /usr/local/bin/dstack-acpi-tables
-
-# Install required QEMU data files
-sudo install -d /usr/local/share/qemu
-sudo install -m 644 ../pc-bios/efi-virtio.rom /usr/local/share/qemu/
-sudo install -m 644 ../pc-bios/kvmvapic.bin /usr/local/share/qemu/
-sudo install -m 644 ../pc-bios/linuxboot_dma.bin /usr/local/share/qemu/
-
-# Clean up source (optional)
-cd ~/dstack
-rm -rf qemu-tdx
-```
+`dstack-mr` generates QEMU-compatible ACPI measurement data in process. No custom QEMU binary or runtime helper is required.
 
 ### Build the measurement calculator
 
@@ -384,6 +349,7 @@ Compare the CVM's actual measurements against your expected values:
 # verify-measurements.sh
 
 cd ~/dstack/dstack/vmm
+export DSTACK_VMM_AUTH_USER=admin
 export DSTACK_VMM_AUTH_PASSWORD=$(cat ~/.dstack/secrets/vmm-auth-token)
 
 # Get VM UUID
@@ -518,13 +484,33 @@ These are the standard events you'll see in the log:
 | `system-preparing` | System initialization marker | Always present |
 | `app-id` | Application identifier | Should match your app name |
 | `compose-hash` | SHA-256 of docker compose config | Should match `tcb_info.compose_hash` |
+| `init-script-hash` | SHA-256 of one init script; repeated in configured order (maximum 5) | Should match the independently approved script bytes |
+| `gpu-policy-hash` | SHA-256 of the JCS-canonicalized GPU policy (default `{}`) | Should match the expected `requirements.gpu_policy` digest |
+| `gpu-attestation` | Verified GPU state and digest of the boot-time `nvattest` JSON | Required for an attested GPU launch; verify as described below |
 | `instance-id` | Unique instance identifier | Should match `instance_id` from response |
 | `boot-mr-done` | Boot measurements complete | Marker event |
-| `mr-kms` | KMS identity measurement | KMS public key hash |
 | `os-image-hash` | Guest OS image hash | Should match `tcb_info.os_image_hash` |
 | `key-provider` | Key provider type | e.g., `kms` |
 | `storage-fs` | Storage filesystem type | Storage configuration |
 | `system-ready` | System ready marker | Always present at end |
+
+For a successful GPU launch, the relevant order is `compose-hash`, any
+`init-script-hash` events, `gpu-policy-hash`, `gpu-attestation`, `instance-id`,
+and `boot-mr-done`.
+After replaying the log to the quote's RTMR3, decode the JSON payload of
+`gpu-attestation` and compare its `evidence_sha256` with the SHA-256 digest of
+the boot-time GPU evidence bytes. Fetch those bytes by calling `/v1/Attest`
+with `include_boottime_gpu_evidence: true`: `AttestResponse.boottime_gpu_evidence`
+is a list of `GpuEvidenceBundle` (`{vendor, format, evidence}`); pick the one
+whose `format` is `nvidia-nvattest-boottime-json-v1`, hex-decode its `evidence`
+field, and hash exactly those bytes — `SHA-256(hex_decode(bundle.evidence))`.
+Hash the decoded bytes as returned, not the JSON string and not a re-serialized
+form: the comparison is byte-exact, including any whitespace or trailing
+newline. That bundle is the record saved during boot; returning it does not
+perform a new attestation. `/v1/AttestGpu` does perform a fresh one, but its
+bundles carry the distinct `format` `nvidia-nvattest-collect-evidence-json-v1`,
+are appraised against a caller nonce rather than the boot record, and are not
+bound to the TD, so they must not be used as remote evidence.
 
 ### Verify specific event values
 
@@ -567,6 +553,7 @@ echo "Image:    $IMAGE_VERSION"
 echo ""
 
 cd ~/dstack/dstack/vmm
+export DSTACK_VMM_AUTH_USER=admin
 export DSTACK_VMM_AUTH_PASSWORD=$(cat ~/.dstack/secrets/vmm-auth-token)
 
 # --- Step 1: Get VM UUID ---
@@ -803,18 +790,12 @@ For highest assurance, build images from source:
 ```bash
 git clone https://github.com/Dstack-TEE/dstack.git
 cd dstack
-git submodule update --init -- \
-  os/yocto/deps/bitbake \
-  os/yocto/deps/openembedded-core \
-  os/yocto/deps/meta-yocto \
-  os/yocto/deps/meta-confidential-compute \
-  os/yocto/deps/meta-virtualization \
-  os/yocto/deps/meta-openembedded \
-  os/yocto/deps/meta-rust-bin \
-  os/yocto/deps/meta-security
-cd os/yocto/repro-build
-./repro-build.sh -n  # Reproducible build
+git checkout <release-revision>
+make os-image        # reproducible mkosi build
 ```
+
+See [Build the dstack guest OS](../building-guest-os.md) for outputs and the
+byte-for-byte reproducibility check.
 
 This ensures you know exactly what code is in the image, and anyone can independently verify the measurements match.
 
@@ -871,4 +852,4 @@ With the foundation complete, you're ready to explore:
 - [Intel TDX Documentation](https://www.intel.com/content/www/us/en/developer/tools/trust-domain-extensions/documentation.html)
 - [DCAP Attestation Guide](https://download.01.org/intel-sgx/latest/dcap-latest/linux/docs/)
 - [dstack Attestation Source](https://github.com/Dstack-TEE/dstack/tree/main/attestation)
-- [Reproducible guest-OS builds](../../os/yocto/repro-build/)
+- [Reproducible guest-OS builds](../building-guest-os.md)

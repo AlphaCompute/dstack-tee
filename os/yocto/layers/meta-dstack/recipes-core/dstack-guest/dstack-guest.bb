@@ -15,18 +15,24 @@ DSTACK_ROOTFS_SRC ?= "${DSTACK_MONOREPO_ROOT}/os/common/rootfs"
 S = "${UNPACKDIR}/repo/dstack"
 DSTACK_ROOTFS_FILES = "${UNPACKDIR}/repo/os/common/rootfs"
 
-RDEPENDS:${PN} += "bash"
+RDEPENDS:${PN} += "bash cryptsetup util-linux-blkid util-linux-mount"
 
 DEPENDS += "rsync-native tpm2-tss"
+DEPENDS += "cmake-native"
+
+# aws-lc-sys cannot detect Yocto cross builds when the build and target share
+# the same Rust target triple, and its cc builder then tries to execute a
+# target binary on the build host. Use its supported CMake builder instead.
+export AWS_LC_SYS_CMAKE_BUILDER = "1"
 
 # Ensure rsync-native is built before unpack runs
 do_unpack[depends] += "rsync-native:do_populate_sysroot"
 
-DSTACK_SERVICES = "dstack-guest-agent.service dstack-guest-agent.socket dstack-prepare.service app-compose.service wg-checker.service"
+DSTACK_SERVICES = "dstack-guest-agent.service dstack-guest-agent.socket dstack-prepare.service app-compose.service dstack-gateway-checker.service"
 SYSTEMD_PACKAGES = "${@bb.utils.contains('DISTRO_FEATURES','systemd','${PN}','',d)}"
 SYSTEMD_SERVICE:${PN} = "${@bb.utils.contains('DISTRO_FEATURES','systemd','${DSTACK_SERVICES}','',d)}"
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
-EXTRA_CARGO_FLAGS = "-p dstack-guest-agent -p dstack-util"
+EXTRA_CARGO_FLAGS = "-p dstack-guest-agent -p dstack-util -p dstack-volume"
 
 inherit cargo_bin
 
@@ -60,9 +66,9 @@ do_install() {
     install -d ${D}${sysconfdir}/systemd/journald.conf.d
     install -m 0755 ${CARGO_BINDIR}/dstack-util ${D}${bindir}
     install -m 0755 ${CARGO_BINDIR}/dstack-guest-agent ${D}${bindir}
+    install -m 0755 ${CARGO_BINDIR}/dstack-volume ${D}${bindir}
     install -m 0755 ${DSTACK_ROOTFS_FILES}/dstack-prepare.sh ${D}${bindir}
     install -m 0755 ${DSTACK_ROOTFS_FILES}/ephemeral-docker.sh ${D}${bindir}
-    install -m 0755 ${DSTACK_ROOTFS_FILES}/wg-checker.sh ${D}${bindir}
     install -m 0755 ${DSTACK_ROOTFS_FILES}/app-compose.sh ${D}${bindir}
     install -m 0644 ${DSTACK_ROOTFS_FILES}/journald.conf ${D}${sysconfdir}/systemd/journald.conf.d/dstack.conf
 
@@ -79,21 +85,24 @@ do_install() {
         install -m 0644 ${DSTACK_ROOTFS_FILES}/dstack-guest-agent.service ${D}${systemd_system_unitdir}
         install -m 0644 ${DSTACK_ROOTFS_FILES}/dstack-prepare.service ${D}${systemd_system_unitdir}
         install -m 0644 ${DSTACK_ROOTFS_FILES}/app-compose.service ${D}${systemd_system_unitdir}
-        install -m 0644 ${DSTACK_ROOTFS_FILES}/wg-checker.service ${D}${systemd_system_unitdir}
+        install -m 0644 ${DSTACK_ROOTFS_FILES}/dstack-gateway-checker.service ${D}${systemd_system_unitdir}
         install -m 0644 ${DSTACK_ROOTFS_FILES}/dstack-guest-agent.socket ${D}${systemd_system_unitdir}
         install -m 0644 ${DSTACK_ROOTFS_FILES}/llmnr.conf ${D}${sysconfdir}/systemd/resolved.conf.d
-        install -d ${D}${sysconfdir}/systemd/system/docker.service.d
-        install -m 0644 ${DSTACK_ROOTFS_FILES}/docker.service.d/* ${D}${sysconfdir}/systemd/system/docker.service.d/
+        # Drop-ins the image ships are vendor configuration, so they belong
+        # beside the units in ${systemd_system_unitdir}. /etc is the operator's
+        # layer and `systemctl revert` deletes <unit>.d/ below it wholesale.
+        install -d ${D}${systemd_system_unitdir}/docker.service.d
+        install -m 0644 ${DSTACK_ROOTFS_FILES}/docker.service.d/* ${D}${systemd_system_unitdir}/docker.service.d/
 
-        install -d ${D}${sysconfdir}/systemd/system/containerd.service.d
-        install -m 0644 ${DSTACK_ROOTFS_FILES}/containerd.service.d/* ${D}${sysconfdir}/systemd/system/containerd.service.d/
+        install -d ${D}${systemd_system_unitdir}/containerd.service.d
+        install -m 0644 ${DSTACK_ROOTFS_FILES}/containerd.service.d/* ${D}${systemd_system_unitdir}/containerd.service.d/
     fi
 }
 
 FILES:${PN} += " \
-    ${sysconfdir}/systemd/system/docker.service.d/dstack-guest-agent.conf \
-    ${sysconfdir}/systemd/system/docker.service.d/dstack-prepare.conf \
-    ${sysconfdir}/systemd/system/containerd.service.d/dstack-prepare.conf \
+    ${systemd_system_unitdir}/docker.service.d/dstack-guest-agent.conf \
+    ${systemd_system_unitdir}/docker.service.d/dstack-prepare.conf \
+    ${systemd_system_unitdir}/containerd.service.d/dstack-prepare.conf \
 "
 
 # Cargo embeds build paths into binaries; allow TMPDIR references.

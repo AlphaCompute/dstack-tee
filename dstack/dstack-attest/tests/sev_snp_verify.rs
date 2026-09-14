@@ -102,7 +102,7 @@ fn verify_sev_snp_attestation_bin() {
     );
     // The HOST_DATA-bound app identity is recovered from the mr_config document.
     assert_eq!(
-        hex::encode(&binding.mr_config.app_id),
+        hex::encode(binding.mr_config.app_id.as_deref().unwrap_or_default()),
         "86e59625be93207bc2351c4d1bba20037cec8e16",
         "mr_config app_id bound by HOST_DATA"
     );
@@ -272,6 +272,28 @@ fn forged_report_bytes_fail_signature_verification() {
 }
 
 #[test]
+fn tampered_real_amd_ask_fails_chain_verification() {
+    let report = fixture_report();
+    let mut ask_der = pem::parse(SEV_ASK_PEM)
+        .expect("parse real AMD ASK")
+        .into_contents();
+    let last = ask_der.last_mut().expect("ASK DER is non-empty");
+    *last ^= 1;
+    let tampered_ask = pem::encode(&pem::Pem::new("CERTIFICATE", ask_der));
+
+    let error = verify_amd_snp_attestation(&AmdSnpAttestationInput {
+        report: &report,
+        ask_pem: tampered_ask.as_bytes(),
+        vcek_pem: SEV_VCEK_PEM,
+    })
+    .expect_err("tampered AMD ASK must fail verification");
+    assert!(
+        error.to_string().contains("cert chain verification"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn wrong_collateral_is_rejected() {
     let report = fixture_report();
     // The ASK presented as the VCEK leaf: the report signature won't verify
@@ -352,6 +374,7 @@ fn substituted_mr_config_breaks_host_data_binding() {
     let evil = MrConfigV3::new(
         vec![0xab; 20],
         vec![0xcd; 32],
+        None,
         KeyProviderKind::None,
         Vec::new(),
         vec![0xef; 20],

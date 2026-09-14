@@ -104,6 +104,18 @@ impl VmWorkDir {
         self.workdir.join("shared")
     }
 
+    pub fn swtpm_state_dir(&self) -> PathBuf {
+        self.workdir.join("swtpm")
+    }
+
+    pub fn swtpm_socket(&self) -> PathBuf {
+        self.swtpm_state_dir().join("swtpm.sock")
+    }
+
+    pub fn launch_spec_path(&self) -> PathBuf {
+        self.workdir.join("launch.json")
+    }
+
     pub fn app_compose_path(&self) -> PathBuf {
         self.shared_dir().join(APP_COMPOSE)
     }
@@ -127,23 +139,8 @@ impl VmWorkDir {
         self.shared_dir().join(INSTANCE_INFO)
     }
 
-    pub fn guest_ip_path(&self) -> PathBuf {
-        self.workdir.join("guest-ip")
-    }
-
     pub fn runtime_networks_path(&self) -> PathBuf {
         self.workdir.join("runtime-networks.json")
-    }
-
-    pub fn guest_ip(&self) -> Option<String> {
-        fs::read_to_string(self.guest_ip_path())
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    pub fn set_guest_ip(&self, ip: &str) -> Result<()> {
-        fs::write(self.guest_ip_path(), ip).context("failed to write guest IP")
     }
 
     pub fn runtime_networks(&self) -> Vec<Networking> {
@@ -154,7 +151,14 @@ impl VmWorkDir {
     }
 
     pub fn set_runtime_networks(&self, networks: &[Networking]) -> Result<()> {
-        let serialized = serde_json::to_vec(networks)?;
+        // A macvtap device path is valid only while its host interface exists.
+        // Keep it in memory for launch preparation, but never persist it across
+        // VMM restarts where the same /dev/tapN may identify another device.
+        let mut persistent_networks = networks.to_vec();
+        for network in &mut persistent_networks {
+            network.device.clear();
+        }
+        let serialized = serde_json::to_vec(&persistent_networks)?;
         safe_write::safe_write(self.runtime_networks_path(), serialized)
             .context("failed to write runtime networks")
     }
@@ -169,10 +173,6 @@ impl VmWorkDir {
 
     pub fn serial_file(&self) -> PathBuf {
         self.workdir.join("serial.log")
-    }
-
-    pub fn serial_history_file(&self) -> PathBuf {
-        self.workdir.join("serial.history.log")
     }
 
     pub fn serial_pty(&self) -> PathBuf {
@@ -261,6 +261,7 @@ mod tests {
     use fs_err as fs;
 
     use super::VmWorkDir;
+    use crate::config::Networking;
 
     #[test]
     fn runtime_networks_snapshot_replaces_target_instead_of_following_it() -> Result<()> {
@@ -279,6 +280,32 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&external)?, "sentinel");
         assert_eq!(fs::read_to_string(workdir.runtime_networks_path())?, "[]");
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_networks_snapshot_omits_ephemeral_device_paths() -> Result<()> {
+        let temp = std::env::temp_dir().join(format!(
+            "dstack-vmm-runtime-networks-device-test-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let workdir = VmWorkDir::new(temp.join("vm"));
+        fs::create_dir_all(workdir.path())?;
+        let network: Networking = serde_json::from_value(serde_json::json!({
+            "mode": "macvtap",
+            "parent": "br0",
+            "macvtap_mode": "private",
+            "device": "/dev/tap42"
+        }))?;
+
+        workdir.set_runtime_networks(&[network])?;
+
+        let persisted = workdir.runtime_networks();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].nic.parent, "br0");
+        assert!(persisted[0].device.is_empty());
+        assert!(!fs::read_to_string(workdir.runtime_networks_path())?.contains("/dev/tap42"));
         fs::remove_dir_all(temp)?;
         Ok(())
     }

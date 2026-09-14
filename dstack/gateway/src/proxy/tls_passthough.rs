@@ -3,11 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::Debug;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
 use hickory_resolver::lookup::Lookup;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RData;
 use hickory_resolver::TokioResolver;
 use proxy_protocol::ProxyHeader;
@@ -20,7 +23,7 @@ use crate::{
 };
 
 use super::{
-    io_bridge::bridge,
+    io_bridge::bridge_tcp,
     port_policy::{filter_allowed_addresses, should_send_pp},
     AddressGroup,
 };
@@ -59,11 +62,11 @@ pub(crate) struct AppAddressResolver {
 }
 
 impl AppAddressResolver {
-    pub(crate) fn new(prefix: String, compat: bool) -> Result<Self> {
+    pub(crate) fn new(prefix: String, compat: bool, dns_servers: Vec<SocketAddr>) -> Result<Self> {
         Ok(Self {
             prefix,
             compat,
-            resolver: app_address_tokio_resolver_from_system_conf()?,
+            resolver: app_address_tokio_resolver(dns_servers)?,
         })
     }
 
@@ -72,8 +75,25 @@ impl AppAddressResolver {
     }
 }
 
-fn app_address_tokio_resolver_from_system_conf() -> Result<TokioResolver> {
-    let mut builder = TokioResolver::builder_tokio().context("failed to read system dns config")?;
+fn app_address_tokio_resolver(dns_servers: Vec<SocketAddr>) -> Result<TokioResolver> {
+    let mut builder = if dns_servers.is_empty() {
+        TokioResolver::builder_tokio().context("failed to read system dns config")?
+    } else {
+        let name_servers = dns_servers
+            .into_iter()
+            .map(|dns_server| {
+                let mut name_server = NameServerConfig::udp_and_tcp(dns_server.ip());
+                for connection in &mut name_server.connections {
+                    connection.port = dns_server.port();
+                }
+                name_server
+            })
+            .collect();
+        TokioResolver::builder_with_config(
+            ResolverConfig::from_parts(None, Vec::new(), name_servers),
+            TokioRuntimeProvider::default(),
+        )
+    };
 
     // App-address records may appear shortly after a CVM/app is registered.
     // Reusing one resolver enables positive TXT caching, but we do not want a
@@ -199,8 +219,29 @@ pub(crate) async fn connect_multiple_hosts(
 ) -> Result<(TcpStream, EnteredCounter, String)> {
     check_connection_limit(&addresses, max_connections, app_id)?;
 
+    let mut candidates = addresses.into_iter();
+    let Some(first) = candidates.next() else {
+        bail!("no addresses to connect to app <{app_id}>");
+    };
+
+    // Fast path: with a single candidate there is nothing to race, so skip the
+    // JoinSet and the task spawn it needs. That allocation and scheduling
+    // happened on every connection, and single-address apps are the common
+    // case.
+    if candidates.as_slice().is_empty() {
+        let addr = first;
+        let counter = addr.counter.enter();
+        let ip = addr.ip;
+        debug!("connecting to {ip}:{port}");
+        let connection = TcpStream::connect((ip, port))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to connect to app@{ip}:{port}: {e}"))?;
+        let _ = connection.set_nodelay(true);
+        return Ok((connection, counter, addr.instance_id));
+    }
+
     let mut join_set = JoinSet::new();
-    for addr in addresses {
+    for addr in std::iter::once(first).chain(candidates) {
         let counter = addr.counter.enter();
         let ip = addr.ip;
         let instance_id = addr.instance_id;
@@ -228,6 +269,9 @@ pub(crate) async fn connect_multiple_hosts(
             }
         }
     };
+    // Disable Nagle on the upstream socket for the same reason as the inbound
+    // side: avoid delayed-ACK stalls on small proxied messages.
+    let _ = connection.set_nodelay(true);
     debug!("connected to {:?}", connection.peer_addr());
     Ok((connection, counter, instance_id))
 }
@@ -259,9 +303,31 @@ pub(crate) async fn proxy_to_app(
         .write_all(&buffer)
         .await
         .context("failed to write to app")?;
-    bridge(inbound, outbound, &state.config.proxy)
-        .await
-        .context("failed to copy between inbound and outbound")?;
+    if let Some(gate) = &state.config.proxy.tcp_splice {
+        // Passthrough is a pure TCP relay: move bytes kernel-side with splice.
+        // Both ends are plain sockets here, so a FIN is the whole close.
+        let idle = state.config.proxy.idle_timeout();
+        if gate.engage.is_immediate() {
+            super::splice::splice_bidirectional(
+                inbound,
+                outbound,
+                gate.release_idle_pipes,
+                idle,
+                super::splice::CloseKind::Tcp,
+            )
+            .await
+            .context("failed to splice between inbound and outbound")?;
+        } else {
+            let buf_size = state.config.proxy.buffer_size;
+            super::splice::splice_bidirectional_after(inbound, outbound, gate, buf_size, idle)
+                .await
+                .context("failed to relay between inbound and outbound")?;
+        }
+    } else {
+        bridge_tcp(inbound, outbound, &state.config.proxy)
+            .await
+            .context("failed to copy between inbound and outbound")?;
+    }
     Ok(())
 }
 
@@ -271,7 +337,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_app_address() -> Result<()> {
-        let resolver = AppAddressResolver::new("_dstack-app-address".to_string(), false)?;
+        let resolver = AppAddressResolver::new("_dstack-app-address".to_string(), false, vec![])?;
         let app_addr = resolver
             .resolve("3327603e03f5bd1f830812ca4a789277fc31f577.app.dstack.org")
             .await?;

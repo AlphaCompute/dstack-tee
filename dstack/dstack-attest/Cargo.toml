@@ -17,9 +17,12 @@ dcap-qvl.workspace = true
 dstack-types.workspace = true
 ez-hash.workspace = true
 fs-err.workspace = true
+safe-write.workspace = true
+rustix = { workspace = true, features = ["process"] }
 hex.workspace = true
 hex_fmt.workspace = true
 or-panic.workspace = true
+pem.workspace = true
 scale = { workspace = true, features = ["derive"] }
 sev-snp-attest.workspace = true
 sev-snp-qvl.workspace = true
@@ -35,6 +38,7 @@ nsm-qvl.workspace = true
 tpm-qvl.workspace = true
 tpm-types.workspace = true
 tracing.workspace = true
+x509-parser.workspace = true
 insta.workspace = true
 errify.workspace = true
 aws-nitro-enclaves-nsm-api = { version = "0.4", optional = true }
@@ -45,6 +49,9 @@ rsa = { workspace = true, optional = true }
 tpm2 = { workspace = true, optional = true }
 
 [features]
+# Synthetic-attestation helpers used to build fixtures. Simulator only -- see
+# the gated `impl Attestation` in src/v1.rs for why production must not have it.
+simulator = []
 quote = [
     "aws-nitro-enclaves-nsm-api",
     "ciborium",
@@ -58,3 +65,5 @@ quote = [
 futures = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 dstack-mr = { workspace = true }
+rcgen = { workspace = true }
+tempfile = { workspace = true }

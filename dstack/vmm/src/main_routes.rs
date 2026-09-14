@@ -10,7 +10,6 @@ use rocket::{
     response::{status::Custom, stream::TextStream},
     routes, Route, State,
 };
-use rocket_apitoken::Authorized;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -57,11 +56,6 @@ async fn beta(app: &State<App>) -> (ContentType, String) {
     index(app).await
 }
 
-#[get("/v0")]
-async fn v0(app: &State<App>) -> (ContentType, String) {
-    render_console(file_or_include_str!("console_v0.html"), app)
-}
-
 #[get("/res/<path>")]
 async fn res(path: &str) -> Result<(ContentType, String), Custom<String>> {
     match path {
@@ -106,27 +100,37 @@ impl Drop for StreamCounter {
 
 #[get("/logs?<id>&<follow>&<ansi>&<lines>&<ch>")]
 fn vm_logs(
-    _auth: Authorized,
     app: &State<App>,
     id: String,
     follow: bool,
     ansi: bool,
     lines: Option<usize>,
     ch: Option<&str>,
-) -> TextStream![String] {
-    let workdir = app.work_dir(&id);
-    let ch = ch.unwrap_or("serial").to_string();
-    TextStream! {
-        let log_file = match ch.as_str() {
-            "serial" => workdir.serial_file(),
-            "stdout" => workdir.stdout_file(),
-            "stderr" => workdir.stderr_file(),
-            _ => {
-                yield format!("Unknown channel {ch}");
-                return;
-            }
-        };
+) -> Result<TextStream![String], Custom<String>> {
+    // Resolve only an inventory-owned VM before deriving a filesystem path.
+    // This keeps arbitrary IDs (including traversal strings) outside run_path.
+    if app.lock().get(&id).is_none() {
+        return Err(Custom(
+            rocket::http::Status::NotFound,
+            "VM not found".to_string(),
+        ));
+    }
+    let workdir = app
+        .work_dir(&id)
+        .map_err(|err| Custom(rocket::http::Status::BadRequest, err.to_string()))?;
+    let log_file = match ch.unwrap_or("serial") {
+        "serial" => workdir.serial_file(),
+        "stdout" => workdir.stdout_file(),
+        "stderr" => workdir.stderr_file(),
+        channel => {
+            return Err(Custom(
+                rocket::http::Status::BadRequest,
+                format!("Unknown channel {channel}"),
+            ));
+        }
+    };
 
+    Ok(TextStream! {
         let counter = StreamCounter::new();
 
         const DEFAULT_TAIL_LINES: usize = 10000;
@@ -170,18 +174,16 @@ fn vm_logs(
                         yield strip_ansi_escapes::strip_str(&line_str);
                     }
                 }
-                Ok(None) => {
-                    break;
-                }
+                Ok(None) => break,
                 Err(err) => {
                     yield format!("<failed to read line: {err}>");
                     break;
                 }
             }
         }
-    }
+    })
 }
 
 pub fn routes() -> Vec<Route> {
-    routes![index, v1, beta, v0, res, vm_logs]
+    routes![index, v1, beta, res, vm_logs]
 }

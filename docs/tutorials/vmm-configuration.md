@@ -105,13 +105,14 @@ qemu_path = ""
 kms_urls = ["http://127.0.0.1:8081"]
 gateway_urls = ["http://127.0.0.1:8082"]
 pccs_url = "https://pccs.phala.network/sgx/certification/v4"
+# Optional. See "NVIDIA GPU attestation cache" below.
+# nvidia_attestation_proxy_url = "http://10.0.2.2:8090"
 docker_registry = ""
 cid_start = 1000
 cid_pool_size = 1000
 max_allocable_vcpu = 124                        # Adjust: total cores - 4
 max_allocable_memory_in_mb = 990616             # Adjust: total MB - 16384
 qmp_socket = false
-user = ""
 use_mrconfigid = true
 qemu_pci_hole64_size = 0
 qemu_hotplug_off = false
@@ -212,6 +213,24 @@ Verify QGS is running:
 systemctl status qgsd
 ```
 
+### Optional: NVIDIA GPU attestation cache
+
+GPU images perform local NVIDIA attestation before app keys are provisioned.
+Without a cache this contacts NVIDIA's OCSP and RIM services during every cold
+boot. A fleet can run the persistent
+[`dstack-nvidia-attest-proxy`](../../dstack/nvidia-attest-proxy/README.md) and pass its
+URL to guests through sys-config:
+
+```toml
+[cvm]
+nvidia_attestation_proxy_url = "http://10.0.2.2:8090"
+```
+
+The example address is the host as seen from QEMU user-mode networking. The
+proxy must be reachable during `dstack-prepare`. It stores only NVIDIA-signed
+collateral and never becomes a signing trust anchor. OCSP entries are not
+served after their signed validity window.
+
 ### Step 7: Create Runtime Directories
 
 ```bash
@@ -286,9 +305,15 @@ To enable GPU passthrough for AI/ML workloads:
 ```toml
 [cvm.gpu]
 enabled = true
-listing = ["10de:2335"]          # NVIDIA GPU product IDs
+# Example: narrow this list to what the host actually holds if you want discovery to reject anything else.
+listing = ["10de:2335", "10de:3182"]   # H200 SXM, B300 SXM6
 allow_attach_all = true
 ```
+
+A card whose product ID is not in `listing` is never offered for passthrough,
+so the shipped default names every Hopper and Blackwell SKU dstack runs on —
+see `[cvm.gpu]` in `dstack/vmm/vmm.toml` for the annotated list. NVSwitches are
+not listed: the `all` attach mode finds GPUs and switches by PCI class instead.
 
 **Requirements:**
 - IOMMU enabled in BIOS

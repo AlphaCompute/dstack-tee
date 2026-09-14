@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dstack_types::KeyProviderInfo;
-use ra_tls::attestation::{AppInfo, AttestationMode};
+use ra_tls::attestation::{AppInfo, TeeVariant};
 use serde::{Deserialize, Serialize};
 
 use serde_human_bytes as serde_bytes;
@@ -32,7 +32,7 @@ pub struct VerificationResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyBootInfo {
-    pub attestation_mode: AttestationMode,
+    pub tee_variant: TeeVariant,
     #[serde(with = "serde_bytes")]
     pub mr_aggregated: Vec<u8>,
     #[serde(with = "serde_bytes")]
@@ -55,13 +55,13 @@ pub struct PolicyBootInfo {
 
 impl PolicyBootInfo {
     pub fn from_app_info(
-        attestation_mode: AttestationMode,
+        tee_variant: TeeVariant,
         app_info: &AppInfo,
         tcb_status: String,
         advisory_ids: Vec<String>,
     ) -> Self {
         Self {
-            attestation_mode,
+            tee_variant,
             mr_aggregated: app_info.mr_aggregated.to_vec(),
             os_image_hash: app_info.os_image_hash.clone(),
             mr_system: app_info.mr_system.to_vec(),
@@ -90,17 +90,22 @@ pub struct VerificationDetails {
     pub os_image_hash_verified: bool,
     /// Indicates that TDX ACPI table contents were verified.
     ///
-    /// This is true for the full-image TDX path, where the verifier recomputes
-    /// ACPI tables and checks the resulting RTMRs against the quote. It remains
-    /// false for TDX lite, which replays ACPI DATA digests from the event log
-    /// without validating the table contents.
+    /// Both dstack TDX paths set this. The full-image path recomputes the
+    /// tables and checks the resulting RTMRs against the quote. The lite path
+    /// recomputes the three RTMR0 ACPI DATA digests from the declared VM shape
+    /// and rejects the attestation when they disagree with the ones the guest
+    /// reported, then rebuilds RTMR0 from the recomputed digests, so neither
+    /// path lets host-reported table content reach the expected value.
+    ///
+    /// It stays false where the check does not apply: GCP TDX, which measures
+    /// through the vTPM instead, and the SEV-SNP and Nitro Enclave paths.
     pub acpi_tables_verified: bool,
     /// dev vs prod OS image, from metadata.json (bound to os_image_hash). None if not exposed.
     pub os_image_is_dev: Option<bool>,
     /// dstack OS version, from the same metadata.json.
     pub os_image_version: Option<String>,
-    /// Attestation mode that produced the verified quote.
-    pub attestation_mode: Option<AttestationMode>,
+    /// TEE variant that produced the verified quote.
+    pub tee_variant: Option<TeeVariant>,
     pub report_data: Option<String>,
     pub tcb_status: Option<String>,
     pub advisory_ids: Vec<String>,
@@ -157,7 +162,7 @@ pub enum RtmrEventStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ra_tls::attestation::AttestationMode;
+    use ra_tls::attestation::TeeVariant;
 
     // the README documents sending either `attestation` or
     // (`quote` + `event_log` + `vm_config`); every field is optional, so any
@@ -203,17 +208,18 @@ mod tests {
             mr_aggregated: [0x66; 32],
             os_image_hash: vec![0x77; 32],
             key_provider_info: br#"{"name":"tpm","id":"aws-test"}"#.to_vec(),
+            init_script_hashes: Some(Vec::new()),
         };
 
         let boot_info = PolicyBootInfo::from_app_info(
-            AttestationMode::DstackAwsNitroTpm,
+            TeeVariant::DstackAwsNitroTpm,
             &app_info,
             String::new(),
             Vec::new(),
         );
         let encoded = serde_json::to_value(&boot_info).unwrap();
 
-        assert_eq!(encoded["attestationMode"], "dstack-aws-nitro-tpm");
+        assert_eq!(encoded["teeVariant"], "dstack-aws-nitro-tpm");
         assert_eq!(encoded["tcbStatus"], "");
         assert_eq!(encoded["advisoryIds"], serde_json::json!([]));
         assert!(encoded.get("mrAggregated").unwrap().is_string());

@@ -6,29 +6,27 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use config::KmsConfig;
 use main_service::{KmsState, RpcHandler};
+use ra_rpc::ratls_client_verifier::RaTlsClientAuth;
 use ra_rpc::rocket_helper::QuoteVerifier;
+use ra_tls::attestation::AttestationVerifier;
 use rocket::{
     fairing::AdHoc,
     figment::{providers::Serialized, Figment},
     response::content::{RawHtml, RawText},
+    tls::Resolver as _,
     Shutdown, State,
 };
 use tracing::{info, warn};
 
+mod admin_auth;
+mod admin_service;
 mod config;
-// mod ct_log;
 mod crypto;
 mod main_service;
 mod onboard_service;
 
 fn app_version() -> String {
-    const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
-    const VERSION: &str = git_version::git_version!(
-        args = ["--abbrev=20", "--always", "--dirty=-modified"],
-        prefix = "git:",
-        fallback = "unknown"
-    );
-    format!("v{CARGO_PKG_VERSION} ({VERSION})")
+    dstack_build_info::app_version!()
 }
 
 #[derive(Parser)]
@@ -53,28 +51,40 @@ async fn run_onboard_service(kms_config: KmsConfig, figment: Figment) -> Result<
     }
 
     if !kms_config.onboard.auto_bootstrap_domain.is_empty() {
-        onboard_service::bootstrap_keys(&kms_config).await?;
+        let verifier = AttestationVerifier::load(&kms_config.attestation)
+            .context("failed to load attestation verifier")?;
+        onboard_service::bootstrap_keys(&kms_config, &verifier).await?;
         return Ok(());
     }
 
-    let state = OnboardState::new(kms_config);
+    let state = OnboardState::new(kms_config)?;
     let figment = figment
         .clone()
         .merge(Serialized::defaults(figment.find_value("core.onboard")?));
 
     // Remove section tls
 
-    let _ = rocket::custom(figment)
-        .mount("/", rocket::routes![index, finish])
+    let rocket = rocket::custom(figment)
+        .mount("/", rocket::routes![index, finish, health])
         .mount(
             "/prpc",
             ra_rpc::prpc_routes!(OnboardState, OnboardHandler, trim: "Onboard."),
         )
-        .manage(state)
+        .manage(state.clone())
+        .ignite()
+        .await
+        .map_err(|err| anyhow!(err.to_string()))?;
+    state.set_shutdown(rocket.shutdown())?;
+    let _ = rocket
         .launch()
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
     Ok(())
+}
+
+#[rocket::get("/health")]
+fn health() -> RawText<&'static str> {
+    RawText("OK")
 }
 
 #[rocket::get("/metrics")]
@@ -105,19 +115,6 @@ fn record_attestation_metrics(req: &rocket::Request<'_>, res: &rocket::Response<
         .record_attestation_request(res.status().code >= 400);
 }
 
-fn configure_amd_kds_base_from_config(config: &KmsConfig) {
-    let Some(base_url) = config
-        .amd_kds_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|base_url| !base_url.is_empty())
-    else {
-        return;
-    };
-    std::env::set_var("DSTACK_AMD_KDS_BASE_URL", base_url);
-    info!("AMD SEV-SNP KDS base URL configured");
-}
-
 #[rocket::main]
 async fn main() -> Result<()> {
     {
@@ -129,7 +126,14 @@ async fn main() -> Result<()> {
 
     let figment = config::load_config_figment(args.config.as_deref());
     let config: KmsConfig = figment.focus("core").extract()?;
-    configure_amd_kds_base_from_config(&config);
+
+    if !config.attest_rpc_cert {
+        warn!(
+            "attest_rpc_cert = false; the KMS RPC certificate carries no attestation, so \
+             guests cannot verify which KMS they are talking to. Intended for local \
+             development only"
+        );
+    }
 
     if config.onboard.enabled && !config.keys_exists() {
         info!("Onboarding");
@@ -141,6 +145,12 @@ async fn main() -> Result<()> {
 
     info!("Updating certs");
     if let Err(err) = onboard_service::update_certs(&config).await {
+        if config.attest_rpc_cert {
+            return Err(err).context(
+                "Failed to reissue the attested KMS RPC certificate; refusing to start with a \
+                 potentially unattested certificate",
+            );
+        }
         warn!("Failed to update certs: {err}");
     };
 
@@ -150,14 +160,33 @@ async fn main() -> Result<()> {
         info!("  /prpc/{method}");
     }
 
-    let pccs_url = config.pccs_url.clone();
-    let amd_kds_base_url = config.amd_kds_base_url.clone();
     let metrics_enabled = config.metrics.enabled;
+    let admin_config = config.admin.clone();
+    // build the admin listener figment from `[core.admin]` before `config` is
+    // moved into the state; the fairing is built now so a misconfigured admin
+    // (enabled but no credential) fails fast before we start serving.
+    let admin_setup = if admin_config.enabled {
+        let admin_value = figment
+            .find_value("core.admin")
+            .context("core.admin section not found")?;
+        let admin_figment =
+            Figment::from(rocket::Config::default()).merge(Serialized::defaults(admin_value));
+        let admin_fairing = admin_auth::AdminAuthFairing::from_config(&admin_config)?;
+        Some((admin_figment, admin_fairing))
+    } else {
+        None
+    };
     let state = main_service::KmsState::new(config).context("Failed to initialize KMS state")?;
+    let quote_verifier = QuoteVerifier::new(state.attestation_verifier());
     let figment = figment
         .clone()
         .merge(Serialized::defaults(figment.find_value("rpc")?));
     let mut rocket = rocket::custom(figment)
+        // Verify client certificates by their attestation rather than by issuer. The
+        // certificates guests and onboarding mint from the temp CA today keep working
+        // unchanged - they are now accepted for the attestation they carry rather than
+        // for who signed them - and a self-issued certificate would be accepted too.
+        .attach(RaTlsClientAuth::fairing())
         .attach(AdHoc::on_response("Add app version header", |_req, res| {
             Box::pin(async move {
                 res.set_raw_header("X-App-Version", app_version());
@@ -167,7 +196,8 @@ async fn main() -> Result<()> {
             "/prpc",
             ra_rpc::prpc_routes!(KmsState, RpcHandler, trim: "KMS."),
         )
-        .manage(state);
+        .mount("/", rocket::routes![health])
+        .manage(state.clone());
 
     if metrics_enabled {
         info!("Prometheus metrics endpoint enabled at /metrics");
@@ -179,12 +209,35 @@ async fn main() -> Result<()> {
             .mount("/", rocket::routes![metrics]);
     }
 
-    let verifier = QuoteVerifier::new_with_amd_kds_base(pccs_url, amd_kds_base_url);
-    rocket = rocket.manage(verifier);
+    rocket = rocket.manage(quote_verifier);
 
-    rocket
-        .launch()
-        .await
-        .map_err(|err| anyhow!(err.to_string()))?;
+    let main_srv = rocket.launch();
+    match admin_setup {
+        Some((admin_figment, admin_fairing)) => {
+            if admin_config.insecure_no_auth {
+                warn!(
+                    "admin API is served with insecure_no_auth = true; the admin RPCs are exposed without authentication"
+                );
+            } else {
+                info!("admin API authentication enabled");
+            }
+            let admin_srv = rocket::custom(admin_figment)
+                .attach(admin_fairing)
+                .mount("/", admin_auth::routes())
+                .mount(
+                    "/prpc",
+                    ra_rpc::prpc_routes!(KmsState, admin_service::AdminRpcHandler, trim: "Admin."),
+                )
+                .manage(state)
+                .launch();
+            tokio::try_join!(
+                async { main_srv.await.map_err(|err| anyhow!(err.to_string())) },
+                async { admin_srv.await.map_err(|err| anyhow!(err.to_string())) },
+            )?;
+        }
+        None => {
+            main_srv.await.map_err(|err| anyhow!(err.to_string()))?;
+        }
+    }
     Ok(())
 }

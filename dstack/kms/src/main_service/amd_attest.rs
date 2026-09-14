@@ -25,7 +25,7 @@
 
 use anyhow::{bail, Context, Result};
 use dstack_types::{mr_config::MrConfigV3, KeyProviderInfo};
-use ra_tls::attestation::{AttestationMode, VerifiedAttestation};
+use ra_tls::attestation::{TeeVariant, VerifiedAttestation};
 use sha2::{Digest, Sha256};
 
 use super::upgrade_authority::BootInfo;
@@ -109,13 +109,13 @@ fn build_amd_snp_boot_info_with_tcb_status(
     let key_provider_info = mr_config_key_provider_info(&mr_config)?;
 
     Ok(BootInfo {
-        attestation_mode: AttestationMode::DstackAmdSevSnp,
+        tee_variant: TeeVariant::DstackAmdSevSnp,
         mr_aggregated,
         os_image_hash: os_image_hash.to_vec(),
         mr_system,
-        app_id: mr_config.app_id.clone(),
+        app_id: mr_config.app_id.clone().unwrap_or_default(),
         compose_hash: mr_config.compose_hash.clone(),
-        instance_id: mr_config.instance_id.clone(),
+        instance_id: mr_config.instance_id.clone().unwrap_or_default(),
         device_id: verified_chip_id.to_vec(),
         key_provider_info,
         tcb_status: tcb_status.to_string(),
@@ -182,7 +182,7 @@ fn parse_measurement_input_from_vm_config(vm_config: &str) -> Result<Measurement
 fn mr_config_key_provider_info(mr_config: &MrConfigV3) -> Result<Vec<u8>> {
     serde_json::to_vec(&KeyProviderInfo::new(
         mr_config.key_provider_name().to_string(),
-        hex::encode(&mr_config.key_provider_id),
+        hex::encode(mr_config.key_provider_id.as_deref().unwrap_or_default()),
     ))
     .context("failed to serialize key provider info")
 }
@@ -193,6 +193,7 @@ fn test_mr_config(app_id: Vec<u8>, compose_hash: Vec<u8>) -> MrConfigV3 {
     MrConfigV3::new(
         app_id,
         compose_hash,
+        None,
         dstack_types::KeyProviderKind::None,
         Vec::new(),
         instance_id,
@@ -365,7 +366,7 @@ mod tests {
 
         let boot_info = build_amd_snp_boot_info(&verified, &chip_id, &input)
             .expect("matching measurement should build snp boot info");
-        assert_eq!(boot_info.attestation_mode, AttestationMode::DstackAmdSevSnp);
+        assert_eq!(boot_info.tee_variant, TeeVariant::DstackAmdSevSnp);
         assert_eq!(boot_info.mr_aggregated.len(), 32);
         assert_eq!(boot_info.device_id, chip_id.to_vec());
         assert_eq!(boot_info.app_id, vec![0x11; 20]);

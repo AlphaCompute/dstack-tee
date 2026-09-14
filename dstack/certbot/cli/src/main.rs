@@ -5,8 +5,8 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result};
-use certbot::{CertBotConfig, WorkDir};
+use anyhow::{bail, Context, Result};
+use certbot::{CertBotConfig, ChallengeKind, WorkDir, LETS_ENCRYPT_ISSUER_DOMAIN_NAME};
 use clap::Parser;
 use documented::DocumentedFields;
 use fs_err as fs;
@@ -28,7 +28,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Initialize the configuration file
+    /// Create the ACME account described by the configuration file
     Init {
         /// Path to the configuration file
         #[arg(short, long, default_value = "certbot.toml")]
@@ -36,6 +36,15 @@ enum Command {
     },
     /// Set CAA record for the domain
     SetCaa {
+        /// Path to the configuration file
+        #[arg(short, long, default_value = "certbot.toml")]
+        config: PathBuf,
+    },
+    /// Print the DNS records the configured domains need
+    ///
+    /// With `challenge = "dns-persist-01"` these are not written by certbot and
+    /// have to be published once, by hand, before the first issuance.
+    DnsRecords {
         /// Path to the configuration file
         #[arg(short, long, default_value = "certbot.toml")]
         config: PathBuf,
@@ -60,8 +69,30 @@ struct Config {
     workdir: PathBuf,
     /// ACME server URL
     acme_url: String,
-    /// Cloudflare API token
+    /// ACME challenge used to prove control of the domains
+    ///
+    /// "dns-01" (default) writes a TXT record per order through the Cloudflare
+    /// API and needs cf_api_token.
+    ///
+    /// "dns-persist-01" proves control with a _validation-persist TXT record
+    /// published once, by hand: no API token, and the zone can be hosted
+    /// anywhere. Run `certbot init` then `certbot dns-records` to get the
+    /// records to publish. Experimental: the draft is still changing and
+    /// Let's Encrypt serves this challenge on staging only.
+    #[serde(default)]
+    challenge: ChallengeKind,
+    /// Issuer Domain Name naming the CA in dns-persist-01 and CAA records
+    #[serde(default = "default_issuer_domain_name")]
+    issuer_domain_name: String,
+    /// Cloudflare API token (unused with dns-persist-01)
+    #[serde(default)]
     cf_api_token: String,
+    /// Optional Cloudflare-compatible API base URL
+    #[serde(default)]
+    cf_api_url: Option<String>,
+    /// TTL for DNS TXT challenge records in seconds
+    #[serde(default = "default_dns_txt_ttl")]
+    dns_txt_ttl: u32,
     /// Auto set CAA record
     auto_set_caa: bool,
     /// List of domains to issue certificates for
@@ -84,7 +115,11 @@ impl Default for Config {
         Self {
             workdir: ".".into(),
             acme_url: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+            challenge: ChallengeKind::default(),
+            issuer_domain_name: default_issuer_domain_name(),
             cf_api_token: "".into(),
+            cf_api_url: None,
+            dns_txt_ttl: default_dns_txt_ttl(),
             auto_set_caa: true,
             domains: vec!["example.com".into()],
             renew_interval: 3600,
@@ -96,13 +131,28 @@ impl Default for Config {
     }
 }
 
+const fn default_dns_txt_ttl() -> u32 {
+    60
+}
+
+fn default_issuer_domain_name() -> String {
+    LETS_ENCRYPT_ISSUER_DOMAIN_NAME.to_string()
+}
+
 impl Config {
     fn to_commented_toml(&self) -> Result<String> {
         let mut doc = to_document(self)?;
 
-        for (i, (mut key, _value)) in doc.iter_mut().enumerate() {
+        for (mut key, _value) in doc.iter_mut() {
+            // Look the doc comment up by name rather than by position: a `None`
+            // option serializes to nothing, so the document's keys are a subset
+            // of the struct's fields and indexing `FIELD_DOCS` positionally
+            // attaches every comment after the first absent key to the wrong
+            // one.
+            let Ok(docstring) = Self::get_field_docs(key.get()) else {
+                continue;
+            };
             let decor = key.leaf_decor_mut();
-            let docstring = Self::FIELD_DOCS[i];
 
             let mut comment = String::new();
             for line in docstring.lines() {
@@ -133,7 +183,11 @@ fn load_config(config: &PathBuf) -> Result<CertBotConfig> {
         .key_file(workdir.key_path())
         .auto_create_account(true)
         .cert_subject_alt_names(config.domains)
+        .challenge(config.challenge)
+        .issuer_domain_name(config.issuer_domain_name)
         .cf_api_token(config.cf_api_token)
+        .maybe_cf_api_url(config.cf_api_url)
+        .dns_txt_ttl(config.dns_txt_ttl)
         .renew_interval(renew_interval)
         .renew_timeout(renew_timeout)
         .renew_expires_in(renew_expires_in)
@@ -147,15 +201,52 @@ fn load_config(config: &PathBuf) -> Result<CertBotConfig> {
 
 async fn renew(config: &PathBuf, once: bool, force: bool) -> Result<()> {
     let bot_config = load_config(config).context("Failed to load configuration")?;
-    let bot = bot_config
-        .build_bot()
-        .await
-        .context("Failed to build bot")?;
     if once {
-        bot.renew(force).await?;
-    } else {
-        bot.run().await;
+        let bot = bot_config
+            .build_bot()
+            .await
+            .context("Failed to build bot")?;
+        bot.renew_and_run_hook(force).await?;
+        return Ok(());
     }
+
+    // Startup and the renew loop are raced against shutdown as one future, so
+    // the signal listener covers the whole daemon lifetime. build_bot() does
+    // network I/O (resolving the DNS zone, creating the ACME account), and a
+    // SIGTERM/Ctrl-C arriving there used to fall through to the default
+    // disposition and hard-kill the process. Racing the two phases separately
+    // would leave a gap between them with no listener registered: tokio never
+    // restores the default disposition once a handler is installed, and drops
+    // a signal that arrives while nothing is subscribed, so such a SIGTERM
+    // would neither terminate nor unblock the process.
+    let daemon = async {
+        let bot = bot_config
+            .build_bot()
+            .await
+            .context("Failed to build bot")?;
+        bot.run().await;
+        // run() loops forever today, but that is not enforced by its type: a
+        // future early return should exit with an error, not panic.
+        bail!("certbot daemon exited unexpectedly")
+    };
+    tokio::select! {
+        result = daemon => result,
+        result = shutdown_signal() => result,
+    }
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
@@ -192,6 +283,16 @@ async fn main() -> Result<()> {
                 .context("Failed to build bot")?;
             bot.set_caa().await?;
         }
+        Command::DnsRecords { config } => {
+            let bot_config = load_config(&config).context("Failed to load configuration")?;
+            let bot = bot_config
+                .build_bot()
+                .await
+                .context("Failed to build bot")?;
+            for record in bot.required_dns_records() {
+                println!("{record}");
+            }
+        }
         Command::Cfg { write_to } => {
             let toml_str = Config::default().to_commented_toml()?;
             match write_to {
@@ -201,4 +302,63 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod config_template_tests {
+    use super::*;
+
+    /// Every key has to carry its own doc comment. `toml_edit` drops `None`
+    /// fields from the serialized document -- `cf_api_url` is unset by default
+    /// -- so indexing `FIELD_DOCS` by position shifts every comment after the
+    /// gap onto the wrong setting.
+    #[test]
+    fn every_key_is_labelled_with_its_own_doc_comment() {
+        let rendered = Config::default()
+            .to_commented_toml()
+            .expect("the default config renders");
+
+        // Pair each key with the comment block immediately above it.
+        let mut comment = String::new();
+        let mut pairs = Vec::new();
+        for line in rendered.lines() {
+            match line.strip_prefix('#') {
+                Some(text) => comment.push_str(text.trim()),
+                None => {
+                    if let Some((key, _)) = line.split_once('=') {
+                        pairs.push((key.trim().to_string(), std::mem::take(&mut comment)));
+                    }
+                }
+            }
+        }
+        assert!(!pairs.is_empty(), "no keys rendered:\n{rendered}");
+
+        for (key, comment) in &pairs {
+            let expected = Config::get_field_docs(key)
+                .unwrap_or_else(|err| panic!("no doc comment for {key:?}: {err}"));
+            let expected: String = expected.lines().map(str::trim).collect();
+            assert_eq!(
+                comment, &expected,
+                "key {key:?} is labelled with another field's doc comment"
+            );
+        }
+    }
+
+    /// The field that made the misalignment visible: it sat after the dropped
+    /// `cf_api_url` and was labelled "Renew timeout in seconds", next to the one
+    /// value whose interaction with `renew_timeout` this crate clamps.
+    #[test]
+    fn max_dns_wait_is_not_labelled_as_a_renew_timeout() {
+        let rendered = Config::default()
+            .to_commented_toml()
+            .expect("the default config renders");
+        let (before, _) = rendered
+            .split_once("max_dns_wait")
+            .expect("max_dns_wait is rendered");
+        let label = before.lines().last().expect("it has a comment above it");
+        assert!(
+            label.contains("DNS propagation"),
+            "max_dns_wait is labelled {label:?}"
+        );
+    }
 }

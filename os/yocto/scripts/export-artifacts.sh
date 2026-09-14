@@ -105,6 +105,30 @@ if [ ! -f "$VERITY_ENV_FILE" ]; then
     echo "Build the rootfs first, e.g. bitbake mc:${FLAVOR}:dstack-rootfs" >&2
     exit 1
 fi
+
+# A kconfig fragment is a request, not a guarantee: an unmet dependency drops
+# the line and a tristate is clamped to whatever it depends on, both silently.
+# linux-yocto%.bbappend deploys the built .config next to the images, so check
+# it here before anything is published -- shipping a guest image whose kernel
+# quietly lacks an asserted capability is the failure this guards against.
+#
+# Both fragments are gated. dstack.cfg used to be exempt because three of its
+# lines were not satisfied by the build: CONFIG_HOTPLUG_CPU has no prompt to
+# set, CONFIG_INPUT has none either without EXPERT, and CONFIG_SCSI is pulled
+# in by the SCSI disk driver that KERNEL_FEATURES enables. Those three kept the
+# other seventy assertions unchecked along with them; the fragment documents
+# each case and now says only what the build actually does.
+KERNEL_CONFIG_FILE="$COMMON_IMG_DIR/kernel-config"
+if [ -f "$KERNEL_CONFIG_FILE" ]; then
+    "$REPO_ROOT/os/common/scripts/check-kernel-config.sh" \
+        "$KERNEL_CONFIG_FILE" \
+        "$YOCTO_DIR/layers/meta-dstack/recipes-kernel/linux/files/dstack-docker.cfg" \
+        "$YOCTO_DIR/layers/meta-dstack/recipes-kernel/linux/files/dstack.cfg"
+    "$REPO_ROOT/os/common/scripts/check-lxc-kernel-config.sh" "$KERNEL_CONFIG_FILE"
+else
+    echo "Error: kernel config not found: $KERNEL_CONFIG_FILE" >&2
+    exit 1
+fi
 # shellcheck source=/dev/null
 source "$VERITY_ENV_FILE"
 : "${ROOT_HASH:?ROOT_HASH missing from verity environment}"

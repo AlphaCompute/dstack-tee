@@ -112,25 +112,15 @@ has_tsm_provider() {
 
 if [[ -e /dev/sev-guest ]] || has_tsm_provider sev_guest; then
 	log "SEV-SNP guest device/TSM provider detected"
-	TEE_PRESENT=1
 elif [[ -e /dev/tdx_guest ]] || has_tsm_provider tdx_guest; then
 	log "TDX guest device/TSM provider detected"
-	TEE_PRESENT=1
 elif modprobe sev-guest 2>/dev/null; then
 	log "Loaded sev-guest module"
-	TEE_PRESENT=1
 elif modprobe tdx-guest 2>/dev/null; then
 	log "Loaded tdx-guest module"
-	TEE_PRESENT=1
 else
-	# DEV-ONLY fallback: no TEE attestation device is present (e.g. a plain
-	# laptop with no sev-guest/tdx-guest hardware). Real deployments still
-	# enforce attestation at a separate layer (KMS/auth-server reject any VM
-	# that cannot produce a valid quote), so continuing here does not weaken
-	# production security -- it only lets a local, non-attesting dev CVM
-	# finish booting. Do NOT rely on this path for anything attested.
-	log "Warning: neither sev-guest nor tdx-guest module is available; continuing in no_tee dev mode (DEV-ONLY, not attested)"
-	TEE_PRESENT=0
+	log "Error: neither sev-guest nor tdx-guest module is available"
+	exit 1
 fi
 
 # Setup configfs and TSM for TDX attestation
@@ -148,11 +138,7 @@ setup_tsm() {
 		mkdir -p /sys/kernel/config/tsm/report/com.intel.dcap
 	fi
 }
-if [[ "$TEE_PRESENT" == "1" ]]; then
-	setup_tsm || true
-else
-	log "Skipping TSM/attestation setup (no_tee dev mode)"
-fi
+setup_tsm || true
 
 # Setup dstack system
 log "Preparing dstack system..."
@@ -299,12 +285,18 @@ dstack-util setup --work-dir $WORK_DIR --device "$DATA_DEVICE" --mount-point $DA
 log "Mounting container runtime dirs to persistent storage"
 mkdir -p $DATA_MNT/var/lib/docker
 mkdir -p $DATA_MNT/var/lib/containerd
+mkdir -p $DATA_MNT/var/lib/containerd-stargz-grpc
+mkdir -p $DATA_MNT/var/lib/nerdctl
 mkdir -p $DATA_MNT/var/lib/sysbox
 mkdir -p /var/lib/docker
 mkdir -p /var/lib/containerd
+mkdir -p /var/lib/containerd-stargz-grpc
+mkdir -p /var/lib/nerdctl
 mkdir -p /var/lib/sysbox
 mount --rbind $DATA_MNT/var/lib/docker /var/lib/docker
 mount --rbind $DATA_MNT/var/lib/containerd /var/lib/containerd
+mount --rbind $DATA_MNT/var/lib/containerd-stargz-grpc /var/lib/containerd-stargz-grpc
+mount --rbind $DATA_MNT/var/lib/nerdctl /var/lib/nerdctl
 mount --rbind $DATA_MNT/var/lib/sysbox /var/lib/sysbox
 mount --rbind $WORK_DIR /dstack
 
@@ -314,16 +306,33 @@ echo "============================"
 
 cd /dstack
 
-if [ "$(jq 'has("init_script")' app-compose.json)" == true ]; then
-	log "Running init script"
+# Verify and mount required read-only data volumes before the application starts.
+/bin/dstack-volume mount-all app-compose.json
+
+mapfile -t init_scripts < <(
+	jq -r '
+		.init_script?
+		| if type == "array" then .[] elif type == "string" then . else empty end
+		| @base64
+	' app-compose.json
+)
+# Keep in sync with dstack_types::MAX_INIT_SCRIPTS.
+if ((${#init_scripts[@]} > 5)); then
+	log "Too many init scripts: maximum is 5"
+	exit 1
+fi
+if ((${#init_scripts[@]} > 0)); then
 	dstack-util notify-host -e "boot.progress" -d "init-script" || true
-	# shellcheck disable=SC1090
-	source <(jq -r '.init_script' app-compose.json)
+	for i in "${!init_scripts[@]}"; do
+		log "Running init script [$i]"
+		# shellcheck disable=SC1090
+		source <(printf '%s' "${init_scripts[$i]}" | base64 -d)
+	done
 fi
 
 RUNNER=$(jq -r '.runner' app-compose.json)
 case "$RUNNER" in
-docker-compose)
+docker-compose|nerdctl-compose)
 	if [[ ! -f docker-compose.yaml ]]; then
 		jq -r '.docker_compose_file' app-compose.json >docker-compose.yaml
 	fi

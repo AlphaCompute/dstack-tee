@@ -51,7 +51,7 @@ fi
 
 # Sync is always enabled when NODE_ID > 0. Peer auto-discovery works via incoming
 # sync connections: when another node syncs to us, we learn about it automatically
-# through WaveKV's handle_sync, which auto-adds the sender as a peer.
+# through WaveKV's envelope handler, which auto-adds the sender as a peer.
 # BOOTNODE_URL is optional — it speeds up initial discovery but is not required.
 SYNC_ENABLED=$([ "$NODE_ID" -gt 0 ] && echo "true" || echo "false")
 
@@ -95,7 +95,7 @@ sync_connections_interval = "${SYNC_CONNECTIONS_INTERVAL:-30s}"
 enabled = true
 address = "${ADMIN_LISTEN_ADDR:-0.0.0.0}"
 port = ${ADMIN_LISTEN_PORT:-8001}
-admin_token = "${ADMIN_API_TOKEN}"
+auth_token = "${ADMIN_API_TOKEN}"
 
 [core.wg]
 public_key = "$PUBLIC_KEY"
@@ -114,7 +114,6 @@ tls_versions = ["1.2"]
 listen_addr = "0.0.0.0"
 listen_port = "${PROXY_LISTEN_PORT:-443}"
 connect_top_n = 3
-localhost_enabled = false
 app_address_ns_compat = true
 workers = ${PROXY_WORKERS:-32}
 max_connections_per_app = ${MAX_CONNECTIONS_PER_APP:-0}
@@ -124,6 +123,7 @@ inbound_pp_enabled = ${INBOUND_PP_ENABLED:-false}
 connect = "${TIMEOUT_CONNECT:-5s}"
 handshake = "${TIMEOUT_HANDSHAKE:-5s}"
 cache_top_n = "${TIMEOUT_CACHE_TOP_N:-30s}"
+handshake_stale = "${TIMEOUT_HANDSHAKE_STALE:-30m}"
 dns_resolve = "${TIMEOUT_DNS_RESOLVE:-5s}"
 data_timeout_enabled = ${TIMEOUT_DATA_ENABLED:-true}
 idle = "${TIMEOUT_IDLE:-10m}"
@@ -131,6 +131,13 @@ write = "${TIMEOUT_WRITE:-5s}"
 shutdown = "${TIMEOUT_SHUTDOWN:-5s}"
 total = "${TIMEOUT_TOTAL:-5h}"
 pp_header = "${TIMEOUT_PP_HEADER:-5s}"
+
+[core.proxy.health_check]
+enabled = ${HEALTH_CHECK_ENABLED:-true}
+interval = "${HEALTH_CHECK_INTERVAL:-5s}"
+timeout = "${HEALTH_CHECK_TIMEOUT:-2s}"
+concurrency = ${HEALTH_CHECK_CONCURRENCY:-16}
+failure_threshold = ${HEALTH_CHECK_FAILURE_THRESHOLD:-2}
 
 [core.proxy.port_policy_fetch]
 timeout = "${PORT_POLICY_FETCH_TIMEOUT:-10s}"

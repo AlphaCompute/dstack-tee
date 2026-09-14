@@ -44,83 +44,6 @@ run_cmd() {
     fi
 }
 
-# --- Detect qemu-bridge-helper path ---
-
-find_bridge_helper() {
-    local paths=(
-        /usr/lib/qemu/qemu-bridge-helper
-        /usr/libexec/qemu-bridge-helper
-        /usr/local/lib/qemu/qemu-bridge-helper
-        /usr/local/libexec/qemu-bridge-helper
-    )
-    for p in "${paths[@]}"; do
-        if [[ -f "$p" ]]; then
-            echo "$p"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# --- Detect current bridge provider ---
-
-# Returns "libvirt:<net_name>" if bridge is managed by a libvirt network,
-# "standalone" otherwise.
-detect_bridge_provider() {
-    if command -v virsh &>/dev/null; then
-        local name br
-        while read -r name; do
-            [[ -z "$name" ]] && continue
-            br=$(virsh net-dumpxml "$name" 2>/dev/null | grep -oP "<bridge name='\K[^']*" | head -1 || true)
-            if [[ "$br" == "$BRIDGE" ]]; then
-                echo "libvirt:$name"
-                return 0
-            fi
-        done < <(virsh net-list --all --name 2>/dev/null)
-    fi
-    echo "standalone"
-}
-
-# --- Check functions ---
-
-check_bridge_helper() {
-    echo
-    bold "qemu-bridge-helper"
-    local helper
-    if ! helper=$(find_bridge_helper); then
-        check_fail "qemu-bridge-helper not found"
-        check_info "Install QEMU: sudo apt install qemu-system-x86"
-        return
-    fi
-    check_pass "found at $helper"
-
-    if [[ -u "$helper" ]]; then
-        check_pass "setuid bit is set"
-    else
-        check_fail "setuid bit not set"
-        check_info "Fix: sudo chmod u+s $helper"
-    fi
-}
-
-check_bridge_conf() {
-    echo
-    bold "/etc/qemu/bridge.conf"
-    local conf="/etc/qemu/bridge.conf"
-    if [[ ! -f "$conf" ]]; then
-        check_fail "$conf does not exist"
-        check_info "Fix: sudo mkdir -p /etc/qemu && echo 'allow $BRIDGE' | sudo tee $conf"
-        return
-    fi
-    check_pass "$conf exists"
-
-    if grep -qE "^allow[[:space:]]+($BRIDGE|all)[[:space:]]*$" "$conf" 2>/dev/null; then
-        check_pass "bridge '$BRIDGE' is allowed"
-    else
-        check_fail "bridge '$BRIDGE' not found in $conf"
-        check_info "Fix: echo 'allow $BRIDGE' | sudo tee -a $conf"
-    fi
-}
-
 check_bridge_interface() {
     echo
     bold "bridge interface: $BRIDGE"
@@ -190,47 +113,6 @@ check_dhcp() {
 
     check_fail "no DHCP server found for $BRIDGE"
     check_info "Run: $(basename "$0") setup --mode standalone --bridge $BRIDGE"
-}
-
-check_dhcp_notify() {
-    echo
-    bold "DHCP lease notification"
-
-    local provider
-    provider=$(detect_bridge_provider)
-
-    if [[ "$provider" == libvirt:* ]]; then
-        check_warn "libvirt DHCP does not support dhcp-script callback"
-        check_info "port forwarding requires manual PRPC call or alternative notification"
-        return
-    fi
-
-    # Check dnsmasq config for dhcp-script
-    local conf_files=(/etc/dnsmasq.d/*"$BRIDGE"* /etc/dnsmasq.d/*.conf)
-    local found_script=""
-    for f in "${conf_files[@]}"; do
-        [[ -f "$f" ]] || continue
-        local script_path
-        script_path=$(grep -oP '^dhcp-script=\K.*' "$f" 2>/dev/null || true)
-        if [[ -n "$script_path" ]]; then
-            found_script="$script_path"
-            break
-        fi
-    done
-
-    if [[ -z "$found_script" ]]; then
-        check_warn "no dhcp-script configured in dnsmasq"
-        check_info "port forwarding will not be set up automatically"
-        check_info "add 'dhcp-script=/usr/local/bin/dhcp-notify.sh' to dnsmasq config"
-        return
-    fi
-
-    if [[ -x "$found_script" ]]; then
-        check_pass "dhcp-script configured: $found_script"
-    else
-        check_fail "dhcp-script $found_script is not executable or missing"
-        check_info "Fix: sudo chmod +x $found_script"
-    fi
 }
 
 check_ip_forward() {
@@ -366,33 +248,6 @@ check_forward_rules() {
 }
 
 # --- Setup: common ---
-
-setup_bridge_conf() {
-    echo
-    bold "Setting up /etc/qemu/bridge.conf"
-    run_cmd sudo mkdir -p /etc/qemu
-    if [[ -f /etc/qemu/bridge.conf ]] && grep -qE "^allow[[:space:]]+($BRIDGE|all)" /etc/qemu/bridge.conf 2>/dev/null; then
-        echo "  already configured"
-    else
-        run_cmd bash -c "echo 'allow $BRIDGE' | sudo tee -a /etc/qemu/bridge.conf"
-    fi
-}
-
-setup_bridge_helper() {
-    echo
-    bold "Setting up qemu-bridge-helper"
-    local helper
-    if ! helper=$(find_bridge_helper); then
-        echo "  $(red 'ERROR'): qemu-bridge-helper not found. Install QEMU first."
-        return 1
-    fi
-    if [[ -u "$helper" ]]; then
-        echo "  setuid already set on $helper"
-    else
-        run_cmd sudo chmod u+s "$helper"
-        echo "  setuid set on $helper"
-    fi
-}
 
 setup_ip_forward() {
     echo
@@ -542,28 +397,12 @@ sudo mv /tmp/.dstack-br-network $network"
             dhcp_end="${prefix}.254"
         fi
 
-        # Install dhcp-notify.sh if present
-        local notify_script="/usr/local/bin/dhcp-notify.sh"
-        local dhcp_script_line=""
-        local src_notify
-        src_notify="$(cd "$(dirname "$0")" && pwd)/dhcp-notify.sh"
-        if [[ -f "$src_notify" ]]; then
-            run_cmd sudo cp "$src_notify" "$notify_script"
-            run_cmd sudo chmod +x "$notify_script"
-            dhcp_script_line="dhcp-script=${notify_script}"
-            echo "  installed $notify_script"
-        else
-            echo "  $(yellow '[WARN]') dhcp-notify.sh not found at $src_notify"
-            echo "  VM port forwarding will not be set up automatically"
-        fi
-
         run_cmd bash -c "cat > /tmp/.dstack-dnsmasq <<HEREDOC
 interface=$BRIDGE
 bind-interfaces
 dhcp-range=${dhcp_start},${dhcp_end},255.255.255.0,12h
 dhcp-option=option:router,${bridge_ip}
 dhcp-option=option:dns-server,8.8.8.8,1.1.1.1
-${dhcp_script_line}
 HEREDOC
 sudo mv /tmp/.dstack-dnsmasq $conf"
         echo "  created $conf"
@@ -738,11 +577,8 @@ cmd_check() {
         echo "provider: $(bold 'standalone')"
     fi
 
-    check_bridge_helper
-    check_bridge_conf
     check_bridge_interface
     check_dhcp
-    check_dhcp_notify
     check_dhcp_firewall
     check_ip_forward
     check_nat_rules
@@ -786,8 +622,6 @@ cmd_setup() {
     $DRY_RUN && echo "dry-run: $(yellow 'yes')"
 
     # Common setup
-    setup_bridge_conf
-    setup_bridge_helper
     setup_ip_forward
 
     # Mode-specific setup
@@ -870,7 +704,9 @@ cmd_destroy() {
         fi
     fi
 
-    # Remove bridge.conf entry
+    # Remove the bridge.conf entry an older setup added. netd owns every host
+    # interface now, so qemu-bridge-helper is not used and the `allow` line is
+    # a standing grant to attach any local user's TAP to the bridge.
     local conf="/etc/qemu/bridge.conf"
     if [[ -f "$conf" ]] && grep -qE "^allow[[:space:]]+${BRIDGE}[[:space:]]*$" "$conf" 2>/dev/null; then
         echo

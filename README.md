@@ -5,7 +5,7 @@
 ### The open framework for confidential AI.
 
 [![GitHub Stars](https://img.shields.io/github/stars/dstack-tee/dstack?style=flat-square&logo=github)](https://github.com/Dstack-TEE/dstack/stargazers)
-[![License](https://img.shields.io/github/license/dstack-tee/dstack?style=flat-square)](https://github.com/Dstack-TEE/dstack/blob/master/LICENSE)
+[![License](https://img.shields.io/github/license/dstack-tee/dstack?style=flat-square)](https://github.com/Dstack-TEE/dstack/blob/next/LICENSE)
 [![REUSE status](https://api.reuse.software/badge/github.com/Dstack-TEE/dstack)](https://api.reuse.software/info/github.com/Dstack-TEE/dstack)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Dstack-TEE/dstack)
 [![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=flat-square&logo=telegram&logoColor=white)](https://t.me/+UO4bS4jflr45YmUx)
@@ -73,6 +73,9 @@ Setting up dstack on your own hardware? Start with the [self-hosted quick onboar
 
 Building or customizing the guest OS itself? Follow the [guest-OS build guide](./docs/building-guest-os.md).
 
+Developing without TEE hardware? Use a development image with
+[no-TEE mode and swtpm](./docs/development-without-tee.md).
+
 ## Architecture
 
 ![Architecture](./docs/assets/arch.png)
@@ -87,15 +90,18 @@ docs/    User and operator documentation
 tools/   Standalone development and security tools
 ```
 
-The currently implemented OS backend is Yocto under `os/yocto/`. Shared rootfs
-payload and release assembly stay outside that backend so another builder can
-be added later without duplicating them. See [`os/README.md`](./os/README.md).
+The default and recommended OS backend is mkosi under `os/mkosi/`. The Yocto
+backend under `os/yocto/` is deprecated and kept only to rebuild existing
+images; do not use it for new work. Shared rootfs payload and release assembly
+stay outside the backends so they are not duplicated. See
+[`os/README.md`](./os/README.md).
 
 Scripts follow the same ownership boundaries: component-specific helpers stay
 beside their component under `dstack/`; files installed into every guest live
 in `os/common/rootfs/`; backend-neutral image tooling lives in `os/image/`;
-Yocto-only helpers live in `os/yocto/scripts/`; and repository-wide standalone
-utilities live in `tools/`.
+mkosi-only helpers live in `os/mkosi/scripts/` (deprecated Yocto-only helpers
+in `os/yocto/scripts/`); and repository-wide standalone utilities live in
+`tools/`.
 
 Your container runs inside a Confidential VM, such as Intel TDX or AMD SEV-SNP, with optional GPU isolation via NVIDIA Confidential Computing. The CPU TEE protects application logic; the GPU TEE protects model weights and inference data.
 
@@ -152,6 +158,8 @@ Apps communicate with the guest agent via HTTP over `/var/run/dstack.sock`. Use 
 - [Gateway](./docs/dstack-gateway.md) - Gateway configuration
 
 **Reference**
+- [Guest Agent API v1](./docs/guest-api-v1.md) - Key derivation, signature chains, and the versioned guest API
+- [Guest Agent API v0](./docs/guest-api-v0.md) - The frozen legacy surface, for clients that still speak the unversioned API
 - [App Compose Format](./docs/normalized-app-compose.md) - Compose file specification
 - [Intel TDX Attestation](./docs/attestation-tdx.md) - Measurement and runtime-event verification
 - [Native TEE Interfaces](./docs/native-tee-interfaces.md) - Advanced compatibility with Linux TEE devices and configfs-tsm
@@ -218,7 +226,7 @@ Yes. dstack runs on supported TEE-capable servers, including Intel TDX-capable h
 <details>
 <summary><strong>How do users verify my deployment?</strong></summary>
 
-Your app exposes attestation quotes via the SDK. Users verify these quotes using [dstack-verifier](https://github.com/Dstack-TEE/dstack/tree/master/dstack/verifier), [dcap-qvl](https://github.com/Phala-Network/dcap-qvl), or the [Trust Center](https://trust.phala.com). See the [verification guide](./docs/verification.md) for details.
+Your app exposes attestation quotes via the SDK. Users verify these quotes using [dstack-verifier](https://github.com/Dstack-TEE/dstack/tree/next/dstack/verifier), [dcap-qvl](https://github.com/Phala-Network/dcap-qvl), or the [Trust Center](https://trust.phala.com). See the [verification guide](./docs/verification.md) for details.
 
 </details>
 

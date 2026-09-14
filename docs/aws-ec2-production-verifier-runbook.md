@@ -11,8 +11,8 @@ and endpoint identity.
 ## Inputs
 
 - The release image package for the exact release candidate, produced by the
-  unified build entrypoint `os/build.sh` (the `<name>-<version>-uki.tar.gz`
-  dist archive). It contains `disk.raw`, `sha256sum.txt`, `digest.txt`, and
+  guest-OS build (`make os-image`; see `docs/building-guest-os.md`) as the
+  `<name>-<version>-uki.tar.gz` archive. It contains `disk.raw`, `sha256sum.txt`, `digest.txt`, and
   `measurement.{gcp,aws}.cbor`. The build output also contains an
   `aws-pcrs.json` side-car, but that file is not part of the archive.
 - The dstack monorepo sources pinned at the exact release revision, for the
@@ -27,14 +27,14 @@ and endpoint identity.
 The release evidence is the image package itself: every measured file is
 listed in `sha256sum.txt`, and the unified image identity is
 `os_image_hash = sha256(sha256sum.txt)` (also recorded as `digest.txt`).
-There is no separately generated release manifest; the same `os/build.sh`
-flow produces both the image and its evidence.
+There is no separately generated release manifest; the same build produces
+both the image and its evidence.
 
 Rebuild from clean, pinned sources and require a byte-identical result:
 
 ```bash
 git status --porcelain   # must be empty at the pinned release revision
-./os/build.sh            # reproducible Yocto backend; emits images/<name>-<version>-uki.tar.gz
+make os-image            # reproducible mkosi backend; emits os/mkosi/repro-build/build/out/prod/<name>-<version>-uki.tar.gz
 ```
 
 Compare the rebuilt package against the published one. `sha256sum.txt` lists
@@ -54,9 +54,9 @@ expected=$(sha256sum published/sha256sum.txt | awk '{print $1}')
 test "$expected" = "$(cat published/digest.txt)"
 ```
 
-BitBake enforces per-recipe input checksums during the rebuild; for full
-supply-chain independence, mirror the Yocto `downloads/` input cache by
-content hash.
+The mkosi backend pins its inputs to an immutable Debian snapshot, SHA-256
+checked archives, and fixed Git revisions (`os/mkosi/versions.env`); for full
+supply-chain independence, mirror those inputs by content hash.
 
 Run the hardening audit against the release kernel config and rootfs; it must
 exit zero with `failures=0`:
@@ -181,7 +181,7 @@ jq -e \
   .is_valid == true and
   .details.quote_verified == true and
   .details.report_data == $expected_report_data and
-  .details.boot_info.attestationMode == "dstack-aws-nitro-tpm" and
+  .details.boot_info.teeVariant == "dstack-aws-nitro-tpm" and
   .details.boot_info.tcbStatus == "UpToDate" and
   .details.boot_info.osImageHash == $expected_os_image_hash
 ' request.json.verification.json
@@ -209,6 +209,18 @@ For AWS NitroTPM, the policy must require:
   `instance-id`, `key-provider`);
 - a `report_data` challenge for external verifier flows that need liveness.
 
+For GPU workloads, PCR14 also contains `gpu-policy-hash` immediately after
+`compose-hash`. Its 32-byte payload must equal
+`SHA-256(JCS(requirements.gpu_policy))`, using `{}` when the policy is omitted.
+Because the verifier replays the event chain against the signed NitroTPM
+Attestation Document, this validates `gpu_policy_hash` on AWS. A successful GPU
+launch also adds `gpu-attestation`; after PCR14 replay, its `evidence_sha256`
+can be compared with `SHA-256(hex_decode(bundle.evidence))`, where `bundle` is
+the `AttestResponse.boottime_gpu_evidence` entry whose `format` is
+`nvidia-nvattest-boottime-json-v1`, returned by `/v1/Attest` when the request
+sets `include_boottime_gpu_evidence`. Hash the decoded bytes exactly as
+returned, not a re-serialized form.
+
 The guest also extends a `MrConfig` V2 **config commitment** into **PCR8**
 (`PCR8 = sha384(0^48 || config_id)`). This is **optional** and exists only to
 let a lightweight third-party verifier confirm `composeHash` + key-provider
@@ -218,9 +230,9 @@ key_provider_id })` and compare it to PCR8. dstack's own verifier and KMS do
 **not** check PCR8 — they rely on PCR14 replay — so it is not part of the
 required policy above.
 
-The `attestationMode` field is carried in the verified boot info for
+The `teeVariant` field is carried in the verified boot info for
 observability; a relying party may additionally assert
-`attestationMode == "dstack-aws-nitro-tpm"` against the verifier output, but the
+`teeVariant == "dstack-aws-nitro-tpm"` against the verifier output, but the
 authorization contract itself keys on the standard fields above.
 
 Same-account AWS KMS is not a trusted secret authority in this threat model if
@@ -253,7 +265,7 @@ Require the generated `endpoint-cert.pem.ratls-verification.json` to contain:
 ```bash
 jq -e '
   .is_valid == true and
-  .details.attestation_mode == "dstack-aws-nitro-tpm" and
+  .details.tee_variant == "dstack-aws-nitro-tpm" and
   .details.app_info.os_image_hash_verified == true
 ' endpoint-cert.pem.ratls-verification.json
 ```
@@ -272,7 +284,7 @@ An AWS EC2 NitroTPM deployment can be promoted only when:
 
 1. a reproducible rebuild from the clean, pinned release sources yields a
    byte-identical `sha256sum.txt` (and therefore the same `os_image_hash`);
-2. Yocto input content is mirrored or otherwise available by content hash;
+2. build input content is mirrored or otherwise available by content hash;
 3. independently recomputed AWS PCRs and the UKI AuthentiCode hash match the
    published build-output `aws-pcrs.json` side-car (when provided) and the
    `boot_pcr_digest` in `measurement.aws.cbor`;

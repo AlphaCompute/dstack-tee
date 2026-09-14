@@ -2,7 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{bail, Context, Result};
 use dstack_kms_rpc::{
@@ -19,13 +22,16 @@ use ra_rpc::{
 };
 use ra_tls::{
     attestation::{
-        GetDeviceId, PlatformEvidence, QuoteContentType, VerifiedAttestation, VersionedAttestation,
+        AttestationVerifier, GetDeviceId, PlatformEvidence, QuoteContentType, VerifiedAttestation,
+        VersionedAttestation,
     },
     cert::{CaCert, CertRequest},
     rcgen::{Certificate, KeyPair, PKCS_ECDSA_P256_SHA256},
 };
-use safe_write::safe_write;
+use safe_write::{safe_write, safe_write_with_mode};
 use sha2::Digest;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::info;
 
 use crate::{
     config::KmsConfig,
@@ -40,11 +46,31 @@ use crate::{
 #[derive(Clone)]
 pub struct OnboardState {
     config: KmsConfig,
+    attestation_verifier: Arc<AttestationVerifier>,
+    bootstrap_lock: Arc<AsyncMutex<()>>,
+    shutdown: Arc<OnceLock<rocket::Shutdown>>,
 }
 
 impl OnboardState {
-    pub fn new(config: KmsConfig) -> Self {
-        Self { config }
+    pub fn new(config: KmsConfig) -> Result<Self> {
+        let attestation_verifier = Arc::new(
+            AttestationVerifier::load(&config.attestation)
+                .context("failed to load attestation verifier")?,
+        );
+        Ok(Self {
+            config,
+            attestation_verifier,
+            bootstrap_lock: Arc::new(AsyncMutex::new(())),
+            shutdown: Arc::new(OnceLock::new()),
+        })
+    }
+
+    /// Hand the Rocket shutdown handle to the service so `finish` can stop the
+    /// server after its response has been sent.
+    pub fn set_shutdown(&self, shutdown: rocket::Shutdown) -> Result<()> {
+        self.shutdown
+            .set(shutdown)
+            .map_err(|_| anyhow::anyhow!("onboard shutdown handle is already set"))
     }
 }
 
@@ -62,12 +88,37 @@ impl RpcCall<OnboardState> for OnboardHandler {
     }
 }
 
+fn validate_onboarding_domain(domain: &str) -> Result<()> {
+    if domain.is_empty() || domain.len() > 253 || !domain.is_ascii() {
+        bail!("domain must be a non-empty ASCII DNS name of at most 253 bytes");
+    }
+    for label in domain.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            bail!("domain contains an invalid DNS label");
+        }
+    }
+    Ok(())
+}
+
 impl OnboardRpc for OnboardHandler {
     async fn bootstrap(self, request: BootstrapRequest) -> Result<BootstrapResponse> {
-        ensure_self_kms_allowed(&self.state.config)
+        validate_onboarding_domain(&request.domain)?;
+        let _bootstrap_guard = self.state.bootstrap_lock.lock().await;
+        let cfg = &self.state.config;
+        if cfg.bootstrap_info().exists() || cfg.root_ca_key().exists() || cfg.k256_key().exists() {
+            bail!("KMS has already been bootstrapped");
+        }
+        ensure_self_kms_allowed(cfg, &self.state.attestation_verifier)
             .await
             .context("KMS is not allowed to bootstrap")?;
-        let keys = Keys::generate(&request.domain)
+        let keys = Keys::generate(&request.domain, self.state.config.attest_rpc_cert)
             .await
             .context("Failed to generate keys")?;
 
@@ -75,7 +126,6 @@ impl OnboardRpc for OnboardHandler {
         let ca_pubkey = keys.ca_key.public_key_der();
         let attestation = attest_keys(&ca_pubkey, &k256_pubkey).await?;
 
-        let cfg = &self.state.config;
         let response = BootstrapResponse {
             ca_pubkey,
             k256_pubkey,
@@ -88,6 +138,12 @@ impl OnboardRpc for OnboardHandler {
     }
 
     async fn onboard(self, request: OnboardRequest) -> Result<OnboardResponse> {
+        validate_onboarding_domain(&request.domain)?;
+        let _bootstrap_guard = self.state.bootstrap_lock.lock().await;
+        let cfg = &self.state.config;
+        if cfg.root_ca_key().exists() || cfg.k256_key().exists() {
+            bail!("KMS has already been onboarded");
+        }
         let source_url = request.source_url.trim_end_matches('/').to_string();
         let source_url = if source_url.ends_with("/prpc") {
             source_url
@@ -95,22 +151,19 @@ impl OnboardRpc for OnboardHandler {
             format!("{source_url}/prpc")
         };
         let keys = Keys::onboard(
-            &self.state.config,
+            cfg,
             &source_url,
             &request.domain,
-            self.state.config.pccs_url.clone(),
+            self.state.attestation_verifier.clone(),
         )
         .await
         .context("Failed to onboard")?;
         let k256_pubkey = keys.k256_key.verifying_key().to_sec1_bytes().to_vec();
-        keys.store(&self.state.config)
-            .context("Failed to store keys")?;
+        keys.store(cfg).context("Failed to store keys")?;
         Ok(OnboardResponse { k256_pubkey })
     }
 
     async fn get_attestation_info(self) -> Result<AttestationInfoResponse> {
-        let pccs_url = self.state.config.pccs_url.clone();
-
         // Get attestation from guest agent
         let report_data = pad64([0u8; 32]);
         let response = app_attest(report_data)
@@ -120,7 +173,7 @@ impl OnboardRpc for OnboardHandler {
         // Decode and verify the attestation to get real device ID
         let attestation = VersionedAttestation::from_bytes(&response.attestation)
             .context("Failed to decode attestation")?;
-        let attestation_mode = match &attestation.clone().into_v1().platform {
+        let tee_variant = match &attestation.clone().into_v1().platform {
             PlatformEvidence::Tdx { .. } => "dstack-tdx",
             PlatformEvidence::SevSnp { .. } => "dstack-amd-sev-snp",
             PlatformEvidence::GcpTdx { .. } => "dstack-gcp-tdx",
@@ -130,7 +183,7 @@ impl OnboardRpc for OnboardHandler {
         .to_string();
         let verified = attestation
             .into_v1()
-            .verify(pccs_url.as_deref())
+            .verify(&self.state.attestation_verifier)
             .await
             .context("Failed to verify attestation")?;
 
@@ -154,7 +207,7 @@ impl OnboardRpc for OnboardHandler {
 
         build_attestation_info_response(
             &verified,
-            attestation_mode,
+            tee_variant,
             &info.vm_config,
             self.state.config.site_name.clone(),
             eth_rpc_url,
@@ -163,13 +216,21 @@ impl OnboardRpc for OnboardHandler {
     }
 
     async fn finish(self) -> anyhow::Result<()> {
-        std::process::exit(0);
+        let shutdown = self
+            .state
+            .shutdown
+            .get()
+            .context("onboard shutdown handle is unavailable")?;
+        // Graceful shutdown lets Rocket finish sending this response before the
+        // server stops, so the client learns that onboarding succeeded.
+        shutdown.clone().notify();
+        Ok(())
     }
 }
 
 fn build_attestation_info_response(
     verified: &VerifiedAttestation,
-    attestation_mode: String,
+    tee_variant: String,
     vm_config: &str,
     site_name: String,
     eth_rpc_url: String,
@@ -182,7 +243,7 @@ fn build_attestation_info_response(
         device_id: sha2::Sha256::digest(&raw_device_id).to_vec(),
         mr_aggregated: boot_info.mr_aggregated,
         os_image_hash: boot_info.os_image_hash,
-        attestation_mode,
+        tee_variant,
         site_name,
         eth_rpc_url,
         kms_contract_address,
@@ -243,6 +304,7 @@ mod tests {
         dstack_types::mr_config::MrConfigV3::new(
             vec![0x11; 20],
             vec![0x22; 32],
+            None,
             dstack_types::KeyProviderKind::None,
             Vec::new(),
             vec![0x99; 20],
@@ -328,10 +390,54 @@ mod tests {
         assert_eq!(response.ppid, vec![0xab; 64]);
         assert_eq!(response.mr_aggregated.len(), 32);
         assert_eq!(response.os_image_hash, os_image_hash.to_vec());
-        assert_eq!(response.attestation_mode, "dstack-amd-sev-snp");
+        assert_eq!(response.tee_variant, "dstack-amd-sev-snp");
         assert_eq!(response.site_name, "test-site");
         assert_eq!(response.eth_rpc_url, "https://rpc.example");
         assert_eq!(response.kms_contract_address, "0x1234");
+    }
+
+    #[test]
+    fn onboarding_domain_accepts_dns_name() {
+        validate_onboarding_domain("kms.example.com").unwrap();
+    }
+
+    #[test]
+    fn onboarding_domain_rejects_empty_overlong_and_invalid_labels() {
+        let overlong = "a".repeat(254);
+        for domain in [
+            "",
+            overlong.as_str(),
+            "-kms.example.com",
+            "kms-.example.com",
+            "kms..example.com",
+            "kms_example.com",
+        ] {
+            assert!(validate_onboarding_domain(domain).is_err(), "{domain:?}");
+        }
+    }
+
+    fn ca_cert_expiring_at(not_after: SystemTime) -> Vec<u8> {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        CertRequest::builder()
+            .subject("Test CA")
+            .ca_level(0)
+            .not_after(not_after)
+            .key(&key)
+            .build()
+            .self_signed()
+            .unwrap()
+            .pem()
+            .into_bytes()
+    }
+
+    #[test]
+    fn ca_certificate_is_renewed_only_within_the_renewal_window() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let inside_window = ca_cert_expiring_at(now + CA_RENEWAL_WINDOW - Duration::from_secs(1));
+        let outside_window = ca_cert_expiring_at(now + CA_RENEWAL_WINDOW + Duration::from_secs(1));
+
+        assert!(ca_cert_expires_within(&inside_window, now, CA_RENEWAL_WINDOW).unwrap());
+        assert!(!ca_cert_expires_within(&outside_window, now, CA_RENEWAL_WINDOW).unwrap());
     }
 }
 
@@ -347,12 +453,20 @@ struct Keys {
 }
 
 impl Keys {
-    async fn generate(domain: &str) -> Result<Self> {
+    async fn generate(domain: &str, attest_rpc_cert: bool) -> Result<Self> {
         let tmp_ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let rpc_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let k256_key = SigningKey::random(&mut rand::rngs::OsRng);
-        Self::from_keys(tmp_ca_key, ca_key, rpc_key, k256_key, domain).await
+        Self::from_keys(
+            tmp_ca_key,
+            ca_key,
+            rpc_key,
+            k256_key,
+            domain,
+            attest_rpc_cert,
+        )
+        .await
     }
 
     async fn from_keys(
@@ -361,6 +475,7 @@ impl Keys {
         rpc_key: KeyPair,
         k256_key: SigningKey,
         domain: &str,
+        attest_rpc_cert: bool,
     ) -> Result<Self> {
         let tmp_ca_cert = CertRequest::builder()
             .org_name("Dstack")
@@ -378,20 +493,32 @@ impl Keys {
             .key(&ca_key)
             .build()
             .self_signed()?;
-        let pubkey = rpc_key.public_key_der();
-        let report_data = QuoteContentType::RaTlsCert.to_report_data(&pubkey);
-        let response = app_attest(report_data.to_vec())
-            .await
-            .context("Failed to get quote")?;
-        let attestation = VersionedAttestation::from_bytes(&response.attestation)
-            .context("Invalid attestation")?;
+        // The only place the KMS embeds its own attestation. Skipping it lets
+        // the KMS run outside a TEE for development; it does not affect the
+        // verification of quotes presented *to* the KMS, which is a separate
+        // path (main_service::ensure_app_attestation_allowed) and stays on.
+        let attestation = if attest_rpc_cert {
+            let pubkey = rpc_key.public_key_der();
+            let report_data = QuoteContentType::RaTlsCert.to_report_data(&pubkey);
+            let response = app_attest(report_data.to_vec()).await.context(
+                "failed to get a quote for the KMS RPC certificate. The KMS attests \
+                     itself through the dstack guest agent, so it must run inside a dstack \
+                     CVM. For local development set attest_rpc_cert = false",
+            )?;
+            Some(
+                VersionedAttestation::from_bytes(&response.attestation)
+                    .context("Invalid attestation")?,
+            )
+        } else {
+            None
+        };
 
         // Sign WWW server cert with KMS cert
         let rpc_cert = CertRequest::builder()
             .subject(domain)
             .alt_names(&[domain.to_string()])
             .special_usage("kms:rpc")
-            .maybe_attestation(Some(&attestation))
+            .maybe_attestation(attestation.as_ref())
             .key(&rpc_key)
             .build()
             .signed_by(&ca_cert, &ca_key)?;
@@ -411,7 +538,7 @@ impl Keys {
         cfg: &KmsConfig,
         other_kms_url: &str,
         domain: &str,
-        pccs_url: Option<String>,
+        attestation_verifier: Arc<AttestationVerifier>,
     ) -> Result<Self> {
         let attestation_slot = Arc::new(Mutex::new(None::<VerifiedAttestation>));
         let attestation_slot_out = attestation_slot.clone();
@@ -431,22 +558,27 @@ impl Keys {
                 *slot = Some(attestation);
                 Ok(())
             }))
-            .maybe_pccs_url(pccs_url.clone())
+            .attestation_verifier(attestation_verifier.clone())
             .build()
             .into_client()?;
         let mut kms_client = KmsClient::new(client);
 
         let tmp_ca = kms_client.get_temp_ca_cert().await?;
         let (ra_cert, ra_key) = gen_ra_cert(tmp_ca.temp_ca_cert, tmp_ca.temp_ca_key).await?;
-        let ra_client = RaClient::new_mtls(other_kms_url.into(), ra_cert, ra_key, pccs_url)
-            .context("Failed to create client")?;
+        let ra_client = RaClient::new_mtls(
+            other_kms_url.into(),
+            ra_cert,
+            ra_key,
+            attestation_verifier.clone(),
+        )
+        .context("Failed to create client")?;
         kms_client = KmsClient::new(ra_client);
         let source_attestation = attestation_slot
             .lock()
             .map_err(|_| anyhow::anyhow!("source attestation mutex poisoned"))?
             .clone()
             .context("Missing source KMS attestation")?;
-        ensure_kms_allowed(cfg, &source_attestation)
+        ensure_kms_allowed(cfg, &source_attestation, &attestation_verifier)
             .await
             .context("Source KMS is not allowed for onboarding")?;
 
@@ -470,7 +602,15 @@ impl Keys {
             KeyPair::from_pem(&tmp_ca_key_pem).context("Failed to parse tmp CA key")?;
         let ecdsa_key =
             SigningKey::from_slice(&root_k256_key).context("Failed to parse ECDSA key")?;
-        Self::from_keys(tmp_ca_key, ca_key, rpc_key, ecdsa_key, domain).await
+        Self::from_keys(
+            tmp_ca_key,
+            ca_key,
+            rpc_key,
+            ecdsa_key,
+            domain,
+            cfg.attest_rpc_cert,
+        )
+        .await
     }
 
     fn store(&self, cfg: &KmsConfig) -> Result<()> {
@@ -481,10 +621,10 @@ impl Keys {
     }
 
     fn store_keys(&self, cfg: &KmsConfig) -> Result<()> {
-        safe_write(cfg.tmp_ca_key(), self.tmp_ca_key.serialize_pem())?;
-        safe_write(cfg.root_ca_key(), self.ca_key.serialize_pem())?;
-        safe_write(cfg.rpc_key(), self.rpc_key.serialize_pem())?;
-        safe_write(cfg.k256_key(), self.k256_key.to_bytes())?;
+        safe_write_with_mode(cfg.tmp_ca_key(), self.tmp_ca_key.serialize_pem(), 0o600)?;
+        safe_write_with_mode(cfg.root_ca_key(), self.ca_key.serialize_pem(), 0o600)?;
+        safe_write_with_mode(cfg.rpc_key(), self.rpc_key.serialize_pem(), 0o600)?;
+        safe_write_with_mode(cfg.k256_key(), self.k256_key.to_bytes(), 0o600)?;
         Ok(())
     }
 
@@ -514,21 +654,73 @@ pub(crate) async fn update_certs(cfg: &KmsConfig) -> Result<()> {
     let domain = domain.trim();
 
     // Regenerate certificates using existing keys
-    let keys = Keys::from_keys(tmp_ca_key, ca_key, rpc_key, k256_key, domain)
-        .await
-        .context("Failed to regenerate certificates")?;
+    let keys = Keys::from_keys(
+        tmp_ca_key,
+        ca_key,
+        rpc_key,
+        k256_key,
+        domain,
+        cfg.attest_rpc_cert,
+    )
+    .await
+    .context("Failed to regenerate certificates")?;
 
-    // Write the new certificates to files
-    keys.store_certs(cfg)?;
+    renew_ca_cert_if_expiring(
+        cfg.root_ca_cert(),
+        keys.ca_cert.pem(),
+        "KMS root CA certificate",
+    )?;
+    renew_ca_cert_if_expiring(
+        cfg.tmp_ca_cert(),
+        keys.tmp_ca_cert.pem(),
+        "temporary client CA certificate",
+    )?;
+
+    // The RPC leaf depends on the refreshed domain and platform attestation, so
+    // it is reissued on every startup.
+    safe_write(cfg.rpc_cert(), keys.rpc_cert.pem())?;
+    info!("Reissued the KMS RPC certificate for {domain}");
 
     Ok(())
 }
 
-pub(crate) async fn bootstrap_keys(cfg: &KmsConfig) -> Result<()> {
-    ensure_self_kms_allowed(cfg)
+const CA_RENEWAL_WINDOW: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+fn renew_ca_cert_if_expiring(
+    path: impl AsRef<std::path::Path>,
+    renewed_pem: String,
+    description: &str,
+) -> Result<()> {
+    let path = path.as_ref();
+    let current_pem = fs::read(path)
+        .with_context(|| format!("Failed to read {description} from {}", path.display()))?;
+    if !ca_cert_expires_within(&current_pem, SystemTime::now(), CA_RENEWAL_WINDOW)? {
+        return Ok(());
+    }
+    safe_write(path, renewed_pem)?;
+    info!("Renewed {description}");
+    Ok(())
+}
+
+fn ca_cert_expires_within(cert_pem: &[u8], now: SystemTime, window: Duration) -> Result<bool> {
+    let (_, pem) =
+        x509_parser::pem::parse_x509_pem(cert_pem).context("Failed to parse CA certificate PEM")?;
+    let cert = pem.parse_x509().context("Failed to parse CA certificate")?;
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .context("System time is before the Unix epoch")?
+        .as_secs();
+    let renewal_deadline = now.saturating_add(window.as_secs());
+    let not_after = u64::try_from(cert.validity().not_after.timestamp()).unwrap_or(0);
+    Ok(not_after <= renewal_deadline)
+}
+
+pub(crate) async fn bootstrap_keys(cfg: &KmsConfig, verifier: &AttestationVerifier) -> Result<()> {
+    validate_onboarding_domain(&cfg.onboard.auto_bootstrap_domain)?;
+    ensure_self_kms_allowed(cfg, verifier)
         .await
         .context("KMS is not allowed to auto-bootstrap")?;
-    let keys = Keys::generate(&cfg.onboard.auto_bootstrap_domain)
+    let keys = Keys::generate(&cfg.onboard.auto_bootstrap_domain, cfg.attest_rpc_cert)
         .await
         .context("Failed to generate keys")?;
     keys.store(cfg)?;

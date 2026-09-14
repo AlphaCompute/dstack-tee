@@ -9,22 +9,25 @@ pub use dstack_attest::attestation::*;
 use crate::{oids, traits::CertExt};
 use anyhow::{bail, Context, Result};
 
-/// Verified RA-TLS certificate evidence.
+/// Attestation evidence verified and bound to an RA-TLS certificate key.
 ///
-/// This is the certificate-level endpoint identity proof: the embedded dstack
-/// attestation has been cryptographically verified and its `report_data` is
-/// bound to the certificate SubjectPublicKeyInfo.
-pub struct VerifiedRaTlsCert {
-    /// DER-encoded SubjectPublicKeyInfo from the verified certificate.
+/// This type proves only the embedded attestation and its binding to the
+/// certificate SubjectPublicKeyInfo. It does not authenticate the certificate
+/// issuer or any other certificate extension. Application identity asserted by
+/// a KMS-issued certificate is an issuer claim and must be consumed only after
+/// normal certificate-chain verification.
+pub struct VerifiedRaTlsAttestation {
+    /// DER-encoded SubjectPublicKeyInfo bound to the attestation.
     pub public_key_der: Vec<u8>,
     /// Verified dstack attestation embedded in the certificate.
     pub attestation: VerifiedAttestation,
-    /// Optional app id certificate extension.
-    pub app_id: Option<Vec<u8>>,
-    /// Optional app info certificate extension.
-    pub app_info: Option<AppInfo>,
-    /// Optional dstack certificate usage extension.
-    pub special_usage: Option<String>,
+}
+
+impl VerifiedRaTlsAttestation {
+    /// Decode application identity from the verified attestation evidence.
+    pub fn decode_app_info(&self, allow_dummy: bool) -> Result<AppInfo> {
+        self.attestation.decode_app_info(allow_dummy)
+    }
 }
 
 /// Extract attestation from x509 certificate
@@ -41,43 +44,47 @@ pub fn from_der(cert: &[u8]) -> Result<Option<VersionedAttestation>> {
 /// DER SubjectPublicKeyInfo. That binding prevents an operator-controlled
 /// network endpoint from reusing valid attestation evidence with a different
 /// TLS key.
-pub async fn verify_der(cert: &[u8], pccs_url: Option<&str>) -> Result<VerifiedRaTlsCert> {
+///
+/// This function does not verify a certificate chain and deliberately does not
+/// return non-attestation certificate extensions. KMS-issued certificates may
+/// omit attestation entirely; authenticate their issuer claims through the
+/// certificate chain instead.
+pub async fn verify_der(
+    cert: &[u8],
+    verifier: &AttestationVerifier,
+) -> Result<VerifiedRaTlsAttestation> {
     let (_, cert) =
         x509_parser::parse_x509_certificate(cert).context("failed to parse certificate")?;
-    verify_cert(&cert, pccs_url).await
+    verify_cert(&cert, verifier).await
 }
 
 /// Verify the RA-TLS attestation embedded in a PEM-encoded X.509 certificate.
-pub async fn verify_pem(cert: &[u8], pccs_url: Option<&str>) -> Result<VerifiedRaTlsCert> {
+pub async fn verify_pem(
+    cert: &[u8],
+    verifier: &AttestationVerifier,
+) -> Result<VerifiedRaTlsAttestation> {
     let (_, pem) = x509_parser::pem::parse_x509_pem(cert).context("failed to parse PEM")?;
-    verify_der(&pem.contents, pccs_url).await
+    verify_der(&pem.contents, verifier).await
 }
 
 /// Verify the RA-TLS attestation embedded in a parsed X.509 certificate.
 async fn verify_cert(
     cert: &x509_parser::prelude::X509Certificate<'_>,
-    pccs_url: Option<&str>,
-) -> Result<VerifiedRaTlsCert> {
+    verifier: &AttestationVerifier,
+) -> Result<VerifiedRaTlsAttestation> {
     let attestation = from_cert(cert)?.context("RA-TLS attestation extension missing")?;
     let public_key_der = cert.tbs_certificate.public_key().raw.to_vec();
     if public_key_der.is_empty() {
         bail!("certificate SubjectPublicKeyInfo is empty");
     }
-    let app_id = cert.get_app_id()?;
-    let app_info = cert.get_app_info()?;
-    let special_usage = cert.get_special_usage()?;
     let attestation = attestation
         .into_v1()
-        .verify_with_ra_pubkey(&public_key_der, pccs_url)
+        .verify_with_ra_pubkey(&public_key_der, verifier)
         .await
         .context("RA-TLS attestation verification failed")?;
-
-    Ok(VerifiedRaTlsCert {
+    Ok(VerifiedRaTlsAttestation {
         public_key_der,
         attestation,
-        app_id,
-        app_info,
-        special_usage,
     })
 }
 
@@ -139,7 +146,8 @@ mod tests {
             .self_signed()
             .unwrap();
 
-        let result = verify_der(cert.der().as_ref(), None).await;
+        let verifier = AttestationVerifier::new_prod(None).unwrap();
+        let result = verify_der(cert.der().as_ref(), &verifier).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("attestation extension missing"));
@@ -158,7 +166,8 @@ mod tests {
             .self_signed()
             .unwrap();
 
-        let result = verify_der(cert.der().as_ref(), None).await;
+        let verifier = AttestationVerifier::new_prod(None).unwrap();
+        let result = verify_der(cert.der().as_ref(), &verifier).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(format!("{err:#}").contains("report data mismatch"));

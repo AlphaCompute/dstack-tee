@@ -1,6 +1,6 @@
 {
   "name": "@phala/dstack-sdk",
-  "version": "0.5.8",
+  "version": "0.6.0",
   "description": "dstack SDK",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -80,9 +80,11 @@
   },
   "author": "Leechael Yim",
   "license": "Apache-2.0",
-  "devDependencies": {
+  "dependencies": {
     "@noble/curves": "^1.8.1",
-    "@noble/hashes": "^1.6.1",
+    "@noble/hashes": "^1.6.1"
+  },
+  "devDependencies": {
     "@solana/web3.js": "^1.98.4",
     "@types/node": "latest",
     "tsup": "^8.5.1",
@@ -91,15 +93,10 @@
     "vitest": "^3.2.4"
   },
   "peerDependencies": {
-    "@noble/curves": "^1.8.1",
-    "@noble/hashes": "^1.6.1",
     "@solana/web3.js": "^1.98.4",
     "viem": "^2.43.3"
   },
   "peerDependenciesMeta": {
-    "@noble/curves": {
-      "optional": true
-    },
     "@solana/web3.js": {
       "optional": true
     },

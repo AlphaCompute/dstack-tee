@@ -2,10 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::app::{make_sys_config, Image, VmConfig, VmWorkDir};
+use crate::app::{
+    make_sys_config, needs_netd_interface, resolved_networks, settle_vhost,
+    simulator_config_for_manifest, sync_tee_simulator_config, Image, VmConfig, VmWorkDir,
+};
 use crate::config::Config;
 use crate::main_service;
 use anyhow::{Context, Result};
+use fs_err as fs;
 
 pub async fn run_one_shot(
     vm_config_path: &str,
@@ -238,21 +242,9 @@ Compose file content (first 200 chars):
     let app_compose = vm_work_dir
         .app_compose()
         .context("Failed to get app compose")?;
-    let platform = config.cvm.resolved_platform();
-    let use_mr_config_v3 = !manifest.no_tee
-        && (platform == crate::config::TeePlatform::AmdSevSnp
-            || (platform == crate::config::TeePlatform::Tdx
-                && config.cvm.use_mrconfigid
-                && !app_compose.key_provider_id.is_empty()));
-    let mr_config = if use_mr_config_v3 {
-        Some(
-            vm_work_dir
-                .prepare_mr_config_v3(&app_compose)
-                .context("Failed to prepare mr_config")?,
-        )
-    } else {
-        None
-    };
+    let mr_config = vm_work_dir
+        .prepare_mr_config(&manifest, &config.cvm, &app_compose)
+        .context("Failed to prepare mr_config")?;
     let sys_config_str = make_sys_config(
         &config,
         &manifest,
@@ -261,7 +253,13 @@ Compose file content (first 200 chars):
         app_compose.requirements.as_ref(),
     )?;
     let sys_config_path = vm_work_dir.shared_dir().join(".sys-config.json");
-    fs_err::write(&sys_config_path, sys_config_str).context("Failed to write sys config")?;
+    fs_err::write(&sys_config_path, &sys_config_str).context("Failed to write sys config")?;
+    let simulator_config = simulator_config_for_manifest(&config.cvm, &manifest)?;
+    sync_tee_simulator_config(
+        &vm_work_dir.shared_dir(),
+        simulator_config.as_ref(),
+        &sys_config_str,
+    )?;
 
     // Create vm-state.json with initial state
     vm_work_dir
@@ -281,8 +279,24 @@ Compose file content (first 200 chars):
         gateway_enabled: app_compose.gateway_enabled(),
     };
 
+    let mut runtime_networks = resolved_networks(&manifest, &config.cvm);
+    // Settle the data plane before anything reads it, so `vhost_enabled()` is a
+    // decision rather than a request and the launch does not warn about a
+    // `/dev/vhost-net` the netdev it then builds never opens.
+    settle_vhost(&mut runtime_networks);
+    // Bridge and macvtap host interfaces belong to netd, whose lifecycle
+    // one-shot does not manage. Refusing is the honest answer: the alternative
+    // was to quietly build a different interface here than the server would,
+    // and then report the VM as if it had the one it asked for.
+    if !dry_run && runtime_networks.iter().any(needs_netd_interface) {
+        anyhow::bail!(
+            "one-shot execution does not manage netd interface lifecycle, which bridge and \
+             macvtap networking need; run the VMM server directly or use --dry-run"
+        );
+    }
+
     let process_configs = vm_builder_config
-        .config_qemu(&workdir_path, &config.cvm, &gpus)
+        .config_qemu(&workdir_path, &config.cvm, &gpus, &runtime_networks)
         .context("Failed to build QEMU configuration")?;
 
     // Get the main QEMU process config (first in the list)
@@ -312,8 +326,8 @@ Compose file content (first 200 chars):
     } else {
         println!("# Executing QEMU...");
 
-        // Change working directory to match supervisor process behavior
-        std::env::set_current_dir(&workdir_path).context("Failed to change working directory")?;
+        crate::gpu_reset::sanitize_on_attach(&config.cvm.gpu, &gpus)
+            .context("Failed to sanitize GPUs before QEMU launch")?;
 
         let mut cmd = std::process::Command::new(&process_config.command);
         cmd.args(&process_config.args);
@@ -325,14 +339,14 @@ Compose file content (first 200 chars):
 
         // Configure stdio to match supervisor behavior
         if !process_config.stdout.is_empty() {
-            let stdout_file = std::fs::File::create(&process_config.stdout)
-                .context("Failed to create stdout file")?;
-            cmd.stdout(stdout_file);
+            let stdout_file =
+                fs::File::create(&process_config.stdout).context("Failed to create stdout file")?;
+            cmd.stdout(stdout_file.into_file());
         }
         if !process_config.stderr.is_empty() {
-            let stderr_file = std::fs::File::create(&process_config.stderr)
-                .context("Failed to create stderr file")?;
-            cmd.stderr(stderr_file);
+            let stderr_file =
+                fs::File::create(&process_config.stderr).context("Failed to create stderr file")?;
+            cmd.stderr(stderr_file.into_file());
         }
 
         cmd.current_dir(&workdir_path);
@@ -365,7 +379,7 @@ Compose file content (first 200 chars):
             }
 
             eprintln!("# Try running with --dry-run to check the generated command");
-            std::process::exit(status.code().unwrap_or(1));
+            anyhow::bail!("QEMU exited with status: {status}");
         }
     }
 

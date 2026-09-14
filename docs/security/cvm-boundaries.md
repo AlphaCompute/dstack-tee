@@ -35,17 +35,20 @@ This is the main configuration file for the application in JSON format:
 | local_key_provider_enabled | 0.3.1 | boolean | Use a local key provider |
 | key_provider_id | 0.5.1 | string | Optional pin for the key provider identity (hex-encoded bytes). For `kms` this is the KMS CA public key; for `local` the sealing-provider MR. For `tpm` and `none` it must be an empty string — the TPM app-root public key is instance-specific and is not used as a provider id or measured as one. |
 | public_logs | 0.3.3 | boolean | Whether logs are publicly visible |
-| public_sysinfo | 0.3.3 | boolean | Whether system info is public |
+| public_sysinfo | 0.3.3 | boolean | Whether system info is public. Covers the guest dashboard and `/metrics`, including the `dstack_gpu_*` series (since 0.6.0), which expose each GPU's UUID and PCI bus address alongside utilization, memory, temperature and power. |
 | public_tcbinfo | 0.5.1 | boolean | Whether TCB info is public |
 | allowed_envs | 0.4.2 | array of string | List of allowed environment variable names |
 | no_instance_id | 0.4.2 | boolean | Disable instance ID generation |
 | secure_time | 0.5.0 | boolean | Whether secure time is enabled |
-| pre_launch_script | 0.4.0 | string | Prelaunch bash script that runs before execute `docker compose up` |
-| init_script | 0.5.5 | string | Bash script that executed prior to dockerd startup |
-| storage_fs | 0.5.5 | string | Filesystem type for the data disk of the CVM. Supported values: "zfs", "ext4". default to "zfs". **ZFS:** Ensures filesystem integrity with built-in data protection features. **ext4:** Provides better performance for database applications with lower overhead and faster I/O operations, but no strong integrity protection. |
+| pre_launch_script | 0.4.0 | string | Prelaunch bash script that runs before `docker compose up`. It runs *after* dockerd, so containers restored by a Docker restart policy can already be running when it executes. Do not build security gates on it — see [security-best-practices.md](./security-best-practices.md#security-semantics-must-not-depend-on-pre_launch_script-running-first). |
+| init_script | 0.5.5 (string), 0.6.0 (string[]) | string or string[] | Up to 5 Bash scripts executed in order prior to dockerd startup, so they always complete before any container starts, on every boot; a string is treated as a one-element array. Multiple scripts require string `manifest_version: "3"` so older guests fail closed. MrConfigV3 binds the hashes only for manifest v3. |
+| storage_fs | 0.5.5 | string | Filesystem type for the data disk of the CVM. Supported values: "zfs", "ext4". default to "zfs". **ZFS:** Checksums every block, so a modified block fails the read. **ext4:** Lower overhead and faster I/O for database workloads; checksums metadata but not file data, so a modified block is not detected. |
+| storage_discard | 0.6.0 | boolean | Return unused data-disk blocks to the host. Defaults to `true` so encrypted sparse images track live data instead of historical writes. Set to `false` if revealing filesystem allocation and deletion patterns to the host is unacceptable. |
 | swap_size | 0.5.5 | string/integer | The linux swap size. default to 0. Can be in byte or human-readable format (e.g., "1G", "256M"). |
-| key_provider | 0.5.6 | string | Key provider type. Supported values: "none", "kms", "local", "tpm". `"tpm"` is only supported on platforms whose TPM is part of the platform trust model (GCP vTPM, AWS EC2 NitroTPM); on other platforms guest setup fails closed, since sealing to a host-provided software TPM (e.g. swtpm under bare QEMU) offers no protection against the host. |
+| key_provider | 0.5.6 | string | Key provider type. Supported values: "none", "kms", "local", "tpm". GCP vTPM and AWS EC2 NitroTPM are part of their platform trust models. The Dstack platform can use VMM-managed swtpm for seal/unseal and restart persistence, but it offers no protection against the host and is intentionally not accepted by remote verifiers. |
 
+The five-script limit bounds runtime-event-log and MrConfigV3 growth while
+allowing several independently approved infrastructure initialization stages.
 
 The hash of this file content is extended as the dstack `compose-hash` launch event. On TDX-family platforms the launch event is measured into RTMR3. On AWS NitroTPM it is measured into non-resettable SHA384 PCR14 before the `system-ready` launch boundary. Remote verifiers extract and replay this event during attestation.
 
@@ -74,6 +77,7 @@ This file contains system configuration in JSON format:
 | kms_urls | array of string | List of KMS service URLs |
 | gateway_urls | array of string | List of gateway service URLs |
 | pccs_url | string | URL of the PCCS service (used when dstack components need to verify a remote TD CVM or SGX enclave) |
+| nvidia_attestation_proxy_url | string | Optional persistent OCSP and RIM cache used by NVIDIA local GPU attestation |
 | docker_registry | string | URL of the docker registry |
 | host_api_url | string | VSOCK URL of host API |
 | vm_config | string | JSON string of VM configuration (os_image_hash, cpu_count, memory_size) |
@@ -85,6 +89,7 @@ The hash of this file is not extended to any RTMR because each field has its own
 | kms_urls | URLs themselves aren't security-critical. The trust anchor is the KMS root public key, which is extended as the `key-provider` launch event. On TDX-family platforms this is RTMR3; on AWS NitroTPM this is PCR14. Keys obtained from KMS will either successfully decrypt/encrypt the disk or fail-and-abort. |
 | gateway_urls | URLs aren't security-critical. Trust is established through CA certificates from KMS. App CVM and dstack-gateway CVM verify each other's CA certificates to ensure they're under the same KMS authority. |
 | pccs_url | URL isn't security-critical. Trust is anchored by the root public key pinned in the attestation verification program. |
+| nvidia_attestation_proxy_url | The URL is not a collateral trust anchor. The measured guest verifies NVIDIA signatures and the signed OCSP validity window, and continues to require a fresh GPU evidence nonce. A bad endpoint can withhold collateral and cause a denial of service, but cannot forge a successful attestation or replay an expired `good` response. |
 | docker_registry | Docker daemon verifies image integrity using the pinned image hashes in the docker-compose file. |
 | host_api_url | Used only for reporting or encrypted sealing key transport. An incorrect URL doesn't create security vulnerabilities. |
 | vm_config | Informs the CVM to report virtual hardware info to KMS when requesting keys. KMS uses this info to calculate expected RTMRs and verify image hash. If tampered with, image hash verification would fail and no keys would be distributed. |
@@ -176,17 +181,72 @@ Full specification: [host_api.proto](../../dstack/host-api/proto/host_api.proto)
 
 The dstack-guest-agent runs an HTTP server on port 8090 inside the CVM. This port is publicly accessible, allowing external clients to view basic CVM information.
 
-| Service | Purpose |
-|---------|--------|
-| Worker | Provides public-facing app information |
+Since dstack 0.6.0 the listener serves two API surfaces, selected by URL path
+alone: the frozen v0.5.11 `Worker` service at `/prpc` (equivalently
+`/prpc/v0`), and the versioned `dstack.guest.v1` `Worker` service at
+`/prpc/v1`. The frozen surface is closed and never changes again; new
+capability arrives only on v1. [guest-api-v1.md](../guest-api-v1.md) is the
+normative specification of the v1 surface, including its status-code and
+version-probing rules.
 
-**Available Methods:**
+Neither surface returns key material, and no caller chooses what gets signed
+or attested. That boundary, not the method list, is what makes this listener
+safe to expose: key material and caller-chosen attestation live only on the
+internal Unix socket (`/var/run/dstack.sock`), which is not a CVM boundary —
+it is reachable only by the application itself. An application that re-exports
+that socket has moved the boundary itself, and everything behind it moves with
+it.
+
+**Frozen `Worker` (`/prpc`, alias `/prpc/v0`):**
 
 | Method | Description | Return Type |
 |--------|-------------|------------|
 | Info | Get application information | AppInfo |
 | Version | Get guest agent version | WorkerVersion |
+| GetAttestationForAppKey | Attest the key the agent derives for the app | GetQuoteResponse |
+
+**v1 `Worker` (`/prpc/v1`):**
+
+| Method | Description | Return Type |
+|--------|-------------|------------|
+| Info | Get application identity, plus configuration when `public_tcbinfo` is set | InfoResponse |
+| Version | Get guest agent version | VersionResponse |
+| Health | Report whether the application is serving | HealthResponse |
+
+Everything on this listener is unauthenticated, so each method is bounded in
+what it costs and in what it says:
+
+- `Health` (v1) answers from a cache the agent refreshes on its own timer, so a
+  call costs a lock and a clone however many callers there are. It reveals
+  whether the app opted into health gating, its current verdict, and — when the
+  app declared a `health_status_file` — the path it named and which parsing
+  rule failed. That last part is a narrow oracle for whether a path exists and
+  what shape its first two lines have; the path itself is already public, since
+  it is measured into the compose hash. The file's *contents* are never quoted
+  back. Container names and statuses were already public through the dashboard
+  below.
+- `GetAttestationForAppKey` (frozen) generates a fresh platform attestation per
+  call. With the frozen `Info` below, it is one of the two methods here that
+  let an anonymous caller drive quote generation. It has no v1 counterpart
+  on purpose: a v1 application attests its own key through the internal socket
+  (`/v1/GetKey`, then `/v1/Attest`) and serves the result itself, so the public
+  listener never gained a second attestation-on-demand entry point.
+- The frozen `Info` decodes identity out of a boot attestation per call, which
+  costs a hardware quote under the agent's global quote lock. The v1 `Info`
+  serves the same identity from a cache decoded once at startup, so an
+  anonymous caller cannot drive quote generation through it; if the boot-time
+  decode failed, retries are throttled to one attempt per interval. Of the two
+  quote-generating methods, the frozen `Info` is the one worth rate-limiting
+  first: it is what clients actually poll, and it replays the event log on top
+  of the quote.
+- Both `Info` methods honour the app's `public_tcbinfo` choice, with different
+  reach. The frozen one blanks `tcb_info` and `vm_config` but always serves
+  `key_provider_info`. The v1 one blanks `app_compose`, `vm_config`, and
+  `key_provider_info`, and carries no measurement registers or event log at
+  all — those are attestation data and belong to the internal `Attest`, where
+  a quote vouches for them. Identity and the measurement hashes are always
+  visible on both surfaces.
 
 The service also provides a web dashboard at the root URL (`/`) showing basic CVM information. View the dashboard template [here](../../dstack/guest-agent/templates/dashboard.html).
 
-Full specification: [agent_rpc.proto](../../dstack/guest-agent/rpc/proto/agent_rpc.proto)
+Full specifications: [agent_rpc.proto](../../dstack/guest-agent/rpc/proto/agent_rpc.proto) for the frozen surface, [agent_rpc_v1.proto](../../dstack/guest-agent/rpc/proto/agent_rpc_v1.proto) for v1.

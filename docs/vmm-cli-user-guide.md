@@ -70,26 +70,46 @@ export DSTACK_VMM_URL=unix:/path/to/socket
 
 ### Authentication
 
-If your dstack-vmm server requires authentication, you can provide credentials using:
+When the dstack-vmm server has `[auth] enabled = true`, the token now guards the
+*entire* management surface (listing/creating/stopping VMs, deploys, logs, and
+the web UI) — not just the logs endpoint. Provide credentials in one of two
+forms.
 
-#### Environment Variables (Recommended)
+#### Bearer token (Recommended)
+
+Pass the VMM API token directly; it is sent as `Authorization: Bearer <token>`.
 
 ```bash
-# Set authentication credentials
-export DSTACK_VMM_AUTH_USER=your-username
-export DSTACK_VMM_AUTH_PASSWORD=your-password
-
-# Then use CLI normally
+# your VMM API token. `dstackup install` writes it to
+# <config-dir>/vmm-auth-token (default /etc/dstack/vmm-auth-token) — and the
+# local `dstack` CLI reads it automatically; a manual setup (see the VMM
+# configuration tutorial) stores it at ~/.dstack/secrets/vmm-auth-token.
+export DSTACK_VMM_TOKEN=$(cat /etc/dstack/vmm-auth-token)
 ./vmm-cli.py lsvm
+
+# or as a flag
+./vmm-cli.py --token "$DSTACK_VMM_TOKEN" lsvm
 ```
 
-#### Command Line Arguments
+#### HTTP Basic
+
+The server also accepts HTTP Basic, where the password may be the shared token
+(any username, e.g. `admin`) or an entry in the server's `htpasswd_file`.
 
 ```bash
-./vmm-cli.py --auth-user your-username --auth-password your-password lsvm
+export DSTACK_VMM_AUTH_USER=admin
+export DSTACK_VMM_AUTH_PASSWORD=$(cat /etc/dstack/vmm-auth-token)
+./vmm-cli.py lsvm
+
+# or as flags
+./vmm-cli.py --auth-user admin --auth-password "$DSTACK_VMM_AUTH_PASSWORD" lsvm
 ```
 
-**Note:** Environment variables take precedence over command line arguments for authentication.
+**Note:** A bearer token takes precedence over Basic when both are set. For each
+setting, command-line flags take precedence over environment variables, which
+take precedence over the config file. Setting only one half of a Basic
+credential (e.g. `DSTACK_VMM_AUTH_PASSWORD` without `DSTACK_VMM_AUTH_USER`) is
+rejected with an error rather than silently sending an unauthenticated request.
 
 
 ## Basic Commands
@@ -205,7 +225,7 @@ First, create an application composition file that describes your application:
 
 - `--name`: Friendly name for your application
 - `--docker-compose`: Path to your Docker Compose file
-- `--prelaunch-script`: Optional script to run before starting containers
+- `--prelaunch-script`: Optional script to run before starting containers. It runs after dockerd, so containers restored by a Docker restart policy may already be running; do not put security gates here (see [security best practices](./security/security-best-practices.md#security-semantics-must-not-depend-on-pre_launch_script-running-first))
 - `--kms`: Enable Key Management Service for secrets
 - `--gateway`: Enable dstack-gateway for external access
 - `--local-key-provider`: Use local key provider
@@ -270,6 +290,11 @@ Expose services running in your VM:
 
 # Multiple ports
 --port tcp:8080:80 --port tcp:8443:443
+
+# Pin a mapping to one NIC: protocol[:host_address]:host_port:vm_port@<nic>
+# Without @<nic> the mapping enters through the first user-mode NIC. A VM
+# with no user-mode NIC has no backend that can publish the mapping.
+--port tcp:0.0.0.0:8443:443@0
 ```
 
 #### GPU Assignment
@@ -325,8 +350,7 @@ After successful deployment, verify your VM is running correctly:
 export DSTACK_VMM_URL=http://127.0.0.1:12000
 
 # If authentication is required
-export DSTACK_VMM_AUTH_USER=your-username
-export DSTACK_VMM_AUTH_PASSWORD=your-password
+export DSTACK_VMM_TOKEN=$(cat ~/.dstack/secrets/vmm-auth-token)
 
 # Create a basic docker-compose.yml
 cat > docker-compose.yml << 'EOF'
