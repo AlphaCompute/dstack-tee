@@ -137,39 +137,6 @@ fn runtime_event_version_file(
     }
 }
 
-#[cfg(test)]
-mod runtime_event_version_tests {
-    use super::*;
-
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("dstack-{name}-{}", std::process::id()))
-    }
-
-    #[test]
-    fn rejects_conflicting_runtime_event_version() {
-        let path = temp_path("event-version-conflict");
-        let _ = fs_err::remove_file(&path);
-        set_runtime_event_version_file(&path, EventLogVersion::V1).unwrap();
-        set_runtime_event_version_file(&path, EventLogVersion::V1).unwrap();
-        let err = set_runtime_event_version_file(&path, EventLogVersion::V2).unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("already set to 1"), "{message}");
-        assert!(
-            message.contains("restart the CVM"),
-            "the conflict error must tell the operator how to apply a new version: {message}"
-        );
-        let _ = fs_err::remove_file(path);
-    }
-
-    #[test]
-    fn reports_unconfigured_runtime_event_version() {
-        let path = temp_path("event-version-missing");
-        let _ = fs_err::remove_file(&path);
-        let err = runtime_event_version_file(path).unwrap_err();
-        assert!(err.to_string().contains("complete dstack system setup"));
-    }
-}
-
 /// Emit a dstack measured event using the system-configured digest format.
 ///
 /// The event-log append and platform-register extension are serialized by a
@@ -256,4 +223,37 @@ fn expected_aws_config_pcr(config_id: &[u8; 48]) -> [u8; 48] {
     let mut material = [0u8; 96];
     material[48..].copy_from_slice(config_id);
     Sha384::digest(material).into()
+}
+
+#[cfg(test)]
+mod runtime_event_version_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("dstack-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn rejects_conflicting_runtime_event_version() {
+        let path = temp_path("event-version-conflict");
+        let _ = fs_err::remove_file(&path);
+        set_runtime_event_version_file(&path, EventLogVersion::V1).unwrap();
+        set_runtime_event_version_file(&path, EventLogVersion::V1).unwrap();
+        let err = set_runtime_event_version_file(&path, EventLogVersion::V2).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("already set to 1"), "{message}");
+        assert!(
+            message.contains("restart the CVM"),
+            "the conflict error must tell the operator how to apply a new version: {message}"
+        );
+        let _ = fs_err::remove_file(path);
+    }
+
+    #[test]
+    fn reports_unconfigured_runtime_event_version() {
+        let path = temp_path("event-version-missing");
+        let _ = fs_err::remove_file(&path);
+        let err = runtime_event_version_file(path).unwrap_err();
+        assert!(err.to_string().contains("complete dstack system setup"));
+    }
 }

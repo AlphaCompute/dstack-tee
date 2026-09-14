@@ -3683,7 +3683,7 @@ fn test_decrypt_env_vars_v1_rejects_bad_manifest() {
     let allowed = test_env_allowed(&["FOO"]);
     let entry = test_env_entry(&[("FOO", "bar")]);
 
-    let ciphertext = test_env_manifest(2, &[entry.clone()]);
+    let ciphertext = test_env_manifest(2, std::slice::from_ref(&entry));
     let err = decrypt_env_vars(&TEST_ENV_CRYPT_KEY, &ciphertext, &allowed).unwrap_err();
     assert!(err
         .to_string()
