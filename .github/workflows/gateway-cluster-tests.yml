@@ -14,7 +14,7 @@ name: Gateway cluster tests
 # this replaces could not do.
 on:
   push:
-    branches: [ next, 'release/**' ]
+    branches: [ alpha, next, 'release/**' ]
     paths:
       - 'dstack/gateway/**'
       - 'dstack/cert-client/**'
@@ -24,7 +24,7 @@ on:
       - 'dstack/crates/mock-attestation/**'
       - '.github/workflows/gateway-cluster-tests.yml'
   pull_request:
-    branches: [ next, 'release/**' ]
+    branches: [ alpha, next, 'release/**' ]
     paths:
       - 'dstack/gateway/**'
       - 'dstack/cert-client/**'

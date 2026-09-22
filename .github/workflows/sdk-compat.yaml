@@ -17,14 +17,14 @@ permissions:
 # rest silently uncovered the moment one of them changed behaviour.
 on:
   push:
-    branches: [next, 'release/**']
+    branches: [alpha, next, 'release/**']
     paths:
       - 'sdk/**'
       - 'dstack/**'
       - 'rust-toolchain.toml'
       - '.github/workflows/sdk-compat.yaml'
   pull_request:
-    branches: [next, 'release/**']
+    branches: [alpha, next, 'release/**']
     paths:
       - 'sdk/**'
       - 'dstack/**'

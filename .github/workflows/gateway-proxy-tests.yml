@@ -16,7 +16,7 @@ name: Gateway proxy tests
 # anything else was using TLS.
 on:
   push:
-    branches: [ next, 'release/**' ]
+    branches: [ alpha, next, 'release/**' ]
     paths:
       - 'dstack/gateway/**'
       - 'dstack/vendor/ktls/**'
@@ -28,7 +28,7 @@ on:
       - 'sdk/simulator/**'
       - '.github/workflows/gateway-proxy-tests.yml'
   pull_request:
-    branches: [ next, 'release/**' ]
+    branches: [ alpha, next, 'release/**' ]
     paths:
       - 'dstack/gateway/**'
       - 'dstack/vendor/ktls/**'

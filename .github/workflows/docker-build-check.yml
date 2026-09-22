@@ -11,7 +11,7 @@ name: Docker Build Check
 # does.
 on:
   push:
-    branches: [ next, 'release/**' ]
+    branches: [ alpha, next, 'release/**' ]
     paths:
       - 'dstack/**'
       - 'rust-toolchain.toml'
@@ -20,7 +20,7 @@ on:
       - '.github/workflows/gateway-release.yml'
       - '.github/workflows/verifier-release.yml'
   pull_request:
-    branches: [ next, 'release/**' ]
+    branches: [ alpha, next, 'release/**' ]
     paths:
       - 'dstack/**'
       - 'rust-toolchain.toml'

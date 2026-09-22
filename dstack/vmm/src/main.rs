@@ -65,6 +65,8 @@ enum Command {
     CheckConfig,
     /// One-shot VM execution mode for debugging
     Run(RunArgs),
+    /// Sanitize GPUs with a VFIO PCI hot reset (debugging/ops)
+    SanitizeGpu(SanitizeGpuArgs),
     /// Run the privileged TAP and libvirt nwfilter broker.
     Netd(NetdArgs),
     /// Internal per-VM QEMU/swtpm launcher.
@@ -77,6 +79,47 @@ struct NetdArgs {
     /// Override the Unix socket configured in [netd].
     #[arg(long)]
     socket: Option<String>,
+    /// Inspect a running netd instead of starting one.
+    #[command(subcommand)]
+    command: Option<NetdCommand>,
+}
+
+#[derive(Subcommand)]
+enum NetdCommand {
+    /// List every host interface netd holds.
+    ///
+    /// Answers the question a leak is made of -- whose is this interface --
+    /// which deriving a name from an identity cannot.
+    List {
+        /// Only this VMM instance's interfaces. Defaults to every one netd
+        /// owns, including those it cannot attribute.
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// Delete one interface by name.
+    ///
+    /// For what nothing else can name: an interface built before netd recorded
+    /// ownership, or by another netd, whose VM is gone. `netd list` shows these
+    /// with no instance and no VM, so nothing can derive the sweep that would
+    /// take them; an operator who can tell what they are says so here.
+    RemoveInterface {
+        /// The interface name, as `netd list` prints it.
+        name: String,
+    },
+    /// Delete every interface netd holds for one VM.
+    ///
+    /// For a VM whose VMM will never ask again -- one whose directory was
+    /// deleted by hand, or whose instance is gone. A VMM retries the sweep for
+    /// its own VMs until it lands; this is for when no VMM will ever run it.
+    RemoveVm {
+        /// The `cvm.instance_id` of the VMM that created them. `netd list`
+        /// shows it.
+        #[arg(long)]
+        instance: String,
+        /// The VM's ID.
+        #[arg(long)]
+        vm: String,
+    },
 }
 
 #[derive(ClapArgs)]
@@ -89,6 +132,16 @@ struct RunArgs {
     /// Dry run: only output QEMU command without executing
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(ClapArgs)]
+struct SanitizeGpuArgs {
+    /// PCI slots of the GPUs to reset, e.g. 0000:0f:00.0
+    #[arg(required = true)]
+    slots: Vec<String>,
+    /// Maximum time in milliseconds for the GPUs to become VFIO-ready again
+    #[arg(long, default_value_t = 10_000)]
+    timeout_ms: u64,
 }
 
 #[derive(ClapArgs)]
@@ -176,6 +229,16 @@ async fn auto_restart_task(app: App) {
     }
 }
 
+async fn network_cleanup_task(app: App) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    // A pass can outlast the period while netd is slow; do not burst after it.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        app.reconcile_network_cleanup().await;
+    }
+}
+
 async fn log_rotation_task(app: App) {
     if app.config.cvm.log.max_bytes == 0 {
         info!("Log rotation is disabled");
@@ -188,6 +251,74 @@ async fn log_rotation_task(app: App) {
         interval.tick().await;
         if let Err(err) = app.rotate_oversized_logs().await {
             error!("Failed to rotate logs: {err:?}");
+        }
+    }
+}
+
+/// Client-side netd subcommands. Talks to the socket like the VMM does, so it
+/// needs whatever the socket's permissions ask for and not root.
+async fn run_netd_command(config: &NetdConfig, command: &NetdCommand) -> Result<()> {
+    match command {
+        NetdCommand::List { instance } => {
+            let interfaces = netd::client(&config.socket)
+                .list_interfaces(netd::ListInterfacesRequest {
+                    instance_id: instance.clone().unwrap_or_default(),
+                })
+                .await
+                .context("failed to list netd interfaces")?
+                .interfaces;
+            println!(
+                "{:<16} {:<8} {:<24} {:<38} {:>3}",
+                "INTERFACE", "KIND", "INSTANCE", "VM", "NIC"
+            );
+            let mut unattributed = 0;
+            for record in &interfaces {
+                if record.instance_id.is_none() {
+                    unattributed += 1;
+                }
+                println!(
+                    "{:<16} {:<8} {:<24} {:<38} {:>3}",
+                    record.tap,
+                    record.kind,
+                    record.instance_id.as_deref().unwrap_or("-"),
+                    record.vm_id.as_deref().unwrap_or("-"),
+                    record
+                        .nic_index
+                        .map_or_else(|| "-".to_string(), |index| index.to_string()),
+                );
+            }
+            println!();
+            println!("{} interface(s)", interfaces.len());
+            if unattributed > 0 {
+                // Not a fault to fix by hand: an interface built before netd
+                // recorded ownership, or by another netd, carries no record and
+                // gets one the next time its VM launches.
+                println!(
+                    "{unattributed} carry no ownership record; `netd remove-interface` takes \
+                     one by name"
+                );
+            }
+            Ok(())
+        }
+        NetdCommand::RemoveInterface { name } => {
+            netd::client(&config.socket)
+                .remove_interface_by_name(netd::InterfaceName { tap: name.clone() })
+                .await
+                .with_context(|| format!("failed to remove {name}"))?;
+            println!("removed {name}");
+            Ok(())
+        }
+        NetdCommand::RemoveVm { instance, vm } => {
+            let removed = netd::client(&config.socket)
+                .remove_vm(netd::VmRef {
+                    instance_id: instance.clone(),
+                    vm_id: vm.clone(),
+                })
+                .await
+                .context("failed to remove the VM's interfaces")?
+                .removed;
+            println!("removed {removed} interface(s) for {vm}");
+            Ok(())
         }
     }
 }
@@ -206,6 +337,14 @@ async fn main() -> Result<()> {
     // server configuration in this mode.
     if let Some(Command::VmLauncher(launcher_args)) = &args.command {
         return vm_launcher::run(Path::new(&launcher_args.spec)).await;
+    }
+
+    // Needs no server configuration; only /dev/vfio access.
+    if let Some(Command::SanitizeGpu(sanitize_args)) = &args.command {
+        return gpu_reset::sanitize_slots(
+            &sanitize_args.slots,
+            Duration::from_millis(sanitize_args.timeout_ms),
+        );
     }
 
     let figment = config::load_config_figment(args.config.as_deref());
@@ -235,6 +374,9 @@ async fn main() -> Result<()> {
                     .context("failed to load [cvm.network_filter] for netd")?,
             );
         }
+        if let Some(command) = &netd_args.command {
+            return run_netd_command(&netd_config, command).await;
+        }
         return netd::serve(netd_config).await;
     }
 
@@ -246,6 +388,7 @@ async fn main() -> Result<()> {
 
     // Preserve the existing startup validation. The broader static checks are
     // opt-in through `check-config` until they have seen wider deployment use.
+    netd::validate_instance_id(&config.cvm.instance_id)?;
     config
         .host_api
         .validate()
@@ -271,6 +414,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::Netd(_) => unreachable!("netd mode handled before server startup"),
+        Command::SanitizeGpu(_) => unreachable!("sanitize-gpu handled before config loading"),
         Command::Run(run_args) => {
             // One-shot VM execution mode
             return one_shot::run_one_shot(
@@ -355,6 +499,7 @@ async fn main() -> Result<()> {
     state.reload_vms().await.context("Failed to reload VMs")?;
     tokio::spawn(auto_restart_task(state.clone()));
     tokio::spawn(log_rotation_task(state.clone()));
+    tokio::spawn(network_cleanup_task(state.clone()));
 
     tokio::select! {
         result = run_external_api(state.clone(), figment.clone(), api_auth) => {

@@ -29,7 +29,7 @@ use crate::app::{
     validate_resolved_networks, App, AttachMode, GpuConfig, GpuSpec, Manifest, PortMapping,
     VmWorkDir,
 };
-use crate::config::{CvmConfig, Networking, NetworkingMode, NicNetworking};
+use crate::config::{CvmConfig, DiskPrealloc, Networking, NetworkingMode, NicNetworking};
 
 fn hex_sha256(data: &str) -> String {
     use sha2::Digest;
@@ -312,6 +312,8 @@ pub fn create_manifest_from_vm_config(
     }
     let key_provider = key_provider_from_compose(&request.compose_file)?;
     let swtpm = needs_swtpm(key_provider, simulated_tee);
+    let disk_prealloc = disk_prealloc_from_vm_config(&request, cvm_config)?;
+    validate_disk_prealloc_against_compose(disk_prealloc, &request.compose_file)?;
 
     Ok(Manifest {
         id,
@@ -333,7 +335,64 @@ pub fn create_manifest_from_vm_config(
         swtpm,
         networks,
         volumes,
+        disk_prealloc,
     })
+}
+
+/// Resolve the data disk preallocation for a deployment. This is a host
+/// storage decision, so it comes from the request or the node default and
+/// never from app-compose.
+fn disk_prealloc_from_vm_config(
+    request: &VmConfiguration,
+    cvm_config: &CvmConfig,
+) -> Result<DiskPrealloc> {
+    let Some(mode) = request
+        .disk_prealloc
+        .as_deref()
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+    else {
+        return Ok(cvm_config.disk_prealloc);
+    };
+    mode.parse()
+        .context("invalid disk_prealloc, expected off, metadata, falloc or full")
+}
+
+/// Reserving data blocks and discarding them pull in opposite directions: the
+/// host reserves the space up front, then the guest hands it straight back on
+/// the first fstrim, leaving a disk that is neither reserved nor thin. Reject
+/// the pair at deployment instead of letting the operator find out from `du`
+/// later.
+///
+/// `metadata` is deliberately not covered. It reserves no data blocks, so
+/// discard costs it nothing, and rejecting it would force a compose change --
+/// a new compose hash, a new app id, another on-chain whitelist entry -- for a
+/// combination that is not actually contradictory.
+fn validate_disk_prealloc_against_compose(
+    prealloc: DiskPrealloc,
+    compose_file: &str,
+) -> Result<()> {
+    if !prealloc.reserves_data_blocks() || !storage_discard_from_compose(compose_file)? {
+        return Ok(());
+    }
+    bail!(
+        "disk preallocation ({}) reserves host blocks, so app-compose must set \
+         storage_discard = false; either turn discard off in the compose file, or redeploy \
+         with disk_prealloc = \"off\" or \"metadata\" -- the mode is fixed at deployment",
+        prealloc.as_str()
+    )
+}
+
+/// Read `storage_discard` out of app-compose. Everything else in the document
+/// stays opaque, and a missing field means the app-compose default, which is
+/// discard enabled.
+fn storage_discard_from_compose(compose_file: &str) -> Result<bool> {
+    let compose: serde_json::Value =
+        serde_json::from_str(compose_file).context("invalid app compose JSON")?;
+    Ok(compose
+        .get("storage_discard")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true))
 }
 
 /// Extract only the field understood by this VMM. Keep every other app-compose
@@ -810,10 +869,26 @@ impl RpcHandler {
                 if hda_path.exists() {
                     info!("Resizing disk to {}GB", disk_size);
                     let new_size_str = format!("{}G", disk_size);
-                    let output = std::process::Command::new("qemu-img")
-                        .args(["resize", &hda_path.display().to_string(), &new_size_str])
-                        .output()
-                        .context("Failed to resize disk")?;
+                    // Grow the disk the same way it was created, so a VM
+                    // deployed with preallocation keeps its space reserved.
+                    let mut args = vec!["resize".to_string()];
+                    if !manifest.disk_prealloc.is_off() {
+                        args.push(format!(
+                            "--preallocation={}",
+                            manifest.disk_prealloc.as_str()
+                        ));
+                    }
+                    args.push(hda_path.display().to_string());
+                    args.push(new_size_str);
+                    // Off the async executor, for the same reason the launch
+                    // path does it: growing a preallocated disk reserves the
+                    // added space before it returns, and `full` writes it.
+                    let output = tokio::task::spawn_blocking(move || {
+                        std::process::Command::new("qemu-img").args(&args).output()
+                    })
+                    .await
+                    .context("disk resize task failed")?
+                    .context("Failed to resize disk")?;
                     if !output.status.success() {
                         bail!(
                             "Failed to resize disk: {}",
@@ -849,26 +924,28 @@ impl VmmRpc for RpcHandler {
             warn!("Failed to set started: {}", err);
         }
 
-        let result = self
+        if let Err(err) = self
             .app
             .load_vm(&work_dir, &Default::default(), false)
             .await
-            .context("Failed to load VM");
-        let result = match result {
-            Ok(()) => {
-                if !request.stopped {
-                    self.app.start_vm(&id).await
-                } else {
-                    Ok(())
-                }
-            }
-            Err(err) => Err(err),
-        };
-        if let Err(err) = result {
+            .context("Failed to load VM")
+        {
+            // Never started, so netd holds nothing for it.
             if let Err(err) = fs::remove_dir_all(&work_dir) {
                 warn!("Failed to remove work dir: {}", err);
             }
             return Err(err);
+        }
+        if !request.stopped {
+            if let Err(err) = self.app.start_vm(&id).await {
+                // A failed start may leave interfaces netd could not release.
+                // The normal removal keeps the directory, and with it
+                // `.netd-pending`, until they are gone.
+                if let Err(remove_err) = self.app.remove_vm(&id).await {
+                    warn!(vm_id = %id, "failed to remove VM after start failure: {remove_err:#}");
+                }
+                return Err(err);
+            }
         }
 
         Ok(Id { id })
@@ -928,6 +1005,21 @@ impl VmmRpc for RpcHandler {
 
     async fn update_vm(self, request: UpdateVmRequest) -> Result<Id> {
         info!(vm_id = %request.id, "update_vm RPC called");
+        // A VM being removed is not one to reconfigure. Before the lock,
+        // because removal holds it across the whole teardown and anything that
+        // only asked afterwards would wait that out in order to be told no.
+        self.app.refuse_if_removing(&request.id)?;
+        // Held from here rather than around the parts that touch the host,
+        // because everything below writes into the workdir -- the compose
+        // file first, the manifest last -- and `put_manifest` creates the
+        // directory it writes into. An update that resumed after a removal
+        // deleted that directory would recreate it holding nothing but a
+        // manifest: invisible to `list_vms`, unloadable at every start, and
+        // claiming the VM's netd interfaces against collection forever.
+        let _launch = self.app.launch_lock(&request.id).await;
+        // Again under the lock: removal can have claimed the VM while this
+        // waited for it.
+        self.app.refuse_if_removing(&request.id)?;
         let new_id = if !request.compose_file.is_empty() {
             // check the compose file is valid
             let _app_compose: AppCompose =
@@ -936,6 +1028,14 @@ impl VmmRpc for RpcHandler {
             if !compose_file_path.exists() {
                 bail!("The instance {} not found", request.id);
             }
+            // Read the manifest here rather than reusing the one below, so a
+            // rejected update leaves the stored compose file untouched.
+            let manifest = self
+                .app
+                .work_dir(&request.id)?
+                .manifest()
+                .context("Failed to read manifest")?;
+            validate_disk_prealloc_against_compose(manifest.disk_prealloc, &request.compose_file)?;
             fs::write(compose_file_path, &request.compose_file)
                 .context("Failed to write compose file")?;
 
@@ -1008,18 +1108,19 @@ impl VmmRpc for RpcHandler {
                 let networks = networks_from_proto(&request.networks, &cvm)?;
                 resolve_requested_networks(&networks, &cvm, manifest.vcpu)?
             };
+            // Under the launch lock this whole call holds. Reading "not
+            // running" outside it and acting on the answer inside is the exact
+            // race the lock exists to close: a launch can start, prepare its
+            // interfaces and deploy QEMU in between, and the release would
+            // then delete the interfaces of a VM that is running -- silently,
+            // since QEMU stays up and the supervisor still reports it healthy.
             let is_running = self
                 .app
                 .supervisor
                 .info(&request.id)
                 .await?
                 .is_some_and(|info| info.state.status.is_running());
-            if !is_running {
-                let runtime_networks = vm_work_dir.runtime_networks();
-                self.app
-                    .remove_netd_networks(&request.id, &runtime_networks)
-                    .await
-                    .context("failed to remove previous netd-managed networking")?;
+            if !is_running && self.app.release_vm_interfaces(&request.id).await {
                 vm_work_dir.clear_runtime_networks()?;
             }
             manifest.networks = networks;
@@ -1094,6 +1195,12 @@ impl VmmRpc for RpcHandler {
             "resize_vm RPC called"
         );
         validate_resize_request(&request)?;
+        // The same guard as `update_vm`, for the same reason: this writes the
+        // manifest, and `put_manifest` recreates a directory a removal has
+        // just deleted. Before the lock, and again under it.
+        self.app.refuse_if_removing(&request.id)?;
+        let _launch = self.app.launch_lock(&request.id).await;
+        self.app.refuse_if_removing(&request.id)?;
         let vm_work_dir = self.app.work_dir(&request.id)?;
         let mut manifest = vm_work_dir.manifest().context("failed to read manifest")?;
         self.apply_resource_updates(
@@ -1418,6 +1525,7 @@ mod tests {
             simulated_tee: None,
             networking: None,
             networks: vec![],
+            disk_prealloc: None,
         }
     }
 
@@ -1488,6 +1596,114 @@ mod tests {
             create_manifest_from_vm_config(test_vm_configuration(), &test_cvm_config()).unwrap();
 
         assert!(manifest.networks.is_empty());
+    }
+
+    /// Preallocation is only accepted together with discard disabled, so a
+    /// preallocating request needs a compose file that says so.
+    fn test_vm_configuration_without_discard() -> VmConfiguration {
+        VmConfiguration {
+            compose_file: r#"{"storage_discard": false}"#.to_string(),
+            ..test_vm_configuration()
+        }
+    }
+
+    #[test]
+    fn disk_prealloc_defaults_to_node_config_and_accepts_request_override() {
+        let mut cvm_config = test_cvm_config();
+        assert_eq!(cvm_config.disk_prealloc, DiskPrealloc::Off);
+
+        let manifest =
+            create_manifest_from_vm_config(test_vm_configuration(), &cvm_config).unwrap();
+        assert_eq!(manifest.disk_prealloc, DiskPrealloc::Off);
+
+        cvm_config.disk_prealloc = DiskPrealloc::Falloc;
+        let manifest =
+            create_manifest_from_vm_config(test_vm_configuration_without_discard(), &cvm_config)
+                .unwrap();
+        assert_eq!(manifest.disk_prealloc, DiskPrealloc::Falloc);
+
+        let mut request = test_vm_configuration_without_discard();
+        request.disk_prealloc = Some("metadata".to_string());
+        let manifest = create_manifest_from_vm_config(request, &cvm_config).unwrap();
+        assert_eq!(manifest.disk_prealloc, DiskPrealloc::Metadata);
+
+        // An empty string is the same as an unset field, as older clients and
+        // JSON round-trips produce it.
+        let mut request = test_vm_configuration_without_discard();
+        request.disk_prealloc = Some(String::new());
+        let manifest = create_manifest_from_vm_config(request, &cvm_config).unwrap();
+        assert_eq!(manifest.disk_prealloc, DiskPrealloc::Falloc);
+
+        // Opting one VM out of a preallocating node default needs no compose
+        // change, so the app identity stays put.
+        let mut request = test_vm_configuration();
+        request.disk_prealloc = Some("off".to_string());
+        let manifest = create_manifest_from_vm_config(request, &cvm_config).unwrap();
+        assert_eq!(manifest.disk_prealloc, DiskPrealloc::Off);
+    }
+
+    #[test]
+    fn create_rejects_unknown_disk_prealloc_mode() {
+        let mut request = test_vm_configuration();
+        request.disk_prealloc = Some("sparse".to_string());
+        let err = create_manifest_from_vm_config(request, &test_cvm_config()).unwrap_err();
+        assert!(err.to_string().contains("disk_prealloc"), "{err}");
+    }
+
+    #[test]
+    fn preallocation_is_rejected_while_the_guest_may_discard() {
+        let cvm_config = test_cvm_config();
+
+        // storage_discard defaults to true in app-compose, so an unset field
+        // conflicts just as an explicit `true` does.
+        for compose in ["{}", r#"{"storage_discard": true}"#] {
+            let request = VmConfiguration {
+                compose_file: compose.to_string(),
+                disk_prealloc: Some("falloc".to_string()),
+                ..test_vm_configuration()
+            };
+            let err = create_manifest_from_vm_config(request, &cvm_config).unwrap_err();
+            assert!(
+                err.to_string().contains("storage_discard"),
+                "{compose}: {err}"
+            );
+        }
+
+        // The same conflict, reached through the node default instead of the
+        // request.
+        let preallocating_node = CvmConfig {
+            disk_prealloc: DiskPrealloc::Full,
+            ..cvm_config
+        };
+        let err = create_manifest_from_vm_config(test_vm_configuration(), &preallocating_node)
+            .unwrap_err();
+        assert!(err.to_string().contains("storage_discard"), "{err}");
+    }
+
+    #[test]
+    fn metadata_preallocation_coexists_with_discard() {
+        // Rejecting it would cost a compose change -- and with it a new app id
+        // -- to avoid a conflict that does not exist: no data block is
+        // reserved, so there is none for the guest to hand back.
+        let mut request = test_vm_configuration();
+        request.disk_prealloc = Some("metadata".to_string());
+        let manifest = create_manifest_from_vm_config(request, &test_cvm_config()).unwrap();
+        assert_eq!(manifest.disk_prealloc, DiskPrealloc::Metadata);
+    }
+
+    #[test]
+    fn a_malformed_compose_is_reported_as_such() {
+        // Not reachable today (the callers parse the compose first), but the
+        // discard lookup must not turn "broken JSON" into "turn discard off".
+        let mut request = test_vm_configuration();
+        request.compose_file = "{not json".to_string();
+        request.disk_prealloc = Some("falloc".to_string());
+        let err = format!(
+            "{:#}",
+            create_manifest_from_vm_config(request, &test_cvm_config()).unwrap_err()
+        );
+        assert!(err.contains("compose"), "{err}");
+        assert!(!err.contains("storage_discard"), "{err}");
     }
 
     #[test]
@@ -1772,6 +1988,9 @@ mod tests {
         .expect("a named backend is an override");
     }
 
+    /// Deliberately restated rather than calling `NetworkingMode::as_str`: the
+    /// test below checks that what `GetInfo` reports is accepted back, and a
+    /// helper that shares the production mapping could only ever agree with it.
     fn networking_mode_name_for_test(mode: NetworkingMode) -> &'static str {
         match mode {
             NetworkingMode::Bridge => "bridge",
