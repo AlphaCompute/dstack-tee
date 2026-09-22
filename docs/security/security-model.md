@@ -326,12 +326,20 @@ kernel header for CoCo VMs", first released in 10.2.0) stopped rewriting the
 header for confidential guests, so the same kernel would otherwise measure
 differently depending on which QEMU the host chose to run.
 
-dstack removes that dependency instead of modelling it. The image build zeroes
-the boot-loader-written fields in the kernel it ships, and dstack's OVMF zeroes
-them again before the kernel blob is measured and loaded. RTMR[1] is therefore
-the plain Authenticode hash of the `bzImage` listed in `sha256sum.txt`, and the
-verifier needs nothing from the host to predict it -- not a QEMU version, not a
-memory size.
+dstack removes that dependency instead of modelling it. The image build fills
+in the boot-loader-owned fields of the kernel it ships with the values QEMU
+<= 10.1 would write, and dstack's OVMF writes the same values again before the
+kernel blob is measured and loaded. RTMR[1] is therefore the plain Authenticode
+hash of the `bzImage` listed in `sha256sum.txt`, and the verifier needs nothing
+from the host to predict it -- not a QEMU version, not a memory size.
+
+Normalizing to QEMU's layout rather than to zeros keeps an earlier release able
+to verify these images: `dstack-mr` computes that layout for an image that does
+not declare the flag, so a KMS that predates the declaration can still verify a
+guest booted on a QEMU that no longer patches the header, and a root-key
+handover does not have to bypass image verification. Recomputing it needs the
+guest RAM size, which limits such a verifier to guests with exactly 2 GiB or at
+least 2816 MiB.
 
 Images built before this landed keep their original behavior: their firmware
 does not normalize, so their digest still covers QEMU's rewritten copy. Which
@@ -350,11 +358,14 @@ here there is no knob. It also removes a class of correct-but-rejected
 deployments, since the previous QEMU-patched digest varied with guest RAM and
 was only reproducible at specific memory sizes.
 
-The normalized field set comes from the boot protocol rather than from QEMU's
-behavior: every field `Documentation/arch/x86/boot.rst` types as `write` is one
-the boot loader fills in and the kernel supplies no value for, so zeroing it
-discards nothing the kernel provided. Fields typed `modify` carry real
-kernel-supplied values and are left measured.
+What is written is one fixed header -- the one QEMU <= 10.1 in fact wrote for
+these kernels -- and not a reimplementation of QEMU's loader. Every field
+written is one QEMU fills in as boot loader; all but one are typed `write` in
+`Documentation/arch/x86/boot.rst`, which the boot loader supplies and the
+kernel has no value for. The exception is `loadflags`, typed
+`modify (obligatory)`, of which only the `CAN_USE_HEAP` bit is set, a bit the
+protocol assigns to the boot loader. Fields that carry real kernel-supplied
+values are left as the kernel built them.
 
 ### TCB status is surfaced, not gated, during verification
 
@@ -375,6 +386,10 @@ This is intentional. Runtime configuration that affects the trust boundary is vi
 This argument has a limit, and it is worth stating because it is what keeps the list short. A switch qualifies only if the trust decision still happens and is merely recorded as a measured setting. A switch that decides *whether* attestation happens at all does not qualify: there is then no measurement to audit, because the thing that would have produced it was skipped. Gateway `core.debug.insecure_skip_attestation` was such a switch -- it turned off both the peer identity check on WaveKV sync and the gateway's own app id lookup -- and it was removed rather than documented.
 
 Production verifiers should reject deployments that use these development settings. Operators should treat them the same way they treat debug-mode TEE quotes: useful for testing, invalid for production trust.
+
+### `requireTcbUpToDate` does not gate AWS NitroTPM
+
+NitroTPM attestations carry no TCB version or advisories, so the verifier reports `tcb_status = "UpToDate"` for every verified NitroTPM attestation, and `DstackApp.requireTcbUpToDate` always passes on it. `IAppAuth.AppBootInfo` has no `teeVariant`, so an app owner cannot exclude the platform on-chain; the only gate is the KMS-local `aws_nitro_tpm_key_release` (off by default).
 
 ### KMS mTLS is route-enforced for sensitive operations
 

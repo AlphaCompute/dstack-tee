@@ -11,7 +11,7 @@ name: Docker Build Check
 # does.
 on:
   push:
-    branches: [ next, 'release/**' ]
+    branches: [ alpha, next, 'release/**' ]
     paths:
       - 'dstack/**'
       - 'rust-toolchain.toml'
@@ -19,8 +19,10 @@ on:
       - '.github/workflows/kms-release.yml'
       - '.github/workflows/gateway-release.yml'
       - '.github/workflows/verifier-release.yml'
+      - '.github/workflows/local-key-provider-release.yml'
+      - '.github/workflows/mkosi-build.yml'
   pull_request:
-    branches: [ next, 'release/**' ]
+    branches: [ alpha, next, 'release/**' ]
     paths:
       - 'dstack/**'
       - 'rust-toolchain.toml'
@@ -28,6 +30,8 @@ on:
       - '.github/workflows/kms-release.yml'
       - '.github/workflows/gateway-release.yml'
       - '.github/workflows/verifier-release.yml'
+      - '.github/workflows/local-key-provider-release.yml'
+      - '.github/workflows/mkosi-build.yml'
 
 env:
   DSTACK_REV: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -52,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Install workflow contract parser
+        run: python3 -m pip install PyYAML==6.0.3
       - name: Test release build orchestration
         run: python3 -m unittest discover -s dstack/build/shared/tests -v
 
@@ -186,6 +192,32 @@ jobs:
           build-args: |
             DSTACK_REV=${{ env.DSTACK_REV }}
             DSTACK_SRC_URL=${{ env.DSTACK_SRC_URL }}
+
+      - name: Verify offline one-shot rejection contract
+        run: |
+          python3 - <<'PYTEST'
+          import json
+          import pathlib
+          import subprocess
+          import tempfile
+
+          with tempfile.TemporaryDirectory() as directory:
+              request = pathlib.Path(directory) / "invalid.json"
+              request.write_text(json.dumps({"attestation": "00"}))
+              result = subprocess.run(
+                  ["docker", "run", "--rm", "--network=none",
+                   "-v", f"{directory}:/evidence", "dstack-verifier-check:latest",
+                   "--config", "/etc/dstack/dstack-verifier.toml",
+                   "--verify", "/evidence/invalid.json"],
+                  capture_output=True, text=True, timeout=30,
+              )
+              assert result.returncode == 1, (result.returncode, result.stderr)
+              response = json.loads(result.stdout)
+              assert response["is_valid"] is False, response
+              assert isinstance(response["details"], dict), response
+              assert response["reason"], response
+              print("Real verifier CLI rejects malformed attestation with one JSON response")
+          PYTEST
 
       - name: Verify pinned packages (runtime)
         run: |

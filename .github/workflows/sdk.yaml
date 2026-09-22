@@ -9,9 +9,9 @@ permissions:
 
 on:
   push:
-    branches: [next, 'release/**']
+    branches: [alpha, next, 'release/**']
   pull_request:
-    branches: [next, 'release/**']
+    branches: [alpha, next, 'release/**']
 
 env:
   CARGO_TERM_COLOR: always

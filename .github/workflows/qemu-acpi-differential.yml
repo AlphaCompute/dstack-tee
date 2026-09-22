@@ -5,7 +5,7 @@ name: QEMU ACPI differential tests
 
 on:
   pull_request:
-    branches: [next]
+    branches: [alpha, next]
     paths:
       - .github/workflows/qemu-acpi-differential.yml
       - dstack/crates/qemu-acpi/**

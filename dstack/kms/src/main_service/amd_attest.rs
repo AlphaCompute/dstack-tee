@@ -592,6 +592,7 @@ mod tests {
                         pcr0: Vec::new(),
                         pcr1: Vec::new(),
                         pcr2: Vec::new(),
+                        pcr4: Vec::new(),
                     },
                     user_data: Vec::new(),
                     timestamp: 0,
@@ -786,7 +787,13 @@ mod tests {
     fn rejects_unsafe_machine_config() {
         let mut input = valid_input();
         input.guest_features = 0;
-        assert_rejects(input, "guest_features must be non-zero");
+        assert_rejects(input, "guest_features must set SNPActive");
+
+        // DebugSwap hands guest debug state to the host; dstack never launches
+        // with it, so the KMS must not recompute a matching digest for it.
+        let mut input = valid_input();
+        input.guest_features = 1 | (1 << 5);
+        assert_rejects(input, "unsupported SEV_FEATURES bits");
 
         let mut input = valid_input();
         input.ovmf_sections[0].size = 0;
