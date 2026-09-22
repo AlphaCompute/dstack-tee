@@ -408,7 +408,7 @@ jobs:
             echo "\`uki_auth\` hash and the AWS \`boot_pcr_digest\` for this image."
             echo
             echo "To build out-of-tree kernel modules, use"
-            echo "\`ghcr.io/dstack-tee/dstack-kernel-builder:$VERSION\`; see"
+            echo "\`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dstack-kernel-builder:$VERSION\`; see"
             echo "[docs/building-guest-os.md](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/docs/building-guest-os.md#kernel-headers-for-out-of-tree-modules)."
           } > release-notes.md
           # --verify-tag: the tag is the publish trigger, so it must already

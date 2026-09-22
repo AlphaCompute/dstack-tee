@@ -56,6 +56,9 @@ jobs:
             dstack/kms/auth-eth/lib/openzeppelin-contracts-upgradeable \
             dstack/kms/auth-eth/lib/openzeppelin-foundry-upgrades
 
+      - name: Normalise registry owner
+        run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -79,7 +82,7 @@ jobs:
           METADATA_FILE: ${{ runner.temp }}/build-metadata.json
           GIT_REV: ${{ env.GIT_REV }}
           IMAGE_VERSION: ${{ env.VERSION }}
-          IMAGE_NAME: ghcr.io/dstack-tee/dstack-kms:${{ env.VERSION }}
+          IMAGE_NAME: ghcr.io/${{ env.OWNER_LC }}/dstack-kms:${{ env.VERSION }}
           IMAGE_SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
           DSTACK_SRC_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
@@ -97,17 +100,17 @@ jobs:
           IMAGE_DIGEST: ${{ steps.build-and-push.outputs.digest }}
         run: |
           token=$(curl -fsSL \
-            "https://ghcr.io/token?scope=repository:dstack-tee/dstack-kms:pull" \
+            "https://ghcr.io/token?scope=repository:${OWNER_LC}/dstack-kms:pull" \
             | jq -er .token)
           curl -fsSL -o /dev/null \
             -H "Authorization: Bearer $token" \
             -H "Accept: application/vnd.oci.image.manifest.v1+json" \
-            "https://ghcr.io/v2/dstack-tee/dstack-kms/manifests/$IMAGE_DIGEST"
+            "https://ghcr.io/v2/${OWNER_LC}/dstack-kms/manifests/$IMAGE_DIGEST"
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@92c65d2898f1f53cfdc910b962cecff86e7f8fcc # v1
         with:
-          subject-name: "ghcr.io/dstack-tee/dstack-kms"
+          subject-name: "ghcr.io/${{ env.OWNER_LC }}/dstack-kms"
           subject-digest: ${{ steps.build-and-push.outputs.digest }}
           push-to-registry: true
 
@@ -131,7 +134,7 @@ jobs:
           body: |
             ## Docker Image Information
 
-            **Image**: `ghcr.io/dstack-tee/dstack-kms:${{ env.VERSION }}`
+            **Image**: `ghcr.io/${{ env.OWNER_LC }}/dstack-kms:${{ env.VERSION }}`
 
             **Digest (SHA256)**: `${{ steps.build-and-push.outputs.digest }}`
 

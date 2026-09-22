@@ -19,6 +19,8 @@ on:
       - '.github/workflows/kms-release.yml'
       - '.github/workflows/gateway-release.yml'
       - '.github/workflows/verifier-release.yml'
+      - '.github/workflows/local-key-provider-release.yml'
+      - '.github/workflows/mkosi-build.yml'
   pull_request:
     branches: [ alpha, next, 'release/**' ]
     paths:
@@ -28,6 +30,8 @@ on:
       - '.github/workflows/kms-release.yml'
       - '.github/workflows/gateway-release.yml'
       - '.github/workflows/verifier-release.yml'
+      - '.github/workflows/local-key-provider-release.yml'
+      - '.github/workflows/mkosi-build.yml'
 
 env:
   DSTACK_REV: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -52,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Install workflow contract parser
+        run: python3 -m pip install PyYAML==6.0.3
       - name: Test release build orchestration
         run: python3 -m unittest discover -s dstack/build/shared/tests -v
 
