@@ -6,9 +6,10 @@
 # kernel: its exported build tree plus a compiler from the same pinned Debian
 # snapshot the kernel was built with. Built by build.sh.
 
-ARG BASE_IMAGE=debian:trixie-slim
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+ARG DEBIAN_RELEASE
 ARG DEBIAN_SNAPSHOT
 ARG KERNEL_RELEASE
 ARG IMAGE_VERSION=unknown
@@ -17,6 +18,7 @@ ARG GIT_REVISION=unknown
 # Pin apt to the snapshot; trixie also ships deb822 sources that must go.
 RUN set -eux; \
     suite=$(. /etc/os-release && echo "${VERSION_CODENAME}"); \
+    test "$suite" = "${DEBIAN_RELEASE:?}"; \
     rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
     echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT:?} ${suite} main" \
       > /etc/apt/sources.list; \

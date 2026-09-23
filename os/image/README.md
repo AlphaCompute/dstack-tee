@@ -52,7 +52,10 @@ image.
 The optional `artifacts.kernel_devel` manifest entry is published as
 `<name>-<version>-kernel-devel.tar.gz` beside the image archives. It is not in
 `sha256sum.txt`, so it does not affect `os_image_hash`. `kernel-builder/`
-builds the matching module-builder container image.
+builds the matching module-builder container image. Its build script takes the
+base image digest and Debian snapshot from `../mkosi/versions.env`; the base must
+predate that snapshot so installed runtime libraries do not outrun the pinned
+development packages. The Docker build rejects a Debian suite mismatch.
 
 ## Kernel setup-header normalization
 
