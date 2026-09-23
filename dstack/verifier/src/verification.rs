@@ -17,9 +17,7 @@ use cc_eventlog::{
     },
     TdxEvent,
 };
-use dstack_mr::{
-    tdx::TdxRtmr0AcpiHashes, RtmrLog, RtmrLogs, TdxMeasurementDetails, TdxMeasurements,
-};
+use dstack_mr::{tdx::TdxRtmr0AcpiHashes, TdxMeasurements};
 use dstack_types::{TdxAttestationVariant, VmConfig};
 use hex_literal::hex;
 use ra_tls::attestation::{
@@ -32,8 +30,7 @@ use tokio::{io::AsyncWriteExt, process::Command};
 use tracing::{debug, info, warn};
 
 use crate::types::{
-    AcpiTables, PolicyBootInfo, RtmrEventEntry, RtmrEventStatus, RtmrMismatch, VerificationDetails,
-    VerificationRequest, VerificationResponse,
+    PolicyBootInfo, VerificationDetails, VerificationRequest, VerificationResponse,
 };
 
 /// Return the canonical TCB status and advisory list used by auth policy.
@@ -86,99 +83,6 @@ fn decode_key_provider_info(bytes: &[u8]) -> Option<dstack_types::KeyProviderInf
         return None;
     }
     serde_json::from_slice(bytes).ok()
-}
-
-fn collect_rtmr_mismatch(
-    rtmr_label: &str,
-    expected: &[u8],
-    actual: &[u8],
-    expected_sequence: &RtmrLog,
-    actual_indices: &[usize],
-    event_log: &[TdxEvent],
-) -> RtmrMismatch {
-    let expected_hex = hex::encode(expected);
-    let actual_hex = hex::encode(actual);
-
-    let mut events = Vec::new();
-
-    for (&idx, expected_digest) in actual_indices.iter().zip(expected_sequence.iter()) {
-        match event_log.get(idx) {
-            Some(event) => {
-                let event_name = if event.event.is_empty() {
-                    "(unnamed)".to_string()
-                } else {
-                    event.event.clone()
-                };
-                let status = if event.digest() == expected_digest.as_slice() {
-                    RtmrEventStatus::Match
-                } else {
-                    RtmrEventStatus::Mismatch
-                };
-                events.push(RtmrEventEntry {
-                    index: idx,
-                    event_type: event.event_type,
-                    event_name,
-                    actual_digest: hex::encode(event.digest()),
-                    expected_digest: Some(hex::encode(expected_digest)),
-                    payload_len: event.event_payload.len(),
-                    status,
-                });
-            }
-            None => {
-                events.push(RtmrEventEntry {
-                    index: idx,
-                    event_type: 0,
-                    event_name: "(missing)".to_string(),
-                    actual_digest: String::new(),
-                    expected_digest: Some(hex::encode(expected_digest)),
-                    payload_len: 0,
-                    status: RtmrEventStatus::Missing,
-                });
-            }
-        }
-    }
-
-    for &idx in actual_indices.iter().skip(expected_sequence.len()) {
-        let (event_type, event_name, actual_digest, payload_len) = match event_log.get(idx) {
-            Some(event) => (
-                event.event_type,
-                if event.event.is_empty() {
-                    "(unnamed)".to_string()
-                } else {
-                    event.event.clone()
-                },
-                hex::encode(event.digest()),
-                event.event_payload.len(),
-            ),
-            None => (0, "(missing)".to_string(), String::new(), 0),
-        };
-        events.push(RtmrEventEntry {
-            index: idx,
-            event_type,
-            event_name,
-            actual_digest,
-            expected_digest: None,
-            payload_len,
-            status: RtmrEventStatus::Extra,
-        });
-    }
-
-    let missing_expected_digests = if expected_sequence.len() > actual_indices.len() {
-        expected_sequence[actual_indices.len()..]
-            .iter()
-            .map(hex::encode)
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    RtmrMismatch {
-        rtmr: rtmr_label.to_string(),
-        expected: expected_hex.to_string(),
-        actual: actual_hex.to_string(),
-        events,
-        missing_expected_digests,
-    }
 }
 
 // Bump whenever expected RTMR computation changes so stale entries get ignored.
@@ -238,8 +142,18 @@ impl CvmVerifier {
             .join(format!("{cache_key}.json"))
     }
 
+    /// Hash only what the measurement reads: `image` and the measurement documents
+    /// are caller-controlled and unused, so they must not be able to force a miss.
+    /// Clear them rather than allowlisting, so new `VmConfig` fields stay in the key.
     fn vm_config_cache_key(vm_config: &VmConfig) -> Result<String> {
-        let serialized = serde_json::to_vec(vm_config)
+        let vm_config = VmConfig {
+            image: None,
+            tdx_measurement: None,
+            gcp_measurement: None,
+            aws_measurement: None,
+            ..vm_config.clone()
+        };
+        let serialized = serde_json::to_vec(&vm_config)
             .context("Failed to serialize VM config for cache key computation")?;
         Ok(hex::encode(Sha256::digest(&serialized)))
     }
@@ -312,34 +226,26 @@ impl CvmVerifier {
         Ok(())
     }
 
-    fn compute_measurement_details(
-        &self,
-        vm_config: &VmConfig,
-        fw_path: &Path,
-        kernel_path: &Path,
-        initrd_path: &Path,
-        kernel_cmdline: &str,
-        kernel_header_normalized: bool,
-    ) -> Result<TdxMeasurementDetails> {
-        let firmware = fw_path.display().to_string();
-        let kernel = kernel_path.display().to_string();
-        let initrd = initrd_path.display().to_string();
+    fn compute_measurements(vm_config: &VmConfig, image: &ImagePaths) -> Result<TdxMeasurements> {
+        let firmware = image.fw_path.display().to_string();
+        let kernel = image.kernel_path.display().to_string();
+        let initrd = image.initrd_path.display().to_string();
 
         // Prefer the explicit variant the image declared; pre-`ovmf_variant`
         // deployments fall back to the only layout that existed back then.
         let ovmf_variant = vm_config.ovmf_variant.unwrap_or_default();
 
-        let details = dstack_mr::Machine::builder()
+        dstack_mr::Machine::builder()
             .cpu_count(vm_config.cpu_count)
             .memory_size(vm_config.memory_size)
             .firmware(&firmware)
             .kernel(&kernel)
             .initrd(&initrd)
-            .kernel_cmdline(kernel_cmdline)
+            .kernel_cmdline(&image.kernel_cmdline)
             .root_verity(true)
             .hotplug_off(vm_config.hotplug_off)
             .maybe_two_pass_add_pages(vm_config.qemu_single_pass_add_pages)
-            .normalized_setup_header(kernel_header_normalized)
+            .normalized_setup_header(image.kernel_header_normalized)
             .maybe_pic(vm_config.pic)
             .maybe_qemu_version(vm_config.qemu_version.clone())
             .maybe_pci_hole64_size(if vm_config.pci_hole64_size > 0 {
@@ -356,40 +262,14 @@ impl CvmVerifier {
             .host_share_mode(vm_config.host_share_mode.clone())
             .ovmf_variant(ovmf_variant)
             .build()
-            .measure_with_logs()
-            .context("Failed to compute expected MRs")?;
-
-        Ok(details)
+            .measure()
+            .context("Failed to compute expected MRs")
     }
 
-    fn compute_measurements(
+    async fn load_or_compute_measurements(
         &self,
         vm_config: &VmConfig,
-        fw_path: &Path,
-        kernel_path: &Path,
-        initrd_path: &Path,
-        kernel_cmdline: &str,
-        kernel_header_normalized: bool,
-    ) -> Result<TdxMeasurements> {
-        self.compute_measurement_details(
-            vm_config,
-            fw_path,
-            kernel_path,
-            initrd_path,
-            kernel_cmdline,
-            kernel_header_normalized,
-        )
-        .map(|details| details.measurements)
-    }
-
-    fn load_or_compute_measurements(
-        &self,
-        vm_config: &VmConfig,
-        fw_path: &Path,
-        kernel_path: &Path,
-        initrd_path: &Path,
-        kernel_cmdline: &str,
-        kernel_header_normalized: bool,
+        image: ImagePaths,
     ) -> Result<TdxMeasurements> {
         let cache_key = Self::vm_config_cache_key(vm_config)?;
 
@@ -397,14 +277,11 @@ impl CvmVerifier {
             return Ok(measurements);
         }
 
-        let measurements = self.compute_measurements(
-            vm_config,
-            fw_path,
-            kernel_path,
-            initrd_path,
-            kernel_cmdline,
-            kernel_header_normalized,
-        )?;
+        let vm_config = vm_config.clone();
+        let measurements =
+            tokio::task::spawn_blocking(move || Self::compute_measurements(&vm_config, &image))
+                .await
+                .context("measurement task failed")??;
 
         if let Err(e) = self.store_measurements_in_cache(&cache_key, &measurements) {
             warn!(
@@ -673,14 +550,8 @@ impl CvmVerifier {
     ) -> Result<TdxMeasurements> {
         let image_paths = self.ensure_image_downloaded(vm_config).await?;
 
-        self.load_or_compute_measurements(
-            vm_config,
-            &image_paths.fw_path,
-            &image_paths.kernel_path,
-            &image_paths.initrd_path,
-            &image_paths.kernel_cmdline,
-            image_paths.kernel_header_normalized,
-        )
+        self.load_or_compute_measurements(vm_config, image_paths)
+            .await
     }
 
     pub async fn verify(&self, request: VerificationRequest) -> Result<VerificationResponse> {
@@ -719,7 +590,6 @@ impl CvmVerifier {
         };
         let mut details = VerificationDetails::default();
 
-        let debug = request.debug.unwrap_or(false);
         let attestation = attestation.into_v1();
         let verified = attestation.verify(&self.attestation_verifier).await;
         let verified_attestation = match verified {
@@ -748,7 +618,6 @@ impl CvmVerifier {
             .verify_os_image_hash(
                 request_vm_config.clone(),
                 &verified_attestation,
-                debug,
                 &mut details,
             )
             .await;
@@ -794,7 +663,6 @@ impl CvmVerifier {
         &self,
         vm_config: String,
         attestation: &VerifiedAttestation,
-        debug: bool,
         details: &mut VerificationDetails,
     ) -> Result<VmConfig> {
         // The raw config string used for platform-specific binding: the explicit
@@ -829,22 +697,12 @@ impl CvmVerifier {
             // rather than degraded to a download.
             AttestationQuote::DstackTdx(_) => match vm_config.tdx_attestation_variant {
                 TdxAttestationVariant::Legacy => {
-                    self.verify_os_image_hash_for_dstack_tdx(
-                        &vm_config,
-                        attestation,
-                        debug,
-                        details,
-                    )
-                    .await?;
+                    self.verify_os_image_hash_for_dstack_tdx(&vm_config, attestation, details)
+                        .await?;
                 }
                 TdxAttestationVariant::Lite => {
-                    self.verify_os_image_hash_for_dstack_tdx_lite(
-                        &vm_config,
-                        attestation,
-                        debug,
-                        details,
-                    )
-                    .await?;
+                    self.verify_os_image_hash_for_dstack_tdx_lite(&vm_config, attestation, details)
+                        .await?;
                 }
             },
             AttestationQuote::DstackNitroEnclave(_) => {
@@ -909,27 +767,9 @@ impl CvmVerifier {
         &self,
         vm_config: &VmConfig,
         attestation: &VerifiedAttestation,
-        debug: bool,
         details: &mut VerificationDetails,
     ) -> Result<()> {
-        let Some(report) = &attestation.report.tdx_report() else {
-            bail!("No TDX report");
-        };
-        let Some(tdx_quote) = attestation.tdx_quote() else {
-            bail!("No TDX quote");
-        };
-        let event_log = &tdx_quote.event_log;
-        let report = report
-            .report
-            .as_td10()
-            .context("Failed to decode TD report")?;
-
-        let verified_mrs = Mrs {
-            mrtd: report.mr_td.to_vec(),
-            rtmr0: report.rt_mr0.to_vec(),
-            rtmr1: report.rt_mr1.to_vec(),
-            rtmr2: report.rt_mr2.to_vec(),
-        };
+        let verified_mrs = verified_tdx_mrs(attestation)?;
 
         // Legacy TDX attestation keeps the original KMS verifier semantics:
         // os_image_hash must be the image digest (digest.txt =
@@ -946,57 +786,11 @@ impl CvmVerifier {
             details.os_image_version = Some(image_paths.version.clone());
         }
 
-        let (mrs, expected_logs) = if debug {
-            let TdxMeasurementDetails {
-                measurements,
-                rtmr_logs,
-                acpi_tables,
-            } = self
-                .compute_measurement_details(
-                    vm_config,
-                    &image_paths.fw_path,
-                    &image_paths.kernel_path,
-                    &image_paths.initrd_path,
-                    &image_paths.kernel_cmdline,
-                    image_paths.kernel_header_normalized,
-                )
-                .context("Failed to compute expected measurements")?;
-
-            details.acpi_tables = Some(AcpiTables {
-                tables: hex::encode(&acpi_tables.tables),
-                rsdp: hex::encode(&acpi_tables.rsdp),
-                loader: hex::encode(&acpi_tables.loader),
-            });
-
-            (measurements, Some(rtmr_logs))
-        } else {
-            (
-                self.load_or_compute_measurements(
-                    vm_config,
-                    &image_paths.fw_path,
-                    &image_paths.kernel_path,
-                    &image_paths.initrd_path,
-                    &image_paths.kernel_cmdline,
-                    image_paths.kernel_header_normalized,
-                )
-                .context("Failed to compute expected measurements")?,
-                None,
-            )
-        };
-
-        self.compare_tdx_mrs(
-            Mrs {
-                mrtd: mrs.mrtd,
-                rtmr0: mrs.rtmr0,
-                rtmr1: mrs.rtmr1,
-                rtmr2: mrs.rtmr2,
-            },
-            verified_mrs,
-            expected_logs.as_ref(),
-            event_log,
-            debug,
-            details,
-        )?;
+        let expected_mrs = self
+            .load_or_compute_measurements(vm_config, image_paths)
+            .await
+            .context("Failed to compute expected measurements")?;
+        assert_tdx_mrs_eq(&expected_mrs, &verified_mrs).context("MRs do not match")?;
         details.acpi_tables_verified = true;
         Ok(())
     }
@@ -1005,29 +799,13 @@ impl CvmVerifier {
         &self,
         vm_config: &VmConfig,
         attestation: &VerifiedAttestation,
-        _debug: bool,
         details: &mut VerificationDetails,
     ) -> Result<()> {
-        let Some(report) = &attestation.report.tdx_report() else {
-            bail!("No TDX report");
-        };
+        let verified_mrs = verified_tdx_mrs(attestation)?;
         let Some(tdx_quote) = attestation.tdx_quote() else {
             bail!("No TDX quote");
         };
         let event_log = &tdx_quote.event_log;
-        // Get boot info from attestation
-        let report = report
-            .report
-            .as_td10()
-            .context("Failed to decode TD report")?;
-
-        // Extract the verified MRs from the report
-        let verified_mrs = Mrs {
-            mrtd: report.mr_td.to_vec(),
-            rtmr0: report.rt_mr0.to_vec(),
-            rtmr1: report.rt_mr1.to_vec(),
-            rtmr2: report.rt_mr2.to_vec(),
-        };
 
         let document = vm_config
             .tdx_measurement
@@ -1073,85 +851,13 @@ impl CvmVerifier {
         details.acpi_tables_verified = true;
         // RTMR0 below is rebuilt from the recomputed digests, so the expected
         // value depends on nothing the host reported about the tables.
-        let mrs = dstack_mr::tdx::tdx_measurements_from_measurement_document(
+        let expected_mrs = dstack_mr::tdx::tdx_measurements_from_measurement_document(
             document,
             vm_config,
             &acpi_hashes,
         )
         .context("Failed to compute TDX expected measurements without image download")?;
-
-        let expected_mrs = Mrs {
-            mrtd: mrs.mrtd.clone(),
-            rtmr0: mrs.rtmr0.clone(),
-            rtmr1: mrs.rtmr1.clone(),
-            rtmr2: mrs.rtmr2.clone(),
-        };
-        expected_mrs
-            .assert_eq(&verified_mrs)
-            .context("MRs do not match")
-    }
-
-    fn compare_tdx_mrs(
-        &self,
-        expected_mrs: Mrs,
-        verified_mrs: Mrs,
-        expected_logs: Option<&RtmrLogs>,
-        event_log: &[TdxEvent],
-        debug: bool,
-        details: &mut VerificationDetails,
-    ) -> Result<()> {
-        match expected_mrs.assert_eq(&verified_mrs) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let result = Err(e).context("MRs do not match");
-                if !debug {
-                    return result;
-                }
-                let Some(expected_logs) = expected_logs else {
-                    return result;
-                };
-                let mut rtmr_debug = Vec::new();
-
-                if expected_mrs.rtmr0 != verified_mrs.rtmr0 {
-                    rtmr_debug.push(collect_rtmr_mismatch(
-                        "RTMR0",
-                        &expected_mrs.rtmr0,
-                        &verified_mrs.rtmr0,
-                        &expected_logs[0],
-                        &[],
-                        event_log,
-                    ));
-                }
-
-                if expected_mrs.rtmr1 != verified_mrs.rtmr1 {
-                    rtmr_debug.push(collect_rtmr_mismatch(
-                        "RTMR1",
-                        &expected_mrs.rtmr1,
-                        &verified_mrs.rtmr1,
-                        &expected_logs[1],
-                        &[],
-                        event_log,
-                    ));
-                }
-
-                if expected_mrs.rtmr2 != verified_mrs.rtmr2 {
-                    rtmr_debug.push(collect_rtmr_mismatch(
-                        "RTMR2",
-                        &expected_mrs.rtmr2,
-                        &verified_mrs.rtmr2,
-                        &expected_logs[2],
-                        &[],
-                        event_log,
-                    ));
-                }
-
-                if !rtmr_debug.is_empty() {
-                    details.rtmr_debug = Some(rtmr_debug);
-                }
-
-                result
-            }
-        }
+        assert_tdx_mrs_eq(&expected_mrs, &verified_mrs).context("MRs do not match")
     }
 
     /// Verify Nitro Enclave OS image hash using the signature-verified NSM PCRs.
@@ -1377,46 +1083,39 @@ impl CvmVerifier {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Mrs {
-    mrtd: Vec<u8>,
-    rtmr0: Vec<u8>,
-    rtmr1: Vec<u8>,
-    rtmr2: Vec<u8>,
+/// MRTD and RTMR0-2 from the verified TD report.
+fn verified_tdx_mrs(attestation: &VerifiedAttestation) -> Result<TdxMeasurements> {
+    let report = attestation
+        .report
+        .tdx_report()
+        .context("No TDX report")?
+        .report
+        .as_td10()
+        .context("Failed to decode TD report")?;
+    Ok(TdxMeasurements {
+        mrtd: report.mr_td.to_vec(),
+        rtmr0: report.rt_mr0.to_vec(),
+        rtmr1: report.rt_mr1.to_vec(),
+        rtmr2: report.rt_mr2.to_vec(),
+    })
 }
 
-impl Mrs {
-    fn assert_eq(&self, other: &Self) -> Result<()> {
-        if self.mrtd != other.mrtd {
+fn assert_tdx_mrs_eq(expected: &TdxMeasurements, actual: &TdxMeasurements) -> Result<()> {
+    for (name, expected, actual) in [
+        ("MRTD", &expected.mrtd, &actual.mrtd),
+        ("RTMR0", &expected.rtmr0, &actual.rtmr0),
+        ("RTMR1", &expected.rtmr1, &actual.rtmr1),
+        ("RTMR2", &expected.rtmr2, &actual.rtmr2),
+    ] {
+        if expected != actual {
             bail!(
-                "MRTD mismatch: expected={}, actual={}",
-                hex::encode(&self.mrtd),
-                hex::encode(&other.mrtd)
+                "{name} mismatch: expected={}, actual={}",
+                hex::encode(expected),
+                hex::encode(actual)
             );
         }
-        if self.rtmr0 != other.rtmr0 {
-            bail!(
-                "RTMR0 mismatch: expected={}, actual={}",
-                hex::encode(&self.rtmr0),
-                hex::encode(&other.rtmr0)
-            );
-        }
-        if self.rtmr1 != other.rtmr1 {
-            bail!(
-                "RTMR1 mismatch: expected={}, actual={}",
-                hex::encode(&self.rtmr1),
-                hex::encode(&other.rtmr1)
-            );
-        }
-        if self.rtmr2 != other.rtmr2 {
-            bail!(
-                "RTMR2 mismatch: expected={}, actual={}",
-                hex::encode(&self.rtmr2),
-                hex::encode(&other.rtmr2)
-            );
-        }
-        Ok(())
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2008,6 +1707,38 @@ mod tests {
     }
 
     #[test]
+    fn measurement_cache_key_ignores_unmeasured_fields() {
+        let base: VmConfig = serde_json::from_value(serde_json::json!({
+            "os_image_hash": "11".repeat(32),
+            "cpu_count": 2,
+            "memory_size": 0x8000_0000u64,
+        }))
+        .unwrap();
+        let key = |config: &VmConfig| CvmVerifier::vm_config_cache_key(config).unwrap();
+        let blob = || vec![0xaa; 4096];
+
+        let mut padded = base.clone();
+        padded.image = Some("x".repeat(4096));
+        padded.tdx_measurement = Some(dstack_types::TdxOsImageMeasurementDocument::new(
+            blob(),
+            blob(),
+        ));
+        padded.gcp_measurement = Some(dstack_types::GcpOsImageMeasurementDocument::new(
+            blob(),
+            blob(),
+        ));
+        padded.aws_measurement = Some(dstack_types::AwsOsImageMeasurementDocument::new(
+            blob(),
+            blob(),
+        ));
+        assert_eq!(key(&padded), key(&base));
+
+        let mut resized = base.clone();
+        resized.cpu_count += 1;
+        assert_ne!(key(&resized), key(&base));
+    }
+
+    #[test]
     fn image_cache_pruning_keeps_checksum_identity() {
         let dir = tempfile::tempdir().expect("temp image directory");
         let files_doc = "00  metadata.json\n";
@@ -2360,7 +2091,6 @@ mod tests {
                 event_log: None,
                 vm_config: None,
                 attestation: Some(attestation),
-                debug: None,
             })
             .await
             .expect("verifier runs");
@@ -2585,7 +2315,6 @@ mod tests {
                 event_log: None,
                 vm_config: None,
                 attestation: Some(forged),
-                debug: None,
             })
             .await
             .expect("verifier runs");
